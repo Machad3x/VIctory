@@ -118,6 +118,37 @@ fn recover(code: NTSTATUS, rip: usize) -> Option<usize> {
         .then_some(&raw const victory_title_copy_failed as usize)
 }
 
+/// Makes the page of `at`, whose guard our read just spent, a guard page
+/// again: the kernel's copy leaves guards alone, and they are the title's.
+///
+/// Between the fault and this, a title thread that touches the page is not
+/// told (the next touch is), and a copy on another thread reads the page's
+/// bytes instead of zeros. A title thread that takes the guard off itself
+/// in those microseconds finds it on again, unless it left another
+/// protection, which is put back.
+fn guard_again(at: usize) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, VirtualProtect, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return;
+    }
+    let protect = |protection: u32| {
+        let mut old = 0;
+        // SAFETY: only the page's protection changes; fails if it is gone.
+        (unsafe { VirtualProtect(at as *const _, 1, protection, &mut old) } != 0).then_some(old)
+    };
+    if let Some(old) = protect(info.Protect | PAGE_GUARD)
+        && old & !PAGE_GUARD != info.Protect & !PAGE_GUARD
+    {
+        protect(old);
+    }
+}
+
 /// Registers the handler, once, ahead of the crash reporter's.
 fn install() {
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -129,6 +160,9 @@ fn install() {
         let (record, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
         match recover(record.ExceptionCode, context.Rip as usize) {
             Some(exit) => {
+                if record.ExceptionCode == EXCEPTION_GUARD_PAGE {
+                    guard_again(record.ExceptionInformation[1]);
+                }
                 context.Rip = exit as u64;
                 EXCEPTION_CONTINUE_EXECUTION
             }
@@ -148,8 +182,9 @@ mod tests {
     use std::hint::black_box;
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS,
-        PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
+        PAGE_EXECUTE_READ, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree, VirtualProtect, VirtualQuery,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -267,11 +302,146 @@ mod tests {
         protect(from, 0, PAGE_READWRITE | PAGE_GUARD);
         // SAFETY: as above.
         assert!(!unsafe { copy(to, from, PAGE) });
-        // The guard is spent.
+        // The guard stays, as the kernel's copy leaves it.
         // SAFETY: as above.
-        assert!(unsafe { copy(to, from, PAGE) });
+        assert!(!unsafe { copy(to, from, PAGE) });
         free(from);
         free(to);
+    }
+
+    /// The page's protection, `PAGE_GUARD` included.
+    fn protection(at: *mut u8, page: usize) -> u32 {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a page of ours and a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(at.add(page * PAGE).cast(), &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0);
+        info.Protect
+    }
+
+    /// A guard page the copy reaches stays one, with its other protection,
+    /// and the range gets the bytes a copy through the kernel gives it
+    /// (zeros for the page), however it lies over the page.
+    #[test]
+    fn guard_pages_stay_guarded() {
+        for other in [PAGE_READWRITE, PAGE_READONLY, PAGE_EXECUTE_READ] {
+            for (start, len) in [
+                (PAGE, 1),
+                (PAGE + 2000, 1),
+                (PAGE + 2000, 100),
+                (2 * PAGE - 1, 1),
+                (PAGE - 1, 2),
+                (PAGE - 7, 16),
+                (PAGE - 500, 1000),
+                (2 * PAGE - 8, 64),
+                (0, 3 * PAGE),
+            ] {
+                let at = pages(3);
+                protect(at, 1, other | PAGE_GUARD);
+                let mut got = vec![0xeeu8; len];
+                // SAFETY: an address in our allocation.
+                let src = unsafe { at.add(start) };
+                // SAFETY: `got` has `len` bytes.
+                assert!(!unsafe { copy(got.as_mut_ptr(), src, len) });
+                assert_eq!(protection(at, 1), other | PAGE_GUARD, "{start} {len}");
+                // The whole way, as a submission copies it.
+                crate::host::copy_mapped(got.as_mut_ptr(), src, len, false);
+                assert_eq!(protection(at, 1), other | PAGE_GUARD, "{start} {len}");
+                for (i, &b) in got.iter().enumerate() {
+                    let i = start + i;
+                    let guarded = (PAGE..2 * PAGE).contains(&i);
+                    let want = if guarded {
+                        0
+                    } else {
+                        (i * 31 + i / 256 + 1) as u8
+                    };
+                    assert_eq!(b, want, "byte {i} of {start} {len}");
+                }
+                free(at);
+            }
+        }
+    }
+
+    /// Two threads reading the same guard page: neither ends the process,
+    /// and the page is a guard page when both are done.
+    #[test]
+    fn two_copies_of_a_guard_page() {
+        let at = pages(1) as usize;
+        protect(at as *mut u8, 0, PAGE_READWRITE | PAGE_GUARD);
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let mut to = [0u8; 256];
+                    for _ in 0..2000 {
+                        // SAFETY: `to` has room.
+                        black_box(unsafe { copy(to.as_mut_ptr(), (at + 64) as *const u8, 256) });
+                    }
+                });
+            }
+        });
+        assert_eq!(protection(at as *mut u8, 0), PAGE_READWRITE | PAGE_GUARD);
+        free(at as *mut u8);
+    }
+
+    /// The title uses a guard page as one (it arms it, and a touch is
+    /// reported to it once) while copies reach it: its touches are reported
+    /// but for those that meet a copy, and the page ends as a guard page.
+    #[test]
+    fn a_guard_page_the_title_touches_meanwhile() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_POINTERS, RemoveVectoredExceptionHandler,
+        };
+        static PAGE_AT: AtomicUsize = AtomicUsize::new(0);
+        static REPORTED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn title(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            let (r, c) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
+            let ours = r.ExceptionCode == EXCEPTION_GUARD_PAGE
+                && r.ExceptionInformation[1] / PAGE * PAGE == PAGE_AT.load(Ordering::Relaxed)
+                && recover(r.ExceptionCode, c.Rip as usize).is_none();
+            if ours {
+                REPORTED.fetch_add(1, Ordering::Relaxed);
+            }
+            if ours { -1 } else { 0 }
+        }
+        let at = pages(1) as usize;
+        PAGE_AT.store(at, Ordering::Relaxed);
+        // SAFETY: removed below.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(title)) };
+        let stop = AtomicBool::new(false);
+        let mut touches = 0;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut to = [0u8; 64];
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: `to` has room.
+                    black_box(unsafe { copy(to.as_mut_ptr(), (at + 64) as *const u8, 64) });
+                    for _ in 0..2000 {
+                        std::hint::spin_loop();
+                    }
+                }
+            });
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while std::time::Instant::now() < until {
+                protect(at as *mut u8, 0, PAGE_READWRITE | PAGE_GUARD);
+                // SAFETY: a committed page; its guard goes to the handler.
+                black_box(unsafe { (at as *const u8).read_volatile() });
+                touches += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        // SAFETY: the handler added above.
+        unsafe { RemoveVectoredExceptionHandler(handler) };
+        let reported = REPORTED.load(Ordering::Relaxed);
+        println!("{reported} of {touches} touches reported");
+        assert!(reported > 0);
+        protect(at as *mut u8, 0, PAGE_READWRITE | PAGE_GUARD);
+        let mut to = [0u8; 64];
+        // SAFETY: `to` has room.
+        assert!(!unsafe { copy(to.as_mut_ptr(), at as *const u8, 64) });
+        assert_eq!(protection(at as *mut u8, 0), PAGE_READWRITE | PAGE_GUARD);
+        free(at as *mut u8);
     }
 
     /// Memory another thread decommits and commits during the copies: each
