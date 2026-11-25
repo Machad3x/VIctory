@@ -4011,6 +4011,19 @@ impl<'a> Lower<'a> {
             }
             return Err(LANE_MASK);
         }
+        if name == "s_getreg_b32" {
+            let selector = imm.ok_or("a missing hardware register selector")?;
+            let (register, offset, width) = (selector & 63, selector >> 6 & 31, (selector >> 11) + 1);
+            // MODE[3:2] holds the FP16/FP64 rounding state tracked during lowering.
+            if register != 1 || offset < 2 || offset + width > 4 {
+                return Err("an unmodeled hardware register field");
+            }
+            let mode = self.mode16.ok_or("an unknown FP16/FP64 rounding mode")?;
+            let bits = u32::from(mode) >> (offset - 2) & ((1 << width) - 1);
+            let value = self.s.m.i32(bits);
+            self.set(lo, Val::I32(value));
+            return Ok(());
+        }
         if matches!(
             name,
             "s_setreg_imm32_b32" | "s_setreg_b32" | "s_swappc_b64" | "s_version"

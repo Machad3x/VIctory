@@ -239,6 +239,26 @@ fn run_cases(
 }
 
 #[test]
+fn read_fp_round_mode_field_after_each_setting() {
+    // S_ROUND_MODE writes both two-bit rounding fields. Give FP32 a
+    // different value so reading the wrong field cannot pass.
+    for mode in 0..4 {
+        let set_round_mode = 0xBFA4_0000 | (mode << 2) | (mode ^ 3);
+        for (offset, width, expected) in [(2, 2, mode), (2, 1, mode & 1), (3, 1, mode >> 1)] {
+            // S_GETREG_B32 s12, hwreg(MODE, offset, width).
+            let get_mode = 0xB90C_0001 | (offset << 6) | ((width - 1) << 11);
+            let body = [set_round_mode, get_mode, vop1(0x001, 0, sgpr(12))];
+            let shader = try_build_valu_cs(&body).unwrap_or_else(|error| {
+                panic!("S_GETREG_B32 MODE {offset}:{width} with rounding {mode}: {error}");
+            });
+            run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+                assert_eq!(got, expected, "{backend} MODE {offset}:{width} with rounding {mode}");
+            });
+        }
+    }
+}
+
+#[test]
 fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     let pack_words = |opcode: u32| {
         [
