@@ -83,6 +83,8 @@ pub(crate) struct Lowered {
     /// Live unsigned-greater-than clamps to `HEAP_VIEWS - 1`.
     #[cfg(test)]
     pub view_clamps: u32,
+    #[cfg(test)]
+    pub legacy_half_conversion: bool,
     /// Whether the module declares `dx.op.waveGetLaneIndex`.
     #[cfg(test)]
     pub uses_lane_index: bool,
@@ -1937,6 +1939,8 @@ impl<'a> Lower<'a> {
                 .m
                 .live_cmps_with_const(pred::IUGT, i64::from(super::HEAP_VIEWS - 1)),
             #[cfg(test)]
+            legacy_half_conversion: self.s.m.has_function("dx.op.legacyF32ToF16"),
+            #[cfg(test)]
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
@@ -2911,7 +2915,11 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        self.narrow16_bits(f, self.mode16 == Some(3))
+    }
+
+    /// Converts with a fixed rounding direction, independent of the host.
+    fn narrow16_bits(&mut self, f: V, rtz: bool) -> V {
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -5719,13 +5727,20 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut halves = Vec::new();
         for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
-                let m = self.s.m.i32(0xFFFF);
-                self.s.m.bin(c, Bin::And, x, m)
-            } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            halves.push(match numeric {
+                Numeric::Uint | Numeric::Sint => {
+                    let m = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, x, m)
+                }
+                Numeric::Uscaled | Numeric::Sscaled | Numeric::Unorm | Numeric::Snorm => {
+                    // D16 rounds these formats to nearest even, independently of VALU MODE.
+                    let f = self.as_float(x);
+                    self.narrow16_bits(f, false)
+                }
+                Numeric::Float => {
+                    let f = self.as_float(x);
+                    self.s.op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+                }
             });
         }
         let mut out = Vec::new();

@@ -518,6 +518,12 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
         (xy, 27, 0xBEEF_1234, 0xBEEF_1234),
         // 16_16_UNORM: 0.0 and 1.0, as f16.
         (xy, 23, 0xFFFF_0000, 0x3C00_0000),
+        // 16_USCALED and 16_SSCALED: halfway between adjacent halves.
+        // 2051 rounds to 2052, -2051 to -2052, and 2049 to 2048.
+        (x, 9, 2051, 0x6802),
+        (x, 10, 0xF7FD, 0xE802),
+        (x, 9, 2049, 0x6800),
+        (x, 7, 0x8010, 0x3801), // 16_UNORM, just above a midpoint
         // 16_FLOAT, one channel: the high half is 0.
         (x, 13, 0x4000_3C00, 0x0000_3C00),
     ];
