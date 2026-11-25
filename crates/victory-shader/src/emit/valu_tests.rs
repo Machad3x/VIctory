@@ -539,6 +539,22 @@ fn tbuffer_d16_loads_pack_two_channels_per_dword() {
 }
 
 #[test]
+fn d16_uscaled_keeps_nearest_even_in_valu_rtz_mode() {
+    // The same halfway value arrives as a buffer code in v1 and f32 in v2.
+    let mut body = vec![0xBA80_0881, 3]; // s_setreg_imm32_b32 hwreg(MODE, 2, 2), RTZ
+    body.extend(buffer_store_dword(1, 8, 0));
+    body.extend(mtbuf(8, 0, 8, 9)); // tbuffer_load_format_d16_x v0, 16_USCALED
+    body.push(vop1(0x0A, 3, vgpr(2))); // v_cvt_f16_f32 v3, v2
+    body.extend(vop3(0x36F, 0, vgpr(3), 128 + 16, vgpr(0))); // (v3 << 16) | v0
+
+    let shader = build_valu_cs(&body);
+    run_cases(&shader, &[[2051, 2051.0f32.to_bits(), 0, 0]], |backend, _, _, got| {
+        assert_eq!(got >> 16, 0x6801, "{backend}: VALU RTZ rounds to 2050");
+        assert_eq!(got & 0xffff, 0x6802, "{backend}: D16 RNE rounds to 2052");
+    });
+}
+
+#[test]
 fn normalized_buffer_formats_load_their_ends_exactly() {
     // tbuffer_load_format_x.
     let x = 0;
