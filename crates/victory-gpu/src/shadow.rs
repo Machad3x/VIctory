@@ -1512,6 +1512,15 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Counts title buffers made and released: which buffer is the innermost
+/// one holding some bytes ([`find`]) may differ when it changed.
+static OWNERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The count of [`OWNERS`].
+pub(crate) fn owners() -> u64 {
+    OWNERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The longest title buffer registered so far (it stays after the buffer is
 /// released): a buffer starting further below an address than this cannot
 /// hold it. Changed under `BUFFERS`' lock.
@@ -1550,6 +1559,7 @@ pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
 
 fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
     let mut map = buffers();
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     MAX_SPAN.fetch_max(len, Ordering::Relaxed);
     if len >= BIG_LEN {
         big().insert((start, resource), start.saturating_add(len));
@@ -1569,6 +1579,7 @@ fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     big().remove(&(start, resource));
     if map.remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
         changed();
