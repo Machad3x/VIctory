@@ -2498,3 +2498,28 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// An f16 result takes its output modifier (times 2, 4 or 0.5), then its
+/// clamp, before it is rounded to a half: 1.5 + 0.25 = 1.75 gives 3.5, 7
+/// and 0.875, and 1.0 clamped from 7; 1.5 x 0.25 = 0.375 gives 0.75.
+#[test]
+fn f16_results_take_their_output_modifier_then_clamp() {
+    const V_ADD_F16: u16 = 0x132;
+    const V_MUL_F16: u16 = 0x135;
+    let op = |op: u16, omod: u32, clamp: bool| {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), 0);
+        build_valu_cs(&[w0 | u32::from(clamp) << 15, w1 | omod << 27])
+    };
+    let cases = [[0x3E00, 0x3400, 0, 0]]; // 1.5, 0.25
+    for (shader, want) in [
+        (op(V_ADD_F16, 1, false), 0x4300), // 3.5
+        (op(V_ADD_F16, 2, false), 0x4700), // 7.0
+        (op(V_ADD_F16, 3, false), 0x3B00), // 0.875
+        (op(V_ADD_F16, 2, true), 0x3C00),  // 7.0 clamped: 1.0
+        (op(V_MUL_F16, 1, false), 0x3A00), // 0.75
+    ] {
+        run_cases(&shader, &cases, |backend, _, _, got| {
+            assert_eq!(got & 0xFFFF, want, "{backend}");
+        });
+    }
+}

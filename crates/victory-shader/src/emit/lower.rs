@@ -7660,9 +7660,14 @@ impl<'a> Lower<'a> {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
+        // The output modifier, then clamp, on the result in f32 before it is
+        // rounded to a half once, as `half_modifiers` does for an f16
+        // interpolation.
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
             if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                let k = l.s.m.f32(factor.to_bits());
+                f = l.s.m.bin(l.cur, Bin::Mul, f, k);
             }
             if v.clamp {
                 f = l.unary(7, f);
