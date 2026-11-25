@@ -1122,7 +1122,9 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    // Render-target XOR layouts of one 2D slice and mip have addresses
+    // (`Layout::addressable`); the other XOR modes do not.
+    if !layout.addressable() {
         once!(?desc, "texture contents in an XOR mode not uploaded");
         return None;
     }
@@ -1174,6 +1176,101 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A title-written texture in a render-target XOR layout (256x256
+    /// RGBA8, `SW_64KB_R_X`) is staged: the bytes read back from the upload
+    /// buffer are the formats crate's detile of its memory.
+    #[test]
+    fn a_render_target_xor_texture_is_staged() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 256,
+            height: 256,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        })
+        .unwrap();
+        assert!(layout.addressable());
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let (mut rows, mut total) = (0u32, 0);
+        // SAFETY: outputs for one subresource.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &d,
+                0,
+                1,
+                0,
+                Some(&mut footprint),
+                Some(&mut rows),
+                None,
+                Some(&mut total),
+            );
+        }
+        let memory: Vec<u8> = (0..layout.size as usize)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        let staging = Staging {
+            size: total,
+            spans: spans(&layout, 1, 1),
+            footprints: vec![footprint],
+            rows: vec![rows],
+            layout,
+            mips: 1,
+            memory: memory.as_ptr(),
+            tracked: None,
+            last: Mutex::default(),
+            uploads: Default::default(),
+            copied: Default::default(),
+        };
+        let (_, upload) = staging.refresh_now();
+        let (buffer, at, list) = upload.expect("staged");
+        assert_eq!(list, [0]);
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let mut want = vec![0; pitch * rows as usize];
+        let len = want.len();
+        staging
+            .layout
+            .detile(&memory, 0, 0, &mut want, pitch, len)
+            .unwrap();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: an upload buffer, mapped to read what was staged.
+        unsafe { buffer.Map(0, None, Some(&mut mapped)) }.unwrap();
+        let at = (footprint.Offset + at) as usize;
+        for row in 0..rows as usize {
+            // SAFETY: the staged rows of the subresource.
+            let got = unsafe {
+                std::slice::from_raw_parts(mapped.cast::<u8>().add(at + row * pitch), 256 * 4)
+            };
+            assert_eq!(got, &want[row * pitch..][..256 * 4], "row {row}");
+        }
+        // SAFETY: unmaps what was mapped above.
+        unsafe { buffer.Unmap(0, None) };
+    }
 
     #[test]
     fn packed_colors_round_trip_with_their_alpha() {
