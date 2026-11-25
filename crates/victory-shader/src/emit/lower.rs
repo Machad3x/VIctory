@@ -69,6 +69,8 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    #[cfg(test)]
+    barrier_modes: Vec<Option<i64>>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -741,8 +743,10 @@ impl<'a> Lower<'a> {
         s.outputs = x.outputs.clone();
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
-            matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
-                && (i.name().contains("store") || i.name().contains("atomic"))
+            let name = i.name();
+            (matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
+                || matches!(i.fields, Fields::Flat { .. }) && name.starts_with("global_"))
+                && (name.contains("store") || name.contains("atomic"))
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
@@ -1905,7 +1909,14 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
-            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap").count() as u32,
+            #[cfg(test)]
+            barrier_modes: self
+                .s
+                .m
+                .written_calls("dx.op.barrier")
+                .map(|args| self.s.m.int_value(args[1]))
+                .collect(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]

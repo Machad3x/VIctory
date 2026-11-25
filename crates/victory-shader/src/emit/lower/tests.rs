@@ -1528,3 +1528,33 @@ fn ds_bpermute_refuses_gds() {
         Err(crate::ShaderError::Unsupported { what: "GDS", .. })
     ));
 }
+
+#[test]
+fn global_writes_add_a_uav_fence_to_barriers() {
+    let uav = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 2,
+        user_data: 0,
+        slot: 0,
+    };
+    for (name, op, mode) in [
+        ("global_store_dword", 0x1C, 11),
+        ("global_atomic_add", 0x32, 11),
+        ("global_load_dword", 0x0C, 9),
+    ] {
+        let words = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xDC00_8000 | op << 18,
+            0x0200_0001, // address v1 + s[0:1], store data v0 or load result v2
+            0xBF8A_0000, // s_barrier
+            S_ENDPGM,
+        ];
+        let shader = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], vec![uav])
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(shader.barrier_modes, [Some(mode)], "{name}");
+    }
+}
