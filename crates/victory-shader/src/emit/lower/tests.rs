@@ -1558,3 +1558,22 @@ fn global_writes_add_a_uav_fence_to_barriers() {
         assert_eq!(shader.barrier_modes, [Some(mode)], "{name}");
     }
 }
+
+#[test]
+fn readfirstlane_uses_the_exec_guard_to_select_a_lane() {
+    for (narrow, calls) in [(0xBF80_0000, [0, 0, 1]), (0x7DA6_0082, [1, 1, 0])] {
+        let words = [
+            0xBE82_037E, // s_mov_b32 s2, exec_lo
+            narrow,      // s_nop 0 or v_cmpx_le_u32 exec_lo, 2, v0
+            0x7E06_0500, // v_readfirstlane_b32 s3, v0
+            0xBEFE_0302, // s_mov_b32 exec_lo, s2
+            0x7E02_0203, // v_mov_b32 v1, s3
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let lowered = lower_with(&words, vec![], vec![]).unwrap();
+        assert!(lowered.wave_ops);
+        assert_eq!(lowered.wave_lane_calls, calls, "{narrow:08x}");
+    }
+}

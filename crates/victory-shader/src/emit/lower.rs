@@ -74,6 +74,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Emitted calls to ballot, read-lane-at, and read-lane-first, in that order.
+    #[cfg(test)]
+    pub wave_lane_calls: [usize; 3],
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
@@ -1919,6 +1922,13 @@ impl<'a> Lower<'a> {
                 .collect(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            wave_lane_calls: [
+                "dx.op.waveActiveBallot",
+                "dx.op.waveReadLaneAt.i32",
+                "dx.op.waveReadLaneFirst.i32",
+            ]
+            .map(|name| self.s.m.written_calls(name)),
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
@@ -6371,10 +6381,18 @@ impl<'a> Lower<'a> {
             }
             return r;
         }
-        // A scalar result (`v_readlane`, `v_readfirstlane`) is written
-        // whatever EXEC holds.
+        // `write_i` writes scalar destinations regardless of EXEC, but a
+        // non-waterfall `v_readfirstlane_b32` selects its source lane from EXEC.
         let mut guard = match v.dst {
-            Some(Operand::Scalar { .. }) => None,
+            Some(Operand::Scalar { .. })
+                if name != "v_readfirstlane_b32"
+                    || inst
+                        .writes
+                        .first()
+                        .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
+            {
+                None
+            }
             _ => self.guard(b, i)?,
         };
         if let Some(d) = v.dpp {
@@ -7392,14 +7410,38 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = if let Some(g) = guard {
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let ballot = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
+                    let lo = self.s.m.extract(c, ballot, 0);
+                    let hi = self.s.m.extract(c, ballot, 1);
+                    let fa = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+                    let fb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let high = self.s.m.cmp(c, pred::NE, hi, z);
+                    let low = self.s.m.cmp(c, pred::NE, lo, z);
+                    // Empty EXEC reads lane 0.
+                    let hi_lane = self.s.m.select(c, high, fb32, z);
+                    let lane = self.s.m.select(c, low, fa, hi_lane);
+                    self.read_lane(a, lane)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        118,
+                        &[a],
+                    )
+                };
                 let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
