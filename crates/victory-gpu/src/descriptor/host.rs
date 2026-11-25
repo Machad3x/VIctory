@@ -1512,6 +1512,12 @@ fn buffer_srv(
         }
     };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let Some(format) = host_buffer_format(desc.Format, buffer.StructureByteStride, raw) else {
+        once!(format = ?desc.Format, raw, "buffer view of a format the host refuses");
+        return None;
+    };
+    desc.Format = format;
     if !in_buffer(&shadow.buffer, first, count, element) {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -1536,6 +1542,28 @@ fn buffer_srv(
 fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> bool {
     // SAFETY: a live buffer.
     within(unsafe { buffer.GetDesc() }.Width, first, count, element)
+}
+
+/// The format a host buffer view of the title's `format` with structure
+/// stride `stride`, raw or not, is made in (`None`: none the host takes).
+/// The host removes the device for a raw shader view of any format but
+/// R32_TYPELESS, and the debug layer refuses a structured view with a
+/// format and a typed view of a typeless format; the title's heap holds
+/// such views (made for its own runtime, or old ones in slots it does not
+/// use). A raw or structured view reads its bytes whatever the format
+/// says, so it takes the one the host wants; a raw view with a stride, or
+/// a typed view of no format or a typeless one, has none.
+fn host_buffer_format(format: DXGI_FORMAT, stride: u32, raw: bool) -> Option<DXGI_FORMAT> {
+    if raw {
+        return (stride == 0).then_some(DXGI_FORMAT_R32_TYPELESS);
+    }
+    if stride > 0 {
+        return Some(DXGI_FORMAT_UNKNOWN);
+    }
+    let f = format.0 as u32;
+    let family = crate::resource::family;
+    let typeless = family(f) == f && family(f + 1) == f;
+    (f != 0 && !typeless).then_some(format)
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
@@ -1596,6 +1624,12 @@ fn buffer_uav(
         }
     };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let Some(format) = host_buffer_format(desc.Format, buffer.StructureByteStride, raw) else {
+        once!(format = ?desc.Format, raw, "unordered buffer view of a format the host refuses");
+        return None;
+    };
+    desc.Format = format;
     if !in_buffer(&shadow.buffer, first, count, element) {
         once!(first, count, element, "unordered buffer view empty or past its host copy");
         return None;
@@ -2240,6 +2274,44 @@ mod tests {
         assert_eq!(copy_align(DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16), 16);
         // Too many dwords for one view.
         assert_eq!(raw_window(0, u32::MAX, 8), None);
+    }
+
+    /// Buffer views in formats the D3D12 debug layer refuses (checked on
+    /// WARP: raw of another format than R32_TYPELESS, structured with a
+    /// format, typed of a typeless format) take the format the host wants
+    /// where their bytes do not depend on it, and are refused where they
+    /// do; typed views keep theirs.
+    #[test]
+    fn buffer_views_take_a_format_the_host_takes() {
+        let host = host_buffer_format;
+        let (typeless, unknown) = (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN);
+        assert_eq!(host(typeless, 0, true), Some(typeless));
+        assert_eq!(host(DXGI_FORMAT_R32_UINT, 0, true), Some(typeless));
+        assert_eq!(host(typeless, 4, true), None);
+        for stride in [2, 6, 12, 4096] {
+            assert_eq!(
+                host(unknown, stride, false),
+                Some(unknown),
+                "stride {stride}"
+            );
+        }
+        assert_eq!(host(DXGI_FORMAT_R32_UINT, 4, false), Some(unknown));
+        assert_eq!(
+            host(DXGI_FORMAT_R32_UINT, 0, false),
+            Some(DXGI_FORMAT_R32_UINT)
+        );
+        assert_eq!(
+            host(DXGI_FORMAT_R8G8B8A8_UNORM, 0, false),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        for format in [
+            typeless,
+            DXGI_FORMAT_R8G8B8A8_TYPELESS,
+            DXGI_FORMAT_R16_TYPELESS,
+            unknown,
+        ] {
+            assert_eq!(host(format, 0, false), None, "{format:?}");
+        }
     }
 
     /// Typed buffer views of integer formats carry their kind in the
