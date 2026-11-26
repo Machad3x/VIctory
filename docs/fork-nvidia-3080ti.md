@@ -351,6 +351,27 @@ Cell window, 4,900 to 5,100 draws, one run each, medians:
 The frame difference is within the noise between runs (about 5 %). No draws
 dropped and no device removal.
 
+## One mark per wave
+
+From upstream pull request #2958: lanes whose write or read mark is the
+leading lane's leave the load and the atomic on the bitmap, which is in system
+memory, to that lane. With it #3013 (`Tracked::taken` leaves pages the
+tracker does not hold writable).
+
+Same scene, warm cache, medians of two runs against the one before:
+
+| | Before | Run 1 | Run 2 |
+|---|---|---|---|
+| Frame | 635 ms | 488 ms | 519 ms |
+| GPU step | 311 ms | 168 ms | 167 ms |
+| Copy-back | 104 ms | 111 ms | 119 ms |
+
+No draws dropped and no device removal. The last screenshot of run 1 shows
+rectangular blocks on the character's hair; they were not seen again in the
+17 screenshots of run 2, whose screenshot during the transition into the cell
+has one hard-edged lit rectangle. Whether either comes from this change is not
+established.
+
 ## Tried and left out
 
 | Change | Result here |
