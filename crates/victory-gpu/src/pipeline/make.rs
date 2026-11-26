@@ -20,12 +20,15 @@
 //! `PS_AreaLightIlluminance`) with such draws once, at the world's first
 //! frame, behind more than a thousand other pipelines. Dropped, the tables
 //! stay empty for the whole run. Idea from Belobug's fork (18e57db).
+//! Compute pipelines wait in the same class, as a one-off dispatch dropped
+//! is lost for the rest of the scene (`VICTORY_COMPUTE_WAIT=0` turns that
+//! off).
 //!
-//! shortcut: both budgets are guesses; any other pass the title runs only
+//! shortcut: both budgets are guesses; any other draw the title runs only
 //! once and whose pipeline takes longer than half a second is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -48,6 +51,8 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    /// Its place in the early list, if started early.
+    place: AtomicUsize,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -87,11 +92,22 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            place: AtomicUsize::new(usize::MAX),
         }
     }
 
     fn screen(&self) -> bool {
         self.graphics.as_ref().is_some_and(|g| g.screen_pass())
+    }
+
+    /// Waited for like a screen pass: a one-off dispatch dropped is lost.
+    fn urgent(&self) -> bool {
+        static COMPUTE: OnceLock<bool> = OnceLock::new();
+        let compute = || {
+            std::env::var_os("VICTORY_COMPUTE_WAIT").as_deref() != Some("0".as_ref())
+        };
+        self.screen()
+            || *COMPUTE.get_or_init(compute) && self.shaders.iter().any(|s| s.stage == "compute")
     }
 
     fn make(&self) {
@@ -190,13 +206,17 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
 
-/// The same for passes over the screen, below the title's 30 s GPU watchdog.
+/// The same for urgent pipelines (passes over the screen, compute), below the
+/// title's 30 s GPU watchdog.
+// shortcut: screen passes and compute share this budget, so slow compute
+// pipelines can use it up and a later screen pass of that frame is dropped;
+// split it if a run loses one.
 const SCREEN_BUDGET: Duration = Duration::from_secs(20);
 
-/// The queue a pipeline goes into, the first served first: passes over the
-/// screen a draw waits for, other draws' pipelines, early starts.
-fn lane(screen: bool, now: bool) -> usize {
-    match (now, screen) {
+/// The queue a pipeline goes into, the first served first: urgent pipelines
+/// a draw or dispatch waits for, other draws' pipelines, early starts.
+fn lane(urgent: bool, now: bool) -> usize {
+    match (now, urgent) {
         (true, true) => 0,
         (true, false) => 1,
         (false, _) => 2,
@@ -250,7 +270,11 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     super::library::note_created(&p.key);
-    if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.made.get().is_none()
+        && !p.shaders.is_empty()
+        && let Some(place) = super::library::early_place(&p.key)
+    {
+        p.place.store(place, Ordering::Relaxed);
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, false);
     }
@@ -258,15 +282,15 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    // The frame and what was waited of it: other pipelines, screen passes.
+    // The frame and what was waited of it: other pipelines, urgent ones.
     static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
     static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let screen = p.screen();
-    let (of_frame, waited) = (&FRAME[usize::from(screen)], &WAITED_US[usize::from(screen)]);
+    let urgent = p.urgent();
+    let (of_frame, waited) = (&FRAME[usize::from(urgent)], &WAITED_US[usize::from(urgent)]);
     if of_frame.swap(frame, Ordering::Relaxed) != frame {
         waited.store(0, Ordering::Relaxed);
     }
-    let budget = if screen { SCREEN_BUDGET } else { BUDGET };
+    let budget = if urgent { SCREEN_BUDGET } else { BUDGET };
     let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -312,9 +336,21 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    let lane = lane(p.screen(), now);
-    lock.lock().unwrap_or_else(|e| e.into_inner())[lane].push_back(p);
+    let lane = lane(p.urgent(), now);
+    push(&mut lock.lock().unwrap_or_else(|e| e.into_inner())[lane], p, lane == 2);
     work.notify_one();
+}
+
+/// Adds `p`; in the early starts' queue (`by_place`) after its equals by
+/// place in the early list, so they go in the order of first use. The draws'
+/// queues stay first come.
+fn push(queue: &mut VecDeque<Arc<Pending>>, p: Arc<Pending>, by_place: bool) {
+    let place = |p: &Pending| p.place.load(Ordering::Relaxed);
+    let at = match by_place {
+        true => queue.partition_point(|q| place(q) <= place(&p)),
+        false => queue.len(),
+    };
+    queue.insert(at, p);
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
@@ -428,6 +464,37 @@ mod tests {
             &[],
         );
         assert!(!p.screen());
+    }
+
+    /// A compute pipeline waits like a screen pass without being one.
+    #[test]
+    fn compute_is_urgent() {
+        let shader = Arc::new(Shader::new("compute", b""));
+        let p = Pending::new(
+            vec![shader],
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        assert!(p.urgent() && !p.screen());
+    }
+
+    /// Early starts are taken in the early list's order, not creation's.
+    #[test]
+    fn early_starts_go_by_first_use() {
+        let mut queue = VecDeque::new();
+        for place in [2, 0, 1] {
+            let p = Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            );
+            p.place.store(place, Ordering::Relaxed);
+            push(&mut queue, Arc::new(p), true);
+        }
+        let places: Vec<_> = queue.iter().map(|p| p.place.load(Ordering::Relaxed)).collect();
+        assert_eq!(places, [0, 1, 2]);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
