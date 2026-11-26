@@ -934,6 +934,7 @@ helpers moved to `lower/spill.rs`.
 | Change | Result here |
 |---|---|
 | Copies and read backs taking a newer alias first (local, committed and reverted) | Review: it copied a whole alias on every dispatch binding the source as unordered access and the alias as a view, left the source in a state it cannot be copied from, skipped copies across lists recorded in parallel, and could overwrite texels filled from title memory. No safe small version was found; the stale read ([#3170](https://github.com/Marvisak/VIctory/pull/3170)) stays, noted at `alias_source` |
+| Shader heaps behind a read-write lock (as in fxceless's and uiliannn's forks, upstream #3320), `gpu241` | Title threads no longer waited to write views (209 ms to 0), but the heap sync on the submitting thread, now contending with them for each heap's slot lock, rose from 43 to 160 ms a frame: preparing 245-277 ms against 125-144, frame 408-445 against 309-321 |
 | A second heap slot sync during the GPU wait | Preparing 161 ms against 154, frame 445 against 406, title threads waited longer to write views (one run). A slot's view copy now retired with its resource stayed from it |
 | Refreshes of copies in video memory through the copy pool | Refresh batches 69 ms against 64 (one run) |
 | Copy-back reads of title memory in user mode instead of `ReadProcessMemory` | Marked pages 81 ms against 61, copy-back 92 against 67, frame 439 against 390 (one run, a noisy one: preparing varied twice as much as before) |
