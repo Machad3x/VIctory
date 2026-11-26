@@ -1246,6 +1246,7 @@ mod tests {
             last: Mutex::default(),
             uploads: Default::default(),
             copied: Default::default(),
+            packed: None,
         };
         let (_, upload) = staging.refresh_now();
         let (buffer, at, list) = upload.expect("staged");
