@@ -63,6 +63,10 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    /// The bound views' formats by title slot, None where unresolved:
+    /// `targets` closes the gaps, which would shift later slots.
+    #[cfg(feature = "diagnostics")]
+    target_formats: Vec<Option<u32>>,
     depth: usize,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
@@ -143,6 +147,52 @@ pub(crate) fn take_root_view_slots() -> u64 {
 }
 static ROOT_VIEW_SLOTS: AtomicU64 = AtomicU64::new(0);
 
+/// Draws since the last [`report_target_formats`] with a bound view whose
+/// format differs from the pipeline's (invalid in D3D12), and with an
+/// unresolved view.
+#[cfg(feature = "diagnostics")]
+static MISMATCHED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+fn note_target_formats(p: &HostPipeline, bound: &[Option<u32>]) {
+    // (slot, pipeline format, bound format) already logged.
+    static SEEN: std::sync::Mutex<Vec<(usize, u32, Option<u32>)>> = std::sync::Mutex::new(Vec::new());
+    let (mut mismatched, mut unresolved) = (false, false);
+    for (slot, &bound) in bound.iter().enumerate() {
+        let declared = match p.targets.RTFormats.get(slot) {
+            Some(f) if slot < p.targets.NumRenderTargets as usize => f.0 as u32,
+            _ => 0,
+        };
+        match bound {
+            Some(f) if f == declared => continue,
+            Some(_) => mismatched = true,
+            None => unresolved = true,
+        }
+        let key = (slot, declared, bound);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&key) {
+            seen.push(key);
+            let shaders = &p.name;
+            match bound {
+                Some(bound) => tracing::warn!(slot, pipeline = declared, bound, %shaders, "render target format mismatch (logged once)"),
+                None => tracing::warn!(slot, pipeline = declared, %shaders, "unresolved render target slot (logged once)"),
+            }
+        }
+    }
+    MISMATCHED.fetch_add(u64::from(mismatched), Ordering::Relaxed);
+    UNRESOLVED.fetch_add(u64::from(unresolved), Ordering::Relaxed);
+}
+
+/// Logs the draws counted since the last call (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn report_target_formats() {
+    let mismatched = MISMATCHED.swap(0, Ordering::Relaxed);
+    let unresolved = UNRESOLVED.swap(0, Ordering::Relaxed);
+    tracing::info!("render targets since the last report: {mismatched} draws with a format mismatch, {unresolved} with an unresolved slot");
+}
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -165,6 +215,9 @@ pub(crate) fn take_frame() -> Vec<String> {
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
 pub(crate) fn take_dropped() -> u64 {
+    // Its only caller runs once per frame report.
+    #[cfg(feature = "diagnostics")]
+    report_target_formats();
     DROPPED.swap(0, Ordering::Relaxed)
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -470,7 +523,12 @@ impl State {
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
-        for &h in handles {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.target_formats.clear();
+            self.target_formats.resize(handles.len(), None);
+        }
+        for (_slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -485,6 +543,14 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             list.keep(&texture);
+            #[cfg(feature = "diagnostics")]
+            {
+                // A view without a format takes its resource's.
+                let format = record.desc().map(|d| d.Format.0).filter(|&f| f != 0);
+                // SAFETY: a live resource.
+                let format = format.unwrap_or_else(|| unsafe { texture.GetDesc() }.Format.0);
+                self.target_formats[_slot] = Some(format as u32);
+            }
             rtvs.push(host.rtv(&texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -662,6 +728,8 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             (self.host_pipeline, self.host_roots[1]) = (p.pso.as_raw() as usize, 0);
         }
+        #[cfg(feature = "diagnostics")]
+        note_target_formats(p, &self.target_formats);
         true
     }
 

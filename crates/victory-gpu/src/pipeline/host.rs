@@ -380,6 +380,10 @@ pub(crate) struct HostPipeline {
     /// written-pages bitmap, if a stage marks its writes through views
     /// (`victory_shader::emit`, "Write marks").
     pub(crate) marks: Option<(u32, u32)>,
+    /// The render target formats it declares, to compare with the bound
+    /// views.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -634,6 +638,8 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                #[cfg(feature = "diagnostics")]
+                targets: Default::default(),
             });
         }
         let Some(g) = g else {
@@ -682,6 +688,8 @@ impl HostPipeline {
                 slots: 0,
                 inputs: Vec::new(),
                 marks,
+                #[cfg(feature = "diagnostics")]
+                targets: g.targets,
             });
         }
 
@@ -784,6 +792,8 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             marks,
+            #[cfg(feature = "diagnostics")]
+            targets: g.targets,
         })
     }
 }
