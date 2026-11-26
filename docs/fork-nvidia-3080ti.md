@@ -2,7 +2,8 @@
 
 This fork stacks open upstream pull requests on `main` (940d32f, then merged
 with `main` at 67e8ae1) and a few local changes, aimed at one machine: Ryzen 7 5700X, RTX 3080 Ti 12 GB
-(driver 621.24), 32 GB RAM, Windows 11. Nothing here is tested elsewhere.
+(driver 621.40 since 26 November, 621.24 before), 32 GB RAM, Windows 11.
+Nothing here is tested elsewhere.
 
 ## How the console and this host differ
 
@@ -571,6 +572,47 @@ One run (`gpu196`): frame 385 ms, preparing 125 ms, marked pages 84 ms, within
 what runs of one binary have given here (marked pages 63 to 86 ms over the last
 runs without changes to them). The yard people rendered dark, as in some runs
 since `gpu189`, before these changes.
+
+## Bound targets kept and partial 64 KiB pages
+
+Two commits taken with their author's name (fuzeofficial):
+
+- [#3128](https://github.com/Marvisak/VIctory/pull/3128): a bound render or
+  depth target stays alive with the command list that recorded it, also when no
+  draw follows and the title releases it before submission.
+- [#3125](https://github.com/Marvisak/VIctory/pull/3125): a 64 KiB page counts
+  as unmapped only after all of its regions were scanned, so a partly mapped
+  page is not zeroed.
+
+Three runs completed with them (`gpu199` to `gpu201`). In the same window the
+guard fallbacks stayed at about 7 a frame; protect calls went from about 2,070
+to 2,290 and protecting from about 9 to 11 ms (one run, and the driver changed
+too).
+
+## Driver 621.40 and a streamed session
+
+On 26 November the driver changed from 621.24 to 621.40 and the machine is
+driven through Sunshine, so earlier timings are not a baseline. The new driver
+rejected the pipeline library, and two runs went into making pipelines again.
+
+| Median, cell window | `gpu196` (621.24) | `gpu201` (621.40, Sunshine) |
+|---|---|---|
+| Frame | 385 ms | 369 ms |
+| Preparing | 125 ms | 121 ms |
+| GPU | 163 ms | 171 ms |
+| Copy-back | 90 ms | 68 ms |
+| Marked pages | 84 ms | 63 ms |
+| Process commit, peak | 36.9 GB | 30.5 GB |
+| Rust heap, peak | 10.5 GB | 3.6 GB |
+
+One run each, within the spread of repeated runs except for memory. The lower
+memory goes with a pipeline library of a few hundred MB instead of several GB
+(every save serialises the whole library into one buffer); that link is not
+measured on its own. No dark yard people in the last screenshot of `gpu201`.
+
+Three of six runs on 621.24 (`gpu193` to `gpu198`) ended in a device removal
+while the world loaded; none of the three on 621.40 did. The cause was never
+established.
 
 ## CPU clock and core parking
 
