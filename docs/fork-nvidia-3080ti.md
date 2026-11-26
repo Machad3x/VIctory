@@ -623,6 +623,58 @@ one, with a median of 6 parked. With parking off for one run preparing took
 141 ms (151 and 162 before) and copy-back 99 ms (81 and 78): the frame did not
 change, and the setting was put back.
 
+## Texture uploads and marked page comparison
+
+Found by reading our upload path; no visible effect has been tied to any of
+them yet:
+
+- A detile that fails for lack of staging space is retried; the written pages
+  had already been taken from the tracker. A subresource the layout cannot
+  detile no longer drops the others of the same refresh.
+- A copy into part of a texture uploads title memory first, so the rest is not
+  left zeroed. A boxless copy that replaces a one-subresource texture skips
+  it; the two-plane R32G8X24 and R24G8 formats do not count as replaced.
+- A rewritten heap slot of a placed texture already made, and read lately, is
+  viewed at once instead of staying null for a submission.
+- BC7 channel rotation applies to modes 4 and 5 only
+  ([#3111](https://github.com/Marvisak/VIctory/pull/3111)).
+
+Marked page comparison now takes 64 bytes at a time and skips the earlier
+bytes where nothing differs. It is faster in a test and made no measurable
+difference in the game (`gpu203`). Reading a whole run of title pages with one
+call was tried and reverted: in `gpu204` the marked pages took 92 ms a frame
+against 63 and page faults went from about 6,500 to 9,200. That is one run, and
+two later runs of nearly the same build gave 54 (`gpu207`) and 76 ms
+(`gpu208`), so the loss is not established; no gain was measured either.
+
+## Water sums, host-written textures and shader fixes
+
+- Two compute programs of the water that did not translate (a sum of 64-bit
+  values over a console wave of 64) translate now. In `gpu206` both ran from
+  frame 1763 to the end. `gpu205` ended in a device removal 48 s after their
+  first use; `gpu206`, the same build with removal tracking on, did not, and
+  the cause is not established.
+- A texture the host GPU wrote was preferred over title memory for good
+  ([#758](https://github.com/Marvisak/VIctory/issues/758)). The preference now
+  ends when title writes reached every page of a page-aligned texture of two
+  pages or more. Copy-backs, read backs and remaps do not count.
+- VOP3 `fmac` and `mac` apply the accumulator's abs and neg
+  ([#3158](https://github.com/Marvisak/VIctory/pull/3158),
+  [#3192](https://github.com/Marvisak/VIctory/pull/3192)); no document of the
+  hardware was checked for it.
+- `image_get_resinfo` answers six faces for a cube
+  ([#3010](https://github.com/Marvisak/VIctory/pull/3010); cube arrays still
+  answer six), and a `saveexec` without a restore no longer hides the sections
+  after it ([#3187](https://github.com/Marvisak/VIctory/pull/3187)).
+- 32-bit integer typed UAVs accessed as floats gave the same bits on the
+  RTX 3080 Ti and removed the WARP device; left as it is.
+- `gpu207` and `gpu208` ran the whole five minutes with every program of the
+  scene translated. The yard buildings were black in one screenshot of
+  `gpu207` and lit in the same moment of `gpu208`.
+- Queries, counted in `gpu208`: 59 occlusion queries a frame, resolved with one
+  call, each ended in the list that began it, none with a dropped draw inside.
+  Their results are still made up.
+
 ## Tried and left out
 
 | Change | Result here |
