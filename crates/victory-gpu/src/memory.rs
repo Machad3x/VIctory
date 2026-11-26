@@ -39,7 +39,6 @@
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
 //! past that, the smallest copies read as missing (logged once).
 
-use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::{
@@ -47,6 +46,7 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 
 use crate::descriptor::host::HostHeap;
+use crate::fx;
 use crate::host::HostList;
 use crate::shadow::Shadow;
 
@@ -128,7 +128,7 @@ struct Shared {
     /// The pair of null views entries without a copy name.
     null: u32,
     /// Each copy's view pair (its first slot), by copy.
-    pairs: HashMap<usize, u32>,
+    pairs: fx::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
@@ -419,7 +419,7 @@ impl Shared {
             data: data as usize,
             gpu,
             null,
-            pairs: HashMap::new(),
+            pairs: fx::Map::default(),
             generation: u64::MAX,
             layout: Arc::default(),
         })
@@ -431,7 +431,7 @@ impl Shared {
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
         let copies = crate::shadow::all();
-        let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
+        let live: fx::Set<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
             let keep = live.contains(copy);
             if !keep {
