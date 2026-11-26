@@ -102,6 +102,15 @@ pub(crate) enum Sym {
         lanes: u64,
         hi: u32,
     },
+    /// One dword (`high`: the upper) of a 64-bit float sum over `lanes` of
+    /// the doubles `mask ? hi:lo : 0.0`.
+    Wide {
+        lo: Value,
+        hi: Value,
+        mask: Value,
+        lanes: u64,
+        high: bool,
+    },
 }
 
 /// What a value a section leaves holds in every lane.
@@ -118,6 +127,9 @@ pub(crate) enum Shape {
     /// [`Sym::Half`] over every lane: `op`, src, mask, identity, the lane
     /// giving the high half.
     Half(Op, Value, Value, u32, u32),
+    /// [`Sym::Wide`] over every lane: low and high source dwords, mask, and
+    /// whether this is the upper dword.
+    Wide(Value, Value, Value, bool),
 }
 
 /// The section starting at instruction `start` of a block: its restore
@@ -347,6 +359,71 @@ fn half(op: Op, a: Sym, b: Option<Sym>, old: Sym) -> Sym {
     }
 }
 
+/// A lane's `v_add_f64` of the dword pairs `a` and `b`.
+fn add_f64(a: (Sym, Sym), b: (Sym, Sym)) -> (Sym, Sym) {
+    // A pair's term: nothing (+0.0), or (low source, high source, mask, lanes).
+    let term = |p: (Sym, Sym)| match p {
+        (Sym::K(0), Sym::K(0)) => Some(None),
+        (
+            Sym::Red {
+                op: None,
+                src: lo,
+                mask,
+                ident: 0,
+                lanes,
+            },
+            Sym::Red {
+                op: None,
+                src: hi,
+                mask: m,
+                ident: 0,
+                lanes: l,
+            },
+        ) if (mask, lanes) == (m, l) => Some(Some((lo, hi, mask, lanes))),
+        (
+            Sym::Wide {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high: false,
+            },
+            upper,
+        ) if upper
+            == (Sym::Wide {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high: true,
+            }) =>
+        {
+            Some(Some((lo, hi, mask, lanes)))
+        }
+        _ => None,
+    };
+    let unknown = (Sym::Unknown, Sym::Unknown);
+    let (Some(x), Some(y)) = (term(a), term(b)) else {
+        return unknown;
+    };
+    let (lo, hi, mask, lanes) = match (x, y) {
+        (None, None) => return (Sym::K(0), Sym::K(0)),
+        // A sum with +0.0 is not followed: it would turn a -0.0 into +0.0.
+        (Some(x), Some(y)) if (x.0, x.1, x.2) == (y.0, y.1, y.2) && x.3 & y.3 == 0 => {
+            (x.0, x.1, x.2, x.3 | y.3)
+        }
+        _ => return unknown,
+    };
+    let half = |high| Sym::Wide {
+        lo,
+        hi,
+        mask,
+        lanes,
+        high,
+    };
+    (half(false), half(true))
+}
+
 fn simulate(
     insts: &[Inst],
     wave: u32,
@@ -427,7 +504,17 @@ fn simulate(
                         sconst.remove(&w);
                     }
                 }
-                uni.entry(w).or_insert(Sym::Unknown);
+                // A copy of a scalar the section wrote keeps what it holds.
+                let copied = match (src.first(), r) {
+                    (Some(&Operand::Scalar { code: from, .. }), Reg::S(code))
+                        if name.starts_with("s_mov_b") && from != NULL =>
+                    {
+                        inst.read(Reg::S(from + (code - base)))
+                            .and_then(|v| uni.get(&v).copied())
+                    }
+                    _ => None,
+                };
+                uni.entry(w).or_insert(copied.unwrap_or(Sym::Unknown));
             }
             continue;
         }
@@ -480,11 +567,50 @@ fn simulate(
             };
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
+                // `Own` is each lane's own value, not lane `l`'s.
                 let s = l
                     .and_then(|l| x.get(l as usize).copied())
+                    .filter(|s| !matches!(s, Sym::Own(_)))
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
+            continue;
+        }
+        if name == "v_add_f64"
+            && let Some(Operand::Vector { reg: d, .. }) = v.dst
+            && let (Some(low), Some(high)) = (inst.write(Reg::V(d)), inst.write(Reg::V(d + 1)))
+        {
+            // Dword `i` of operand `k` in every lane; operands other than
+            // register pairs are not followed.
+            let dword = |k: usize, i: u8| {
+                let op = match v.src.get(k) {
+                    Some(&Operand::Vector { reg, dwords }) => Operand::Vector {
+                        reg: reg + i,
+                        dwords,
+                    },
+                    Some(&Operand::Scalar { code, dwords }) if code != NULL => Operand::Scalar {
+                        code: code + i,
+                        dwords,
+                    },
+                    _ => return vec![Sym::Unknown; wave as usize],
+                };
+                lanes(&op, &vec, &uni)
+            };
+            let a = (dword(0, 0), dword(0, 1));
+            let b = (dword(1, 0), dword(1, 1));
+            let old = |reg| lanes(&Operand::Vector { reg, dwords: 1 }, &vec, &uni);
+            let (mut lo, mut hi) = (old(d), old(d + 1));
+            for l in 0..wave as usize {
+                if exec >> l & 1 != 0 {
+                    (lo[l], hi[l]) = if modifiers || v.dpp.is_some() {
+                        (Sym::Unknown, Sym::Unknown)
+                    } else {
+                        add_f64((a.0[l], a.1[l]), (b.0[l], b.1[l]))
+                    };
+                }
+            }
+            vec.insert(low, lo);
+            vec.insert(high, hi);
             continue;
         }
         let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
@@ -725,6 +851,13 @@ fn shapes(
             lanes,
             hi,
         } if lanes == all => Some(Shape::Half(op, src, mask, ident, hi)),
+        Sym::Wide {
+            lo,
+            hi,
+            mask,
+            lanes,
+            high,
+        } if lanes == all => Some(Shape::Wide(lo, hi, mask, high)),
         _ => None,
     };
     for (v, s) in uni {
@@ -768,6 +901,13 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
                 ident,
                 lanes,
             } if lanes == all => Some(Shape::Active(op, src, mask, ident)),
+            Sym::Wide {
+                lo,
+                hi,
+                mask,
+                lanes,
+                high,
+            } if lanes == all => Some(Shape::Wide(lo, hi, mask, high)),
             _ => None,
         };
     }
@@ -824,6 +964,42 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     }
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
+
+/// The compiler's sum of doubles over a console wave64: v10 (low) and v11
+/// (high) of the lanes in `vcc`, left in s12 (low) and s13 (high).
+#[cfg(test)]
+#[rustfmt::skip]
+pub(super) const F64_SUM: &[u32] = &[
+    0xBE80_25C1,              // s_or_saveexec_b64 s[0:1], -1
+    0x7E04_0280,              // v_mov_b32 v2, 0
+    0x7E06_0280,              // v_mov_b32 v3, 0
+    0x8790_006A,              // s_and_b64 s[16:17], vcc, s[0:1]
+    0xD501_0002, 0x0042_1502, // v_cndmask_b32 v2, v2, v10, s[16:17]
+    0xD501_0003, 0x0042_1703, // v_cndmask_b32 v3, v3, v11, s[16:17]
+    0x7E08_02E9, 0xDE54_C102, // v_mov_b32 v4, v2 dpp8:[1,0,3,2,5,4,7,6]
+    0x7E0A_02E9, 0xDE54_C103, // v_mov_b32 v5, v3 (the same)
+    0xD564_0002, 0x0002_0504, // v_add_f64 v[2:3], v[4:5], v[2:3]
+    0x7E08_02E9, 0x9360_1202, // v_mov_b32 v4, v2 dpp8:[2,2,0,0,6,6,4,4]
+    0x7E0A_02E9, 0x9360_1203,
+    0xD564_0002, 0x0002_0504,
+    0x7E08_02E9, 0x0009_2402, // v_mov_b32 v4, v2 dpp8:[4,4,4,4,0,0,0,0]
+    0x7E0A_02E9, 0x0009_2403,
+    0xD564_0002, 0x0002_0504,
+    0x7E08_02FA, 0xFF01_4002, // v_mov_b32 v4, v2 row_mirror
+    0x7E0A_02FA, 0xFF01_4003,
+    0xD564_0002, 0x0002_0504,
+    0xD778_0004, 0x0201_0102, // v_permlanex16_b32 v4, v2, 0, 0
+    0xD778_0005, 0x0201_0103, // v_permlanex16_b32 v5, v3, 0, 0
+    0xD564_0002, 0x0002_0504,
+    0xD760_000E, 0x0001_4102, // v_readlane_b32 s14, v2, 32
+    0xD760_000F, 0x0001_4103, // v_readlane_b32 s15, v3, 32
+    0xD564_0002, 0x0002_040E, // v_add_f64 v[2:3], s[14:15], v[2:3]
+    0xD760_000E, 0x0001_0102, // v_readlane_b32 s14, v2, 0
+    0xD760_000F, 0x0001_0103, // v_readlane_b32 s15, v3, 0
+    0xBE8C_030E,              // s_mov_b32 s12, s14
+    0xBE8D_030F,              // s_mov_b32 s13, s15
+    0xBEFE_0400,              // s_mov_b64 exec, s[0:1]
+];
 
 #[cfg(test)]
 mod tests {
@@ -895,6 +1071,68 @@ mod tests {
             fi: false,
         };
         assert_eq!(dpp_lane(swap, 8), Some((9, false, true)));
+    }
+
+    /// A wave64 sum of doubles leaves its two dwords in scalar copies; the
+    /// lanes the sum was not gathered in (the upper half) keep no shape.
+    #[test]
+    fn a_wave64_f64_sum_leaves_its_two_dwords() {
+        let p = build(F64_SUM, true);
+        let insts = &p.blocks[0].insts;
+        let of = |reg: Reg| insts.iter().find_map(|i| i.read(reg)).unwrap();
+        let last = |reg: Reg| {
+            insts
+                .iter()
+                .filter_map(|i| i.write(reg))
+                .next_back()
+                .unwrap()
+        };
+        let (lo, hi) = (of(Reg::V(10)), of(Reg::V(11)));
+        let mask = insts[3].write(Reg::S(16)).unwrap();
+        let sec = &sections(&p, 0)[&0];
+        assert_eq!(sec.ended, None);
+        for (reg, high) in [(12, false), (13, true)] {
+            assert_eq!(
+                sec.shapes.get(&last(Reg::S(reg))),
+                Some(&Shape::Wide(lo, hi, mask, high)),
+                "s{reg}"
+            );
+        }
+        assert_eq!(sec.shapes.get(&last(Reg::V(2))), None);
+
+        // Without the upper half's term the sum is not the wave's.
+        let mut w = F64_SUM.to_vec();
+        let add = w
+            .windows(2)
+            .position(|x| x == [0xD564_0002, 0x0002_040E])
+            .unwrap();
+        w.drain(add..add + 2);
+        let p = build(&w, true);
+        let s12 = p.blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| i.write(Reg::S(12)))
+            .next_back()
+            .unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&s12), None);
+    }
+
+    /// Lane 32 of a vector the section did not write is not each lane's own.
+    #[test]
+    fn a_lane_read_of_an_unwritten_vector_has_no_shape() {
+        let words = [
+            0xBE80_25C1,              // s_or_saveexec_b64 s[0:1], -1
+            0xD760_000E, 0x0001_410A, // v_readlane_b32 s14, v10, 32
+            0xBE8C_030E,              // s_mov_b32 s12, s14
+            0xBEFE_0400,              // s_mov_b64 exec, s[0:1]
+        ];
+        let p = build(&words, true);
+        let s12 = p.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| i.write(Reg::S(12)))
+            .unwrap();
+        assert_eq!(sections(&p, 0)[&0].shapes.get(&s12), None);
     }
 
     #[test]

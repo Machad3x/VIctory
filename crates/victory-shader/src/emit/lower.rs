@@ -346,6 +346,9 @@ struct Lower<'a> {
     console_flat: Option<V>,
     /// Group-shared slots the two halves exchange a dword through.
     xchg: Option<V>,
+    /// [`Self::wide_sum`]s made, by DXIL block, sources and mask: the second
+    /// dword of a sum reuses the first's wave operation and exchanges.
+    wide_sums: HashMap<(usize, Value, Value, Value), (V, V)>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -1045,6 +1048,7 @@ impl<'a> Lower<'a> {
             no_console_flow,
             console_flat: None,
             xchg: None,
+            wide_sums: HashMap::new(),
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
@@ -1514,6 +1518,10 @@ impl<'a> Lower<'a> {
         let (op, src, mask, ident, prefix) = match shape {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
+            Shape::Wide(lo, hi, mask, high) => {
+                let (lo, hi) = self.wide_sum(lo, hi, mask)?;
+                return Ok(if high { hi } else { lo });
+            }
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
@@ -1758,6 +1766,72 @@ impl<'a> Lower<'a> {
             });
         }
         Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// The dwords of a whole-wave section's sum of doubles
+    /// ([`super::wave::Shape::Wide`]) over the console wave: when split, the
+    /// halves' sums added.
+    fn wide_sum(&mut self, lo: Value, hi: Value, mask: Value) -> Result<(V, V), Why> {
+        if self.mask_data == MaskData::None {
+            return Err("a wave reduction in a mesh shader");
+        }
+        if self.split && !self.console_cf {
+            return Err("a wave reduction in a wave64 program split in halves");
+        }
+        // The host adds to nearest even only.
+        if self.mode16 != Some(0) {
+            return Err("a 64-bit wave reduction in another round mode");
+        }
+        let c = self.cur;
+        if let Some(&r) = self.wide_sums.get(&(c, lo, hi, mask)) {
+            return Ok(r);
+        }
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        let on = self.boolean(m, c)?;
+        let zero = self.s.m.i32(0);
+        let (x, y) = (self.i32_of(lo)?, self.i32_of(hi)?);
+        let x = self.s.m.select(c, on, x, zero);
+        let y = self.s.m.select(c, on, y, zero);
+        self.s.flags |= flags::WAVE_OPS | flags::FLOAT64;
+        let (i32t, double) = (self.s.t.i32, self.s.m.double());
+        let make = |l: &mut Self, lo: V, hi: V| {
+            l.s.op(c, "makeDouble.f64", Attr::ReadNone, double, 101, &[lo, hi])
+        };
+        let split = |l: &mut Self, x: V| {
+            let two = l.s.m.named_struct("dx.types.splitdouble", vec![i32t; 2]);
+            let r = l.s.op(c, "splitDouble.f64", Attr::ReadNone, two, 102, &[x]);
+            (l.s.m.extract(c, r, 0), l.s.m.extract(c, r, 1))
+        };
+        let x = make(self, x, y);
+        let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+        // (The host adds in its own order, as for 32-bit float sums: the
+        // last bits may differ from the console's.)
+        let r = self.s.op(
+            c,
+            "waveActiveOp.f64",
+            Attr::NoUnwind,
+            double,
+            119,
+            &[x, sum, signed],
+        );
+        let mut r = split(self, r);
+        // A group of 32 threads or fewer has no upper half to add.
+        let upper_half = self.s.threads.is_some_and(|t| t.iter().product::<u32>() > 32);
+        if self.split && upper_half {
+            // The halves' sums, exchanged as their dwords and added last.
+            let (a, b) = self.exchange(c, r.0);
+            let (d, e) = self.exchange(c, r.1);
+            let (lower, upper) = (make(self, a, d), make(self, b, e));
+            let total = self.s.m.bin(c, Bin::Add, lower, upper);
+            r = split(self, total);
+        }
+        self.wide_sums.insert((c, lo, hi, mask), r);
+        Ok(r)
     }
 
     fn run(mut self, partial: bool) -> Result<Lowered, Stop> {

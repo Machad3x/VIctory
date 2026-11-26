@@ -646,6 +646,34 @@ fn wave64_inclusive_prefix_joins_both_host_waves() {
     console_flow_case("whole-wave inclusive sum", &body, 64, |n| n * (n + 1) / 2);
 }
 
+/// A sum of doubles over each console wave ([`super::wave::F64_SUM`]): lane
+/// u gives 2^32 + u * 2^-12 (every partial sum exact), the lanes below
+/// `limit` of each wave take part, and every lane gets one dword of it.
+#[test]
+fn whole_wave_f64_sums_join_both_host_waves() {
+    for (threads, limit) in [(64u32, 64u32), (64, 40), (64, 20), (36, 64), (32, 64), (128, 40)] {
+        for high in [false, true] {
+            let mut body = vec![
+                0x3414_0088, // v_lshlrev_b32 v10, 8, v0
+                0x7E16_02FF,
+                0x41F0_0000,         // v_mov_b32 v11, 0x41f00000
+                0x3618_00BF,         // v_and_b32 v12, 63, v0
+                0x7D88_1880 + limit, // v_cmp_gt_u32 vcc, limit, v12
+            ];
+            body.extend_from_slice(super::wave::F64_SUM);
+            body.push(0x7E04_020C + u32::from(high)); // v_mov_b32 v2, s12 or s13
+            let label = format!("whole-wave v_add_f64, lanes below {limit}, high {high}");
+            console_flow_case(&label, &body, threads, |t| {
+                let first = t & !63;
+                let sum = (first..threads.min(first + limit))
+                    .map(|u| f64::from_bits(0x41F0_0000 << 32 | u64::from(u) << 8))
+                    .fold(0.0, |a, b| a + b);
+                (f64::to_bits(sum) >> if high { 32 } else { 0 }) as u32
+            });
+        }
+    }
+}
+
 /// A scan of the lane ids with `opcode` (a VOP2 operation) as its step and
 /// `ident` (an inline constant operand) in the lanes outside the mask, as
 /// in the test above, then a read of lane 63: the reduction over the whole
