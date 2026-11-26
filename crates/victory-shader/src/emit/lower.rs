@@ -10536,9 +10536,10 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
-            // float and normalized formats; for integer formats (the view's
-            // kind, from the view-stride table) the integer's low 16 bits.
+            // Two 16-bit channels per VGPR (an odd last channel keeps the
+            // register's high half): f16 for float and normalized formats; for
+            // integer formats (the view's kind, from the view-stride table) the
+            // integer's low 16 bits.
             // shortcut: an integer view is read and written through the
             // float-typed handle, so its channels' bits travel as the driver
             // passes a mismatched component type (unchanged on the RX 6700
@@ -10569,7 +10570,19 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let r = reg + k as u8;
+                let mut x = x.expect("a channel");
+                if 2 * k + 1 == count {
+                    // A high half with no DXIL form reads 0.
+                    let old = match inst.read(Reg::V(r)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => self.s.m.i32(0),
+                    };
+                    let keep = self.s.m.i32(0xFFFF_0000);
+                    let old = self.s.m.bin(c, Bin::And, old, keep);
+                    x = self.s.m.bin(c, Bin::Or, old, x);
+                }
+                self.write(inst, Reg::V(r), x, guard);
             }
             return Ok(());
         }
