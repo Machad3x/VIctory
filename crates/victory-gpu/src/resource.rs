@@ -288,7 +288,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
 #[cfg(windows)]
 fn packed_target_format(
     format: u32,
-    support: impl FnOnce(u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
+    support: impl Fn(u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
 ) -> u32 {
     use windows::Win32::Graphics::Direct3D12::*;
     let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
@@ -1397,6 +1397,14 @@ fn shared_texture(
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Some(t);
     }
+    // Made before its memory's stand-in: a read-only 67 texture over the
+    // memory of a writable 67 title texture makes that stand-in itself.
+    let key = match stand_in_key(key, desc) {
+        Some(alt)
+            if TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner()).get(&address).into_iter().flatten()
+                .any(|&r| memory_key(address, &resource(r as This).desc) == Some(alt)) => Some(alt),
+        _ => key,
+    };
     let live = key.and_then(live_at);
     if let Some(t) = &live
         && takes(t, &d)
