@@ -1080,6 +1080,26 @@ A draw still reads title slot 999,999, past the host heap: indexed heap
 reads past 721,469 read a null view. A sparse remap of title slots to host
 slots is being designed.
 
+### Shader review fixes, `gpu257` to `gpu260`
+
+The shader review's fixes: title-memory pages are marked once per wave bit
+after a load, with the lead lanes found by one `WaveMatch`; sub-dword loads
+read the next dword only at byte 3 and take their dword and byte from the
+raw view's offset; `buffer_store_short` at byte 3 writes its high byte. A
+uniform page handle for scalar loads was tried and left out (scalar registers
+are not wave-uniform in the per-lane form).
+
+The changed programs give about 1,700 new pipelines, which took three runs to
+build: `gpu257` and `gpu258` still dropped 500 to 940 draws a frame waiting
+for them, and `gpu259` (393 still being made) was dark, 6.2 / 5.2.
+
+| Run | Pipelines being made | Picture (wall / floor) | Frame ms | GPU ms |
+|---|---|---|---|---|
+| `gpu255` (before) | 0 | 44.4 / 21.0 | 250-303 | 79-92 |
+| `gpu260` | 0 | 34.8 / 28.1 | 281-299 | 92-97 |
+
+Lit, no draws dropped, no device removal; the frame is in the same range.
+
 ## Open problems
 
 - About 1 frame per second.
