@@ -798,6 +798,8 @@ impl Shadow {
             compared.push(Compared { page, from, to, back });
         }
         let mut written = 0;
+        // The pages written through views of our own.
+        let mut unseen = Vec::new();
         // Title memory opened once for each stretch of pages with bytes to
         // write: never a page between them, which may be one that keeps the
         // shaders' bytes out of title memory.
@@ -806,13 +808,20 @@ impl Shadow {
                 continue;
             }
             let (from, to) = (stretch[0].from, stretch[stretch.len() - 1].to);
-            let _writing = crate::watch::writing(from, to - from);
+            // Through views of our own where the pages have them: the
+            // title's stay guarded, with nothing to take again.
+            let own = t.write_unseen(from, to);
+            let opened = own.is_none().then(|| crate::watch::writing(from, to - from));
             for c in stretch {
                 if let Some((host, runs)) = &c.back {
-                    write_spans(c.from, host, runs);
+                    write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);
                     written += c.to - c.from;
+                    if own.is_some() {
+                        unseen.push(c.page);
+                    }
                 }
             }
+            drop(opened);
         }
         // Equal to title memory now: taken, unless the copy holds the page in
         // part. A page neither we nor the title wrote meanwhile (a title write
@@ -823,7 +832,8 @@ impl Shadow {
         for c in &compared {
             // The copy took the title's bytes: so does video memory.
             self.push(c.from - start, c.to - c.from);
-            if c.from == c.page && c.to == c.page + PAGE && (c.writes() || t.changed(c.page / PAGE)) {
+            let opened = c.writes() && !unseen.contains(&c.page);
+            if c.from == c.page && c.to == c.page + PAGE && (opened || t.changed(c.page / PAGE)) {
                 again.push(c.page / PAGE);
             }
         }
@@ -3472,6 +3482,37 @@ void main(uint3 id : SV_DispatchThreadID) {
             let title = if page == TITLE_PAGE { 0xaa } else { 0 };
             assert_eq!((at(10), at(20)), (shader, title), "page {page}");
         }
+        copy.copy_back(p, len);
+        unregister(p, p as u64);
+    }
+
+    /// Marked pages written back through a view of our own: the title sees
+    /// the shaders' bytes, the copy has nothing to take again, and a title
+    /// write afterwards is taken as usual.
+    #[test]
+    fn a_marked_run_written_through_our_own_view_leaves_the_copy_clean() {
+        const PAGES: usize = 3;
+        let (p, own) = crate::watch::tests::section_views(PAGES);
+        let len = PAGES * PAGE;
+        crate::watch::title_memory_own(p, len, own);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        let marked: Vec<usize> = (0..PAGES).map(|page| p + page * PAGE).collect();
+        for &page in &marked {
+            copy.write_host((page + 10) as u64, &[5]);
+        }
+        assert_eq!(copy.copy_back_run(&marked), len);
+        // SAFETY: bytes of our view.
+        assert!(marked.iter().all(|&page| unsafe { ((page + 10) as *const u8).read_volatile() } == 5));
+        assert_eq!(copy.update(p, len), 0, "nothing changed for the copy");
+        // SAFETY: a byte of our view.
+        unsafe { ((p + PAGE + 20) as *mut u8).write_volatile(9) };
+        assert_eq!(copy.update(p, len), PAGE, "the title's write");
         copy.copy_back(p, len);
         unregister(p, p as u64);
     }

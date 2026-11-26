@@ -393,6 +393,27 @@ Also taken: #3031's fix (a second, overlapping copy-back of a submission took
 the title bytes the first had put into the copy for the shaders'). Its test
 failed here before it. One run after: 448 ms median, nothing dropped.
 
+## Copy-back through a view of our own
+
+The title's physical pages are slices of pagefile sections, so `xmem` maps
+each section once more, writable, for the layer alone. Marked pages go back
+through that view: the title's views stay read-only for the guards, nothing is
+opened or taken again, and a title write still faults. The trackers other than
+the writing copy's are marked changed before and after the write, and so are
+those at the other addresses showing the pages. The idea is fxceless's fork's
+(`VICTORY_BACK_OWN_VIEW`); the code here is this tree's.
+`VICTORY_BACK_OWN_VIEW=0` writes through the title's views as before.
+
+Cell window, one run each, medians:
+
+| | Before | After |
+|---|---|---|
+| Frame | 448 ms | 418 ms |
+| Copy-back | 102 ms | 76 ms |
+| Marked pages | 102 ms | 71 ms |
+
+No draws dropped and no device removal.
+
 ## Tried and left out
 
 | Change | Result here |

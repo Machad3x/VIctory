@@ -202,6 +202,9 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Where each title page shows in a view of our own, never guarded, as
+    /// the runtime told when it mapped it ([`title_memory_own`]).
+    own: BTreeMap<usize, usize>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -214,6 +217,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    own: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -540,6 +544,20 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// Before the copy-back writes title memory `[from, to)`, bytes its copy
+    /// holds already: through views of our own, if each page has one (then no
+    /// guard is opened or set again).
+    pub(crate) fn write_unseen(&self, from: usize, to: usize) -> Option<Unseen> {
+        let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+        if !own_views() {
+            return None;
+        }
+        let mut g = guards();
+        let views = (first..last).map(|p| g.own.get(&p).copied()).collect::<Option<Vec<_>>>()?;
+        mark_others(&mut g, first, last, true, &self.changed);
+        Some(Unseen { writer: self.changed.clone(), first, views })
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed.pages().contains(&page)
@@ -749,9 +767,9 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     // without our lock, and that write must find the trackers marked
     // already ([`Tracked::clean`] reads that without a lock) and the
     // bytes from before it kept.
-    mark(g, first, last, save);
+    mark(g, first, last, save, None);
     for &page in &others {
-        mark(g, page, page + 1, save);
+        mark(g, page, page + 1, save, None);
     }
     let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
     for &page in guarded.iter().chain(&others) {
@@ -762,10 +780,10 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
 
 /// Marks `[first, last)` changed in every tracker holding it. With `save`,
 /// before the write lands: trackers armed for a page they had taken keep
-/// its bytes.
-fn mark(g: &mut Guards, first: usize, last: usize, save: bool) {
+/// its bytes. `skip` is left alone.
+fn mark(g: &mut Guards, first: usize, last: usize, save: bool, skip: Option<&Arc<Changed>>) {
     for (&page, holders) in g.holders.range(first..last) {
-        for c in holders {
+        for c in holders.iter().filter(|c| skip.is_none_or(|s| !Arc::ptr_eq(c, s))) {
             let first_write = {
                 let mut set = c.pages();
                 set_dirty(c.2, true);
@@ -827,6 +845,60 @@ pub fn writing(at: usize, len: usize) -> Writing {
     Writing { first, last }
 }
 
+/// The runtime shows title memory `[at, at + len)` at `own` as well, in a
+/// view only we write through ([`Tracked::write_unseen`]), until it maps or
+/// unmaps `at` ([`title_memory_remapped`]).
+pub fn title_memory_own(at: usize, len: usize, own: usize) {
+    let mut g = guards();
+    for k in 0..len / PAGE {
+        g.own.insert(at / PAGE + k, own + k * PAGE);
+    }
+}
+
+/// A write through views of our own into pages one tracker's copy writes
+/// back, under way: the title's views stay guarded, so its writes are seen,
+/// and every other tracker holding the memory is marked changed, before and
+/// (dropped) after.
+#[must_use = "the write must happen while this lives"]
+pub(crate) struct Unseen {
+    writer: Arc<Changed>,
+    first: usize,
+    /// The view of our own of each page from `first` on.
+    views: Vec<usize>,
+}
+
+impl Unseen {
+    /// Where to write for title address `at`.
+    pub(crate) fn at(&self, at: usize) -> usize {
+        self.views[at / PAGE - self.first] + at % PAGE
+    }
+}
+
+impl Drop for Unseen {
+    fn drop(&mut self) {
+        let mut g = guards();
+        mark_others(&mut g, self.first, self.first + self.views.len(), false, &self.writer);
+    }
+}
+
+/// [`mark`] for a write into `[first, last)` through our own views that
+/// `writer`'s copy holds already: every other tracker there, and every
+/// tracker at the other mappings of the pages.
+fn mark_others(g: &mut Guards, first: usize, last: usize, save: bool, writer: &Arc<Changed>) {
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark(g, first, last, save, Some(writer));
+    for page in others {
+        mark(g, page, page + 1, save, None);
+    }
+}
+
+/// `VICTORY_BACK_OWN_VIEW=0`: shaders' bytes go back through the title's
+/// views, opened for the write.
+fn own_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_VIEW").is_none_or(|v| v != "0"))
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
@@ -834,6 +906,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
+    let gone: Vec<usize> = g.own.range(first..last).map(|(&p, _)| p).collect();
+    for page in gone {
+        g.own.remove(&page);
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
@@ -1363,6 +1439,16 @@ pub(crate) mod tests {
     /// title's pool view and tiled heap show the same physical pages),
     /// reported as the runtime does when it maps them.
     pub(crate) fn twin_views(pages: usize) -> (usize, usize) {
+        let (a, b) = section_views(pages);
+        for k in (0..pages * PAGE).step_by(PAGE) {
+            title_memory_aliased(b + k, &[a + k]);
+        }
+        (a, b)
+    }
+
+    /// `pages` pages of a fresh pagefile section mapped twice, the views not
+    /// reported as showing the same memory (a title view and one of our own).
+    pub(crate) fn section_views(pages: usize) -> (usize, usize) {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
         let len = pages * PAGE;
         // SAFETY: a pagefile section mapped read-write twice; the test
@@ -1383,10 +1469,49 @@ pub(crate) mod tests {
             )
         };
         assert!(a != 0 && b != 0);
-        for k in (0..len).step_by(PAGE) {
-            title_memory_aliased(b + k, &[a + k]);
-        }
         (a, b)
+    }
+
+    /// A write through a view of our own leaves the title's guarded: the
+    /// writing tracker stays clean, the others holding the memory (here and
+    /// at the other mappings) are marked, and a title write still faults.
+    #[test]
+    fn a_write_through_our_own_view_marks_the_others_and_keeps_the_guard() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        let len = 2 * PAGE;
+        // SAFETY: a pagefile section mapped read-write three times; the test
+        // keeps the views.
+        let (title, own, alias) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            (map(), map(), map())
+        };
+        assert!(title != 0 && own != 0 && alias != 0);
+        title_memory_aliased(alias, &[title]);
+        title_memory_own(title, PAGE, own);
+        let track = || track(title, len, true).expect("views are tracked");
+        let (writer, other) = (track(), track());
+        let mapped = super::track(alias, PAGE, true).expect("views are tracked");
+        for t in [&writer, &other] {
+            t.take(title, title + len);
+        }
+        mapped.take(alias, alias + PAGE);
+        let page = title / PAGE;
+        assert!(writer.write_unseen(title, title + len).is_none(), "the second page has no view of ours");
+        let writing = writer.write_unseen(title, title + PAGE).expect("a view of ours");
+        // SAFETY: our own view of the first page.
+        unsafe { (writing.at(title + 4) as *mut u32).write_volatile(7) };
+        drop(writing);
+        // SAFETY: the title's view, which shows the write.
+        assert_eq!(unsafe { ((title + 4) as *const u32).read_volatile() }, 7);
+        assert!(!writer.changed(page), "its copy holds what it wrote");
+        assert!(other.changed(page) && mapped.changed(alias / PAGE));
+        // SAFETY: the title's view, still guarded.
+        unsafe { ((title + 8) as *mut u32).write_volatile(9) };
+        assert!(writer.changed(page), "a title write is still seen");
+        title_memory_remapped(title, PAGE);
+        assert!(writer.write_unseen(title, title + PAGE).is_none(), "mapped anew: the view is forgotten");
     }
 
     /// A write through another mapping of the same pages marks the tracker

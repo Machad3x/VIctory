@@ -363,15 +363,43 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section(HANDLE, std::sync::OnceLock<usize>);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    /// Where the whole section shows in a writable view of our own, mapped
+    /// at first use: the GPU layer writes what shaders wrote through it, so
+    /// that the title's views stay guarded. `None` if the host refuses.
+    fn own_view(&self) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let at = *self.1.get_or_init(|| {
+            // SAFETY: a view of all of our section, unmapped when it drops.
+            let at = unsafe { MapViewOfFile(self.0, FILE_MAP_WRITE, 0, 0, 0) }.Value as usize;
+            if at == 0 {
+                let error = std::io::Error::last_os_error();
+                tracing::warn!(%error, "no view of our own on a section of title pages");
+            } else {
+                tracing::info!(at = format_args!("{at:#x}"), "a view of our own on a section of title pages");
+            }
+            at
+        });
+        (at != 0).then_some(at)
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // Every title view of the section is gone (each holds it), and the
+        // GPU layer forgot their addresses here when they went.
+        if let Some(&at) = self.1.get().filter(|&&at| at != 0) {
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -515,7 +543,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, Default::default()));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -838,6 +866,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
+    if let Some(own) = slice.section.own_view() {
+        victory_gpu::title_memory_own(base, len, own + slice.index * PAGE);
+    }
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         // Pages shown elsewhere already: guarded here too if they are there.
