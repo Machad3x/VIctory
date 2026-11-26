@@ -2972,12 +2972,23 @@ impl Batch {
             let _ = started;
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
-            // Kept: the union with what was current if they touch, else
-            // the larger.
+            // Kept: the union with what was current if they meet and it
+            // holds no whole page neither part held (pages are taken whole:
+            // a page two parts share stays changed), else the larger.
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (_, a, b) = self.current.entry(key).or_insert((shadow, from, to));
-            if from <= *b && *a <= to {
-                (*a, *b) = ((*a).min(from), (*b).max(to));
+            let page = crate::watch::PAGE;
+            let holds = |x: usize, y: usize, p: usize| x <= p * page && (p + 1) * page <= y;
+            let (lo, hi) = (from.min(*a), to.max(*b));
+            // Only a page with an end of a part can be whole in neither.
+            if from <= *b
+                && *a <= to
+                && [from, to, *a, *b]
+                    .iter()
+                    .map(|x| x / page)
+                    .all(|p| !holds(lo, hi, p) || holds(from, to, p) || holds(*a, *b, p))
+            {
+                (*a, *b) = (lo, hi);
             } else if to - from > *b - *a {
                 (*a, *b) = (from, to);
             }
@@ -4846,6 +4857,30 @@ mod batch {   // `mod tests` is already taken at the top of this file
         crate::watch::tests::free(p);
     }
 
+
+    /// Two partial refreshes of a page do not make it current: neither took
+    /// it, so a whole refresh still copies it (upstream #2473).
+    #[test]
+    fn parts_of_a_page_do_not_make_it_current() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(1);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let Some(copy) = crate::shadow::find(p as u64, PAGE as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            eprintln!("skipped parts_of_a_page_do_not_make_it_current: no host GPU");
+            return;
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, 100);
+        batch.flush();
+        batch.add(&copy, p + 100, PAGE - 100);
+        batch.flush();
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
 
     /// A world frame's refreshes, on a made-up heap shaped like the world's
     /// (#400): 36 submissions, each after the title wrote 256 scattered
