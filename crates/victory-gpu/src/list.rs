@@ -1360,7 +1360,14 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+extern "system" fn begin_query(_this: This, _heap: This, _kind: u32, _index: u32) {
+    #[cfg(feature = "diagnostics")]
+    crate::query::counts::begin(_this as usize, _heap as usize, _kind, _index);
+}
+extern "system" fn end_query(_this: This, _heap: This, _kind: u32, _index: u32) {
+    #[cfg(feature = "diagnostics")]
+    crate::query::counts::end(_this as usize, _heap as usize, _kind, _index);
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1382,6 +1389,14 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    #[cfg(feature = "diagnostics")]
+    crate::query::counts::resolve(
+        _heap as usize,
+        kind,
+        _first,
+        count,
+        crate::resource::buffer_bytes(buffer).map(|(p, _)| (p as u64).wrapping_add(offset) as usize),
+    );
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -1852,6 +1867,9 @@ extern "system" fn execute_indirect(
 ) {
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        // An unknown signature may draw.
+        #[cfg(feature = "diagnostics")]
+        crate::query::counts::draw_dropped();
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
@@ -1877,6 +1895,11 @@ extern "system" fn execute_indirect(
     }
     if ran {
         return;
+    }
+    // Dispatches (12 bytes, types 2 and 105) pass no samples.
+    #[cfg(feature = "diagnostics")]
+    if !args.last().is_some_and(|a| matches!(a, [2 | 105, ..])) {
+        crate::query::counts::draw_dropped();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
@@ -2038,8 +2061,8 @@ const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
     (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
-    (28, query_mark as *const ()),                  // 0xe0 BeginQuery
-    (29, query_mark as *const ()),                  // 0xe8 EndQuery
+    (28, begin_query as *const ()),                 // 0xe0 BeginQuery
+    (29, end_query as *const ()),                   // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
     (78, dispatch_x as *const ()),                  // 0x270
     (98, state::dispatch_mesh_x as *const ()),      // 0x310

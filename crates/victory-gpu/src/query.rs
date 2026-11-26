@@ -71,6 +71,130 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// How the title uses queries, measured before real host queries replace the
+/// made-up results.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod counts {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    const KINDS: [&str; 5] = ["occlusion", "binary occlusion", "timestamp", "statistics", "other"];
+
+    #[derive(Default)]
+    struct Mark {
+        /// The list that began it and [`DRAWS_DROPPED`] then, until it ends.
+        open: Option<(usize, u64)>,
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        /// Per kind: begins, ends, resolve calls, queries resolved.
+        kinds: [[u64; 4]; 5],
+        spans_with_drops: u64,
+        cross_list: u64,
+        early_resolves: u64,
+        destinations: Vec<usize>,
+    }
+
+    #[derive(Default)]
+    struct All {
+        marks: HashMap<(usize, u32), Mark>,
+        counts: Counts,
+    }
+
+    static ALL: LazyLock<Mutex<All>> = LazyLock::new(Default::default);
+
+    // shortcut: per thread, not per list (a list is recorded by one thread at
+    // a time); a thread that switches lists or a list that switches threads
+    // inside a span skews the count.
+    thread_local! {
+        static DRAWS_DROPPED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn all() -> std::sync::MutexGuard<'static, All> {
+        ALL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn slot(kind: u32) -> usize {
+        (kind as usize).min(KINDS.len() - 1)
+    }
+
+    pub(crate) fn draw_dropped() {
+        DRAWS_DROPPED.set(DRAWS_DROPPED.get() + 1);
+    }
+
+    pub(crate) fn begin(list: usize, heap: usize, kind: u32, index: u32) {
+        let mut all = all();
+        all.counts.kinds[slot(kind)][0] += 1;
+        let open = Some((list, DRAWS_DROPPED.get()));
+        all.marks.insert((heap, index), Mark { open });
+    }
+
+    pub(crate) fn end(list: usize, heap: usize, kind: u32, index: u32) {
+        let mut all = all();
+        let All { marks, counts } = &mut *all;
+        counts.kinds[slot(kind)][1] += 1;
+        // A timestamp is only ended: nothing to remember.
+        if let Some((began, drops)) = marks.get_mut(&(heap, index)).and_then(|m| m.open.take()) {
+            if began != list {
+                counts.cross_list += 1;
+            } else if kind < 2 && drops != DRAWS_DROPPED.get() {
+                counts.spans_with_drops += 1;
+            }
+        }
+    }
+
+    pub(crate) fn resolve(heap: usize, kind: u32, first: u32, count: u32, to: Option<usize>) {
+        let mut all = all();
+        let All { marks, counts } = &mut *all;
+        counts.kinds[slot(kind)][2] += 1;
+        counts.kinds[slot(kind)][3] += u64::from(count);
+        let mut early = false;
+        // Bounded: the count is the title's and unchecked here. A slot never
+        // begun is not early, and a resolved one is forgotten.
+        for index in (first..first.saturating_add(count)).take(1 << 16) {
+            match marks.get(&(heap, index)) {
+                Some(mark) if mark.open.is_some() => early = true,
+                _ => {
+                    marks.remove(&(heap, index));
+                }
+            }
+        }
+        counts.early_resolves += u64::from(early);
+        if let Some(to) = to
+            && counts.destinations.len() < 8
+            && !counts.destinations.contains(&to)
+        {
+            counts.destinations.push(to);
+        }
+    }
+
+    /// Logs and clears the counts of the last `frames` frames.
+    pub(crate) fn log(frames: f64) {
+        let c = std::mem::take(&mut all().counts);
+        for (name, n) in KINDS.iter().zip(c.kinds) {
+            if n == [0; 4] {
+                continue;
+            }
+            let [begins, ends, resolves, queries] = n.map(|n| n as f64 / frames);
+            tracing::info!(
+                "{name} queries/frame: {begins:.1} begins, {ends:.1} ends, {resolves:.1} resolves of {queries:.1} queries"
+            );
+        }
+        if c.kinds != [[0; 4]; 5] {
+            tracing::info!(
+                "query spans/frame: {:.1} occlusion with dropped draws, {:.1} ended in another list, \
+                 {:.1} resolves before an end (all in recording order); resolve destinations {:x?}",
+                c.spans_with_drops as f64 / frames,
+                c.cross_list as f64 / frames,
+                c.early_resolves as f64 / frames,
+                c.destinations
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

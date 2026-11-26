@@ -174,6 +174,9 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 /// it in the list (diagnostics).
 #[cfg(feature = "diagnostics")]
 fn dropped(list: &HostList, pipeline: usize, kind: &str) {
+    if kind != "dispatch" {
+        crate::query::counts::draw_dropped();
+    }
     let why = NOT_RUN.with(|w| w.replace(""));
     if crate::pipeline::host_pipeline(pipeline as This).is_none() {
         crate::pipeline::note_drop(pipeline as This);
