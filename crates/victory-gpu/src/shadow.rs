@@ -668,11 +668,12 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = segments.iter().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
+        if let Some((taken, before)) =
+            segments.iter_mut().find(|(at, bytes)| *at <= from && to <= at + bytes.len())
             && back
             && from < to
         {
-            let before = &before[from - taken..to - taken];
+            let before = &mut before[from - *taken..to - *taken];
             // The mirror is read below (with snapshots ahead, its pages are
             // current already).
             self.freshen(from, to);
@@ -689,7 +690,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
@@ -703,7 +704,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // The GPU's bytes go into title memory, and no others:
                     // the title writes the piece meanwhile.
-                    let runs = differing(host, title, Some(old));
+                    let runs = differing(host, title, Some(&*old));
                     // The copy takes the title's bytes in turn.
                     take_others(host, title, &runs);
                     if write_runs(start + at, host, &runs) {
@@ -711,6 +712,10 @@ impl Shadow {
                     }
                     // The copy took the title's bytes: so does video memory.
                     self.push(at, n);
+                    // What an overlapping copy-back of this submission
+                    // compares with: or the title's bytes just taken would
+                    // be taken for the shaders'.
+                    old.copy_from_slice(host);
                     synced.push((start + at, n));
                 }
                 at += n;
@@ -3469,6 +3474,46 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         copy.copy_back(p, len);
         unregister(p, p as u64);
+    }
+
+    /// A second, overlapping copy-back of a submission leaves a title write
+    /// made after the first: the bytes the first took from title memory are
+    /// not taken for the shaders' (upstream pull request #3031).
+    #[test]
+    fn overlapping_copy_backs_do_not_clobber_newer_cpu_writes() {
+        let cases = [
+            ("partial then wider", (0, 0x1000), (0, 0x2000), 0),
+            ("partial then whole page", (0x1000, 0x1000), (0, PAGE), 0x1000),
+        ];
+        for (label, (off1, len1), (off2, len2), probe) in cases {
+            let p = crate::watch::tests::pool(2);
+            let len = 2 * PAGE;
+            let write_title = |at: usize, v: u8| {
+                // SAFETY: bytes inside our pool.
+                unsafe { ((p + at) as *mut u8).write_volatile(v) };
+            };
+            // SAFETY: bytes inside our pool.
+            let read_title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+            write_title(probe, 0x11);
+            write_title(probe + 1, 0x11);
+            register(p, p as u64, len as u64);
+            let Some(copy) = find(p as u64, len as u64) else {
+                unregister(p, p as u64);
+                return; // no host GPU here
+            };
+            copy.update(p, len);
+            copy.writing(p + off1, len1, false);
+            copy.writing(p + off2, len2, false);
+            // The shaders write one byte, the title the next.
+            copy.write_host((p + probe) as u64, &[0xaa]);
+            write_title(probe + 1, 0x22);
+            copy.copy_back(p + off1, len1);
+            assert_eq!((read_title(probe), read_title(probe + 1)), (0xaa, 0x22), "{label}: first");
+            write_title(probe + 1, 0x33);
+            copy.copy_back(p + off2, len2);
+            assert_eq!((read_title(probe), read_title(probe + 1)), (0xaa, 0x33), "{label}: second");
+            unregister(p, p as u64);
+        }
     }
 
     /// Mark bits are handed out in runs and come back joined.
