@@ -1865,7 +1865,7 @@ pub(crate) fn freed(start: u64, len: u64) -> Freeing {
             }
         }
     }
-    // Demand windows touching it go: a miss in a new run of frames makes a new one.
+    // Demand windows touching it go: one is made again once the page persists anew.
     // Recorded under the lock windows are made under, so none is missed.
     let mut windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     FREEING.lock().unwrap_or_else(|e| e.into_inner()).push((start, end));

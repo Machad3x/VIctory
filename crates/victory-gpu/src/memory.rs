@@ -37,7 +37,7 @@
 //! marked region gets a block of null entries, so that later submissions mark
 //! its pages, and [`log_frame`] reports which pages stay missed. With
 //! `VICTORY_DEMAND_COPIES=1` (an experiment, any build) the same is counted,
-//! and committed pages missed in [`PERSISTENT`] frames in a row get small
+//! and committed pages missed in [`PERSISTENT`] of 16 frames get small
 //! copies of their own ([`crate::shadow::demand`]), up to
 //! `VICTORY_DEMAND_COPIES_MB` MiB (256) made in all.
 //! shortcut: a page two copies share without either holding all of it is
@@ -331,7 +331,7 @@ pub(crate) fn log_frame() {
         let (new, now) = (std::mem::take(&mut m.new), std::mem::take(&mut m.persistent_now));
         tracing::info!(
             "title memory misses: {} distinct pages so far ({new} new this frame), {} committed and {} with \
-             nothing there when first missed, {} ever missed in {PERSISTENT}+ frames in a row ({now} this frame)",
+             nothing there when first missed, {} ever missed in {PERSISTENT}+ of 16 frames ({now} this frame)",
             m.pages.len(),
             m.committed,
             m.pages.len() as u64 - m.committed,
@@ -571,15 +571,18 @@ fn wanted() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>>
     WANTED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Frames in a row from which a missed page counts as persistent.
-const PERSISTENT: u32 = 8;
+/// A page missed in this many of the last 16 frames counts as persistent:
+/// the title's rings come back to a page every few frames, never twice in a
+/// row.
+const PERSISTENT: u32 = 2;
 
-/// A missed page: the last frame it was, and the frames in a row up to it.
+/// A missed page: the last frame it was, and which of the 16 frames up to it
+/// it was missed in (bit 0 the last).
 struct Missed {
     last: u64,
-    run: u32,
+    recent: u16,
     persisted: bool,
-    /// A copy was asked for in this run of frames.
+    /// A copy was asked for since the page last went 16 frames unmissed.
     tried: bool,
 }
 
@@ -611,7 +614,7 @@ impl Misses {
             std::collections::hash_map::Entry::Vacant(e) => {
                 self.new += 1;
                 self.committed += u64::from(committed());
-                e.insert(Missed { last: frame, run: 1, persisted: false, tried: false });
+                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false });
                 return false;
             }
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -619,22 +622,25 @@ impl Misses {
         if page.last == frame {
             return false;
         }
-        page.tried &= page.last.checked_add(1) == Some(frame);
-        page.run = if page.last.checked_add(1) == Some(frame) { page.run.saturating_add(1) } else { 1 };
+        let since = u32::try_from(frame.wrapping_sub(page.last)).unwrap_or(u32::MAX);
+        let kept = page.recent.checked_shl(since).unwrap_or(0);
+        page.tried &= kept != 0;
+        page.recent = kept | 1;
         page.last = frame;
-        if page.run >= PERSISTENT {
+        let persistent = page.recent.count_ones() >= PERSISTENT;
+        if persistent {
             self.persistent_now += 1;
             if !page.persisted {
                 page.persisted = true;
                 self.persistent += 1;
             }
         }
-        page.run >= PERSISTENT
+        persistent
     }
 
     /// The persistent page at `at` was missed in `frame`: asks `copy` (the
     /// bytes it may still make; whether the page has a copy as of this frame,
-    /// and the bytes it made) once per run of frames, if the page is
+    /// and the bytes it made) once while the page stays persistent, if it is
     /// committed.
     fn heal(
         &mut self,
@@ -960,47 +966,37 @@ mod tests {
     }
 
     #[test]
-    fn a_page_persists_after_eight_frames_in_a_row() {
+    fn a_page_persists_when_missed_twice_in_sixteen_frames() {
         let mut m = Misses::default();
-        for frame in 0..7 {
-            m.note(0x10000, frame, || frame == 0);
-            m.note(0x10000, frame, || panic!("asked once"));
-        }
+        assert!(!m.note(0x10000, 0, || true));
+        assert!(!m.note(0x10000, 0, || panic!("asked once")), "one frame, once");
         assert_eq!((m.new, m.committed, m.persistent), (1, 1, 0));
-        m.note(0x10000, 7, || false);
-        m.note(0x10000, 7, || false);
-        assert_eq!((m.persistent, m.persistent_now), (1, 1), "the eighth frame, once");
-        m.note(0x10000, 8, || false);
+        assert!(m.note(0x10000, 15, || false), "the oldest frame still counted");
+        assert!(!m.note(0x10000, 15, || false));
+        assert_eq!((m.persistent, m.persistent_now), (1, 1));
+        assert!(!m.note(0x10000, 31, || false), "sixteen frames on");
+        assert!(m.note(0x10000, 32, || false));
         assert_eq!((m.persistent, m.persistent_now), (1, 2));
-        // A frame without it starts over.
-        for frame in 10..17 {
-            m.note(0x10000, frame, || false);
-        }
-        assert_eq!(m.persistent_now, 2);
-        m.note(0x10000, 17, || false);
-        assert_eq!((m.persistent, m.persistent_now), (1, 3));
-        m.note(0x20000, 17, || false);
+        assert!(!m.note(0x10000, 1000, || false));
+        m.note(0x20000, 1000, || false);
         assert_eq!((m.pages.len(), m.new, m.committed), (2, 2, 1));
     }
 
-    /// A persistent committed page asks for a copy once per run of frames,
+    /// A persistent committed page asks for a copy once while it stays so,
     /// with what is left of the budget; an empty one never does.
     #[test]
     fn persistent_committed_pages_ask_for_a_copy_once() {
         let mut m = Misses::default();
-        for frame in 0..7 {
-            assert!(!m.note(0x10000, frame, || true));
-        }
-        assert!(m.note(0x10000, 7, || true));
-        assert!(!m.note(0x10000, 7, || true), "once per frame");
+        assert!(!m.note(0x10000, 0, || true));
+        assert!(m.note(0x10000, 8, || true));
         m.heal(0x10000, 100, || false, |_| panic!("nothing there"));
         m.heal(0x10000, 100, || true, |room| (true, room - 40));
+        assert!(m.note(0x10000, 16, || true));
         m.heal(0x10000, 100, || panic!("not queried"), |_| panic!("asked already"));
         assert_eq!((m.bytes, m.healed, m.left_committed, m.left_empty), (60, 1, 1, 1));
-        // A new run of frames asks again, with the rest.
-        for frame in 20..28 {
-            m.note(0x10000, frame, || true);
-        }
+        // After sixteen frames unmissed it asks again, with the rest.
+        m.note(0x10000, 40, || true);
+        assert!(m.note(0x10000, 48, || true));
         m.heal(0x10000, 100, || true, |room| {
             assert_eq!(room, 40);
             (false, 0)

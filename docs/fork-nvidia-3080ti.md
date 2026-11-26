@@ -799,17 +799,33 @@ From logs and code; no fix yet and no proven cause of the dark interiors.
 - The title's pipeline sync (`sync` in `list.rs`) now records a global
   barrier. The title rarely calls it: one report each in `gpu218` and
   `gpu219` showed 0.1 calls per frame, the others none.
-- Computes `5e5b5c98afaa1753`, `f0afa89ecfb6944e` and `8d5d3f97369050bd` were
-  bound in every lit run compared. In the dark runs `gpu196`, `gpu211`,
-  `gpu213` and `gpu218` the title created them and never bound them; `gpu200`
-  and `gpu210` bound them and were dark. A correlation, not a cause.
+- Computes `5e5b5c98afaa1753`, `f0afa89ecfb6944e` and `8d5d3f97369050bd` do
+  not tell lit runs from dark ones, as first thought: `gpu220` was lit without
+  binding them and `gpu200` bound them and was dark.
+- `gpu220` and `gpu221` ran the same build with the same settings; one was
+  lit, the other dark. The dark interior varies between runs. Dark runs tend
+  to reach the scene cut later (a threshold picked afterwards, with lit
+  exceptions); nothing in the logs separates the two groups cleanly.
 
-`VICTORY_DEMAND_COPIES=1` is an experiment against these misses: copies for
-the pages missed 8 frames running. Off by default, not yet run in the game.
+`VICTORY_DEMAND_COPIES=1` is an experiment against these misses, off by
+default. With the first rule, a copy for a page missed 8 frames running
+(`gpu222`, lit): 49 MiB of copies were made, steady frames still missed a
+median of 3 pages, and copy-back ran in 5 of 582 frames, at the same frame
+time as `gpu221`. The remaining pages recur every 8 frames, so a page now
+counts as persistent when missed in 2 of 16 frames. Not yet run with it.
 
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
-Not yet run in the game.
+Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
+frame with copy-back at 54 ms. `gpu220` and `gpu222` were lit, `gpu221` dark
+(the intermittent dark interior, seen before these changes). Its final frame
+differs from the lit one in indirect light only: sky and sunlit surfaces
+match, shadowed surfaces are near black. No change here is verified to alter
+the picture.
+
+An alias copy now also returns its source to the unordered or shader view
+state the same draw or dispatch bound it in, instead of leaving it in
+`COPY_SOURCE`. Not yet run in the game.
 
 | Change | What was wrong |
 |---|---|
