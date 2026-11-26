@@ -39,8 +39,13 @@ pub(crate) fn rectangle_corners(
 }
 
 /// Expands each rectangle into two triangles using the draw's corner order.
-/// The first triangle is (v0, v1, v2), and the second is (va, vb, va + vb - vc)
-/// around right angle vc. Without a position to choose from, vc is v1.
+/// Like the geometry shader, it splits along the diagonal through v0, leads
+/// both triangles with v0 and keeps the input winding; v3 = va + vb - vc
+/// around right angle vc (other formats keep v0's bytes):
+/// vc = v0: (v0, v1, v3), (v0, v3, v2);
+/// vc = v1: (v0, v1, v2), (v0, v2, v3);
+/// vc = v2: (v0, v1, v2), (v0, v3, v1).
+/// Without a position to choose from, vc is v1.
 pub(crate) fn expand_rects_with_corners(
     src: &[u8],
     dst: &mut [u8],
@@ -62,11 +67,18 @@ pub(crate) fn expand_rects_with_corners(
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         let right = usize::from(corners.get(i).copied().unwrap_or(1));
         let (a, b) = ((right + 2) % 3, (right + 1) % 3);
-        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
-            out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
+        // 3 is the fourth vertex.
+        let order = match right {
+            0 => [0, 1, 3, 0, 3, 2],
+            2 => [0, 1, 2, 0, 3, 1],
+            _ => [0, 1, 2, 0, 2, 3],
+        };
+        for (slot, i) in order.into_iter().enumerate() {
+            // The fourth vertex starts as a copy of v0.
+            out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i % 3));
         }
-        let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(a));
+        let first = if right == 0 { 2 } else if right == 2 { 4 } else { 5 };
+        let fourth = &mut out[first * stride..(first + 1) * stride];
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -80,6 +92,9 @@ pub(crate) fn expand_rects_with_corners(
                 let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
+        }
+        if right == 0 {
+            out.copy_within(2 * stride..3 * stride, 4 * stride);
         }
     }
 }
@@ -239,22 +254,26 @@ mod tests {
         assert_eq!(dst[36..48], src[..12]);
         assert_eq!(dst[48..60], src[24..36]);
         assert_eq!(dst[60..], vertex(1.0, 1.0, 50)[..]);
+        assert_eq!([&dst[..12], &dst[36..48]], [&src[..12]; 2], "v0 leads");
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x3e00), 1.5);
         assert_eq!(half_to_f32(0xc000), -2.0);
     }
 
     /// The tiled lighting's order (top left, bottom left, top right: the
-    /// right angle first) completes at the bottom right, the second
-    /// triangle (v2, v1, v3); a triangle that is no rectangle's keeps its
-    /// winding in both halves.
+    /// right angle first) completes at the bottom right, the triangles
+    /// (v0, v1, v3) and (v0, v3, v2); a triangle that is no rectangle's
+    /// keeps its winding in both halves.
     #[test]
     fn rectangles_complete_opposite_their_right_angle() {
         let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
         let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
         let mut dst = vec![0u8; 6 * 8];
         expand_rects(&src, &mut dst, 8, &[(0, 16)]);
-        assert_eq!(dst[24..], [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]);
+        let v3 = vertex(1.0, 1.0);
+        let (v0, v1, v2) = (&src[..8], &src[8..16], &src[16..]);
+        assert_eq!(dst[..], [v0, v1, &v3[..], v0, &v3[..], v2].concat()[..]);
+        assert_eq!([&dst[..8], &dst[24..32]], [v0; 2], "v0 leads");
         let read = |d: &[u8], i: usize| {
             let f = |k: usize| f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap());
             [f(0), f(1)]
