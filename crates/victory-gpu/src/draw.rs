@@ -266,6 +266,11 @@ thread_local! {
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
+thread_local! {
+    /// The indirect draw being prepared is the storing last member of its clamp window.
+    static CLOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Notes why the draw or dispatch being prepared cannot run (diagnostics).
 fn not_run(why: &'static str) {
     #[cfg(feature = "diagnostics")]
@@ -794,8 +799,9 @@ impl State {
         compute: bool,
         dims: [u32; 3],
     ) -> bool {
-        // A store ends the window of clamped indirect draws first.
-        if crate::indirect::windows_on() && may_store(p) {
+        // A store ends the window of clamped indirect draws first, unless
+        // this is the storing indirect draw that closes it.
+        if crate::indirect::windows_on() && may_store(p) && !CLOSING.get() {
             crate::indirect::end_window(list);
         }
         // What its shaders write is withheld only if the program uses title
@@ -2060,18 +2066,23 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         // A draw whose shaders store nothing may share a clamp pass with the
         // indirect draws around it (`crate::indirect`).
+        // A storing draw may close a window: its clamp ran before its writes, and no member follows it.
+        let storing = crate::indirect::windows_on()
+            && kind != DISPATCH
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(may_store);
         let window = (crate::indirect::windows_on() && kind != DISPATCH)
             .then(|| {
-                if may_store(crate::pipeline::host_pipeline(self.pipeline as This)?) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::ClampStoring, 1);
-                    return None;
-                }
                 let (start, _) = args.range();
                 crate::indirect::windowed(list, args.gpu(start), arguments - start, (kind, stride, max))
             })
             .flatten();
         let joined = window.is_some();
+        // Counts storing draws still clamped alone (the window could not take them).
+        #[cfg(feature = "diagnostics")]
+        if storing && !joined {
+            crate::copystat::add(crate::copystat::C::ClampStoring, 1);
+        }
+        let closes = storing && joined;
         // The records' buffer and offset, and whether a clamp pass replaced
         // the compute root signature and pipeline.
         let (clamped, at, replaced) = match window {
@@ -2088,6 +2099,7 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+        CLOSING.set(closes);
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -2102,6 +2114,7 @@ impl State {
             },
             _ => false,
         };
+        CLOSING.set(false);
         if !ran {
             if !joined {
                 crate::indirect::done(list, &clamped);
@@ -2152,6 +2165,9 @@ impl State {
         // A window's buffer stays readable as arguments until it ends.
         if !joined {
             crate::indirect::done(list, &clamped);
+        }
+        if closes {
+            crate::indirect::end_window(list);
         }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3077,6 +3093,55 @@ uint ps() : SV_Target { return 1; }
         crate::indirect::open_for_test(&list);
         state.clear_unordered(&list, 0, [0; 4], false, &[]);
         assert!(list.clamp_window().is_none(), "a clear");
+        list.close();
+    }
+
+    /// A storing pipeline bound while `CLOSING` joins the open clamp window
+    /// as its last member; the window ends only at `end_window`. Without
+    /// `CLOSING` the store ends the window first.
+    #[test]
+    fn closing_store_joins_the_clamp_window() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let source = "[numthreads(1, 1, 1)] void main() {}";
+        let mut code = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            windows::Win32::Graphics::Direct3D::Fxc::D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                windows::core::s!("none"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let dxil = unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) }.to_vec();
+        let mut t = bare(dxil);
+        t.host.written_root_uavs = vec![0];
+        let shader = crate::pipeline::translated_for_test("compute", t);
+        let storing = crate::pipeline::host::HostPipeline::new(&[shader], None).expect("a host pipeline");
+        let list = host.new_list().unwrap();
+        crate::indirect::FORCE_WINDOWS.set(true);
+        crate::indirect::open_for_test(&list);
+        CLOSING.set(true);
+        assert!(State::default().bind(&list, &storing, true));
+        assert!(list.clamp_window().is_some(), "the closing store");
+        CLOSING.set(false);
+        crate::indirect::end_window(&list);
+        assert!(list.clamp_window().is_none(), "ended after the draw");
+        crate::indirect::open_for_test(&list);
+        assert!(State::default().bind(&list, &storing, true));
+        assert!(list.clamp_window().is_none(), "a store, not closing");
         list.close();
     }
 
