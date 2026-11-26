@@ -859,9 +859,10 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        // A copy given up after this check is remade below (that one texture).
         let later = !for_draw && is_placed_texture(&view) && !made_without_new_texture(&view);
-        if !later {
+        // A placed view viewed at once needs nothing prepared, and keeps the
+        // slot lock from check to view: a copy being given up is not remade.
+        if for_draw || !is_placed_texture(&view) {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
@@ -2025,7 +2026,9 @@ fn is_placed_texture(view: &View) -> bool {
 }
 
 /// Whether a host view of the placed texture view `view` needs no new host
-/// texture: its copy is made, and the twin an unordered view of depth writes.
+/// texture: its copy is made (not being given up, and used recently, so
+/// uploads keep it as title memory is), and the twin an unordered view of
+/// depth writes.
 fn made_without_new_texture(view: &View) -> bool {
     let View::Placed(unordered, resource, desc) = view else {
         return false;
@@ -2034,6 +2037,10 @@ fn made_without_new_texture(view: &View) -> bool {
     let Some(copy) = crate::resource::made_texture_at(address, resource).and_then(crate::resource::made_copy) else {
         return false;
     };
+    let claimed = copy.pending_host_writes.load(std::sync::atomic::Ordering::Acquire) & crate::resource::EVICTED != 0;
+    if claimed || !copy.used_recently() {
+        return false;
+    }
     // SAFETY: a live resource.
     !*unordered
         || unsafe { copy.texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
@@ -2595,6 +2602,9 @@ mod tests {
         red[2] = 0x1000;
         crate::descriptor::create_placed_srv(null, &words, &red, title_heap.start);
         assert_ne!(record(), first, "a new generation");
+        // Used now: other tests present frames meanwhile.
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        crate::resource::made_copy(texture).expect("its copy").stamp();
         assert!(host.mirror(0, title_heap.start, false).is_some());
         assert!(host.kept(0), "viewed at once");
     }
