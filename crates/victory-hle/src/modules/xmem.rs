@@ -397,8 +397,11 @@ impl Drop for Section {
         // Every title view of the section is gone (each holds it), and the
         // GPU layer forgot their addresses here when they went.
         if let Some(&at) = self.1.get().filter(|&&at| at != 0) {
-            // SAFETY: our view.
-            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) };
+            // SAFETY: our view, with no write of the GPU layer's under way
+            // in it.
+            victory_gpu::with_own_views_idle(|| unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void })
+            });
         }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };

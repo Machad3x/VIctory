@@ -552,10 +552,14 @@ impl Tracked {
         if !own_views() {
             return None;
         }
+        // Before the views are looked up: none is unmapped while it is held.
+        let mapped = OWN_VIEW_WRITES.read().unwrap_or_else(|e| e.into_inner());
         let mut g = guards();
         let views = (first..last).map(|p| g.own.get(&p).copied()).collect::<Option<Vec<_>>>()?;
         mark_others(&mut g, first, last, true, &self.changed);
-        Some(Unseen { writer: self.changed.clone(), first, views })
+        let others = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+        g.busy.push((first, last));
+        Some(Unseen { writer: self.changed.clone(), first, views, others, _mapped: mapped })
     }
 
     /// Whether page `page` (a page number) changed since it was taken.
@@ -858,13 +862,36 @@ pub fn title_memory_own(at: usize, len: usize, own: usize) {
 /// A write through views of our own into pages one tracker's copy writes
 /// back, under way: the title's views stay guarded, so its writes are seen,
 /// and every other tracker holding the memory is marked changed, before and
-/// (dropped) after.
+/// (dropped) after. Until then the pages are busy, as under [`Writing`]: a
+/// tracker taking one meanwhile may copy part of the write, so the page
+/// stays changed for it.
+///
+/// Nothing marks the writing tracker: it stays clean only while its pages'
+/// guards stand, and whatever opens one marks it ([`changed`], a remapping,
+/// the last other tracker's drop leaving its own).
 #[must_use = "the write must happen while this lives"]
 pub(crate) struct Unseen {
     writer: Arc<Changed>,
     first: usize,
     /// The view of our own of each page from `first` on.
     views: Vec<usize>,
+    /// The other addresses showing the pages when the write began: marked
+    /// at its end even if the title mapped the pages anew meanwhile.
+    others: Vec<usize>,
+    /// Keeps the views of our own mapped ([`with_own_views_idle`]).
+    _mapped: std::sync::RwLockReadGuard<'static, ()>,
+}
+
+/// Held shared by every [`Unseen`].
+static OWN_VIEW_WRITES: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Runs `f` while no write through a view of our own is under way: the
+/// runtime unmaps such a view in it, after [`title_memory_remapped`] forgot
+/// the addresses there, so that a write holding one does not land in what
+/// the host maps there next.
+pub fn with_own_views_idle<R>(f: impl FnOnce() -> R) -> R {
+    let _idle = OWN_VIEW_WRITES.write().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 impl Unseen {
@@ -877,7 +904,14 @@ impl Unseen {
 impl Drop for Unseen {
     fn drop(&mut self) {
         let mut g = guards();
-        mark_others(&mut g, self.first, self.first + self.views.len(), false, &self.writer);
+        let (first, last) = (self.first, self.first + self.views.len());
+        if let Some(i) = g.busy.iter().position(|&r| r == (first, last)) {
+            g.busy.swap_remove(i);
+        }
+        mark_others(&mut g, first, last, false, &self.writer);
+        for &page in &self.others {
+            mark(&mut g, page, page + 1, false, None);
+        }
     }
 }
 
@@ -1507,6 +1541,26 @@ pub(crate) mod tests {
         assert_eq!(unsafe { ((title + 4) as *const u32).read_volatile() }, 7);
         assert!(!writer.changed(page), "its copy holds what it wrote");
         assert!(other.changed(page) && mapped.changed(alias / PAGE));
+        // A take while the write is under way may copy part of it: the page
+        // stays changed for it, here and at the other mapping.
+        let again = writer.write_unseen(title, title + PAGE).expect("a view of ours");
+        other.take(title, title + PAGE);
+        mapped.take(alias, alias + PAGE);
+        assert!(other.changed(page) && mapped.changed(alias / PAGE), "the write is under way");
+        drop(again);
+        // The title maps the address anew during a write: the other mapping
+        // of the pages written is still told.
+        mapped.take(alias, alias + PAGE);
+        let moved = writer.write_unseen(title, title + PAGE).expect("a view of ours");
+        title_memory_remapped(title, PAGE);
+        mapped.take(alias, alias + PAGE);
+        assert!(!mapped.changed(alias / PAGE), "no longer linked: taken");
+        drop(moved);
+        assert!(mapped.changed(alias / PAGE), "marked when the write ended");
+        title_memory_own(title, PAGE, own);
+        title_memory_aliased(alias, &[title]);
+        writer.take(title, title + len);
+        mapped.take(alias, alias + PAGE);
         // SAFETY: the title's view, still guarded.
         unsafe { ((title + 8) as *mut u32).write_volatile(9) };
         assert!(writer.changed(page), "a title write is still seen");
