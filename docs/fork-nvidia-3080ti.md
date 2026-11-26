@@ -389,6 +389,10 @@ The frame times overlap the noise between runs; preparing is lower in both.
 The higher marked-pages time of run 1 did not repeat. No draws dropped and no
 device removal.
 
+Also taken: #3031's fix (a second, overlapping copy-back of a submission took
+the title bytes the first had put into the copy for the shaders'). Its test
+failed here before it. One run after: 448 ms median, nothing dropped.
+
 ## Tried and left out
 
 | Change | Result here |
