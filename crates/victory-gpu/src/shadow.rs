@@ -540,6 +540,18 @@ impl Shadow {
         self.marks.is_some()
     }
 
+    /// Marks the 64 KiB title page at `page` in the written-pages bitmap
+    /// (`memory`: shaders using title memory), as a shader write does (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_page_for_test(&self, page: usize, memory: bool) {
+        let (bit, _) = self
+            .mark_entry(page as u64)
+            .expect("tracked copy with mark bits");
+        let b = bitmap(memory).expect("written-pages bitmap");
+        // SAFETY: `bit` is a valid mark bit inside the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -1511,8 +1523,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             .iter()
             .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
     };
-    let dropped: Vec<usize> =
+    let mut dropped: Vec<usize> =
         pages.iter().filter(|(copy, page)| kept(copy, *page)).map(|&(_, page)| page).collect();
+    dropped.sort_unstable();
+    dropped.dedup();
     for_each_by_page(pages, |copy, run| {
         let run: Vec<usize> = run.iter().copied().filter(|&page| !kept(copy, page)).collect();
         let written = copy.copy_back_run(&run);

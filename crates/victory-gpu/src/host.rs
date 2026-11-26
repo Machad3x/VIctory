@@ -4890,6 +4890,207 @@ mod withholding {
             crate::watch::tests::free(p);
         }
     }
+
+    /// An ordinary marked range withheld because it overlaps a title-memory
+    /// withheld range drops the pages marked in the ordinary bitmap via
+    /// `copy_back_marks`, while leaving unmarked pages in both ranges clean.
+    #[test]
+    fn withheld_overlapping_ordinary_marked_write_drops_only_marked_pages() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _alone = crate::memory::without_a_miss();
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        for (page, byte) in [(0, 0x11u8), (1, 0x22), (2, 0x33)] {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { ((p + page * PAGE + 16) as *mut u8).write_volatile(byte) };
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            copy.refresh(&list, p as u64, (2 * PAGE) as u64);
+            copy.gpu_writes(&list, p as u64, (2 * PAGE) as u64, true);
+        }
+        {
+            let _writer = list.writer_uses_memory(false);
+            copy.refresh(&list, (p + PAGE) as u64, (2 * PAGE) as u64);
+            copy.gpu_writes(&list, (p + PAGE) as u64, (2 * PAGE) as u64, true);
+        }
+        let c = copy.clone();
+        list.defer(move || {
+            c.write_host((p + 16) as u64, &[0xaa]);
+            c.mark_page_for_test(p, true);
+            c.write_host((p + PAGE + 16) as u64, &[0xbb]);
+            c.mark_page_for_test(p + PAGE, false);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |page: usize| unsafe { ((p + page * PAGE + 16) as *const u8).read_volatile() };
+        assert_eq!(
+            (title(0), title(1), title(2)),
+            (0x11, 0x22, 0x33),
+            "both withheld writes stay out of title memory"
+        );
+        assert_eq!(
+            copy.update(p + 2 * PAGE, PAGE),
+            0,
+            "unmarked page 2 stays clean"
+        );
+        assert_eq!(
+            copy.update(p, PAGE),
+            PAGE,
+            "title-memory marked page 0 dropped"
+        );
+        assert_eq!(
+            copy.update(p + PAGE, PAGE),
+            PAGE,
+            "ordinary-bitmap withheld page 1 dropped"
+        );
+        assert_eq!(copy.read_host((p + 16) as u64, 1)[0] & 0xff, 0x11);
+        assert_eq!(copy.read_host((p + PAGE + 16) as u64, 1)[0] & 0xff, 0x22);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// A withheld range declared by both a marked step and an unmarked step
+    /// merges `marked` with AND and still drops the whole range, so unmarked
+    /// writes cannot remain stale in the host copy.
+    #[test]
+    fn withheld_range_mixing_marked_and_unmarked_steps_drops_whole_range() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _alone = crate::memory::without_a_miss();
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        for (page, byte) in [(0, 0x11u8), (1, 0x22)] {
+            // SAFETY: our pool, not guarded yet.
+            unsafe { ((p + page * PAGE + 16) as *mut u8).write_volatile(byte) };
+        }
+        crate::shadow::register(p, p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            copy.refresh(&list, p as u64, len as u64);
+            copy.gpu_writes(&list, p as u64, len as u64, true);
+        }
+        {
+            let _writer = list.writer_uses_memory(false);
+            copy.gpu_writes(&list, p as u64, len as u64, false);
+        }
+        let c = copy.clone();
+        list.defer(move || {
+            // Unmarked write to page 1 (no mark bit set).
+            c.write_host((p + PAGE + 16) as u64, &[0xcc]);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |page: usize| unsafe { ((p + page * PAGE + 16) as *const u8).read_volatile() };
+        assert_eq!(
+            (title(0), title(1)),
+            (0x11, 0x22),
+            "withheld range stays out of title memory"
+        );
+        assert_eq!(
+            copy.update(p, len),
+            len,
+            "mixed marked/unmarked range drops whole"
+        );
+        assert_eq!(
+            copy.read_host((p + PAGE + 16) as u64, 1)[0] & 0xff,
+            0x22,
+            "unmarked write on page 1 is cleared from the copy"
+        );
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+    /// Dropping withheld marked pages in `copy_back_marks` runs after all
+    /// non-withheld marked copy-backs, so an immediate retake on a shared page
+    /// does not mark another copy's page changed before its own copy-back.
+    #[test]
+    fn withheld_marked_drop_runs_after_other_copy_marked_copy_back() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _alone = crate::memory::without_a_miss();
+        let p = crate::watch::tests::pool(2);
+        // SAFETY: our pool, not guarded yet.
+        unsafe {
+            ((p + 16) as *mut u8).write_volatile(0x11);
+            ((p + 32) as *mut u8).write_volatile(0x22);
+        }
+        crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+        crate::shadow::register(p + 1, p as u64, PAGE as u64);
+        let outer = crate::shadow::find(p as u64, (2 * PAGE) as u64).unwrap();
+        let inner = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&outer, &inner));
+        let list = host.new_list().unwrap();
+        {
+            // Outer has a withheld marked range, plus an overlapping ordinary
+            // marked write whose mark lands in the ordinary bitmap.
+            let _writer = list.writer_uses_memory(true);
+            outer.refresh(&list, p as u64, (2 * PAGE) as u64);
+            outer.gpu_writes(&list, p as u64, (2 * PAGE) as u64, true);
+        }
+        {
+            let _writer = list.writer_uses_memory(false);
+            outer.gpu_writes(&list, p as u64, PAGE as u64, true);
+            inner.refresh(&list, p as u64, PAGE as u64);
+            inner.gpu_writes(&list, p as u64, PAGE as u64, true);
+        }
+        let (o, i) = (outer.clone(), inner.clone());
+        list.defer(move || {
+            o.write_host((p + 16) as u64, &[0xaa]);
+            o.mark_page_for_test(p, false);
+            i.write_host((p + 32) as u64, &[0xbb]);
+            i.mark_page_for_test(p, false);
+        });
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pool.
+        let title = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
+        assert_eq!(
+            title(16),
+            0x11,
+            "withheld outer write does not reach title memory"
+        );
+        assert_eq!(
+            title(32),
+            0xbb,
+            "non-withheld inner write copies back before outer's page is retaken"
+        );
+        assert_eq!(
+            outer.update(p + PAGE, PAGE),
+            0,
+            "unmarked outer page 1 stays clean"
+        );
+        assert_eq!(
+            outer.update(p, PAGE),
+            PAGE,
+            "withheld marked outer page 0 was dropped"
+        );
+        assert_eq!(outer.read_host((p + 16) as u64, 1)[0] & 0xff, 0x11);
+        assert_eq!(outer.read_host((p + 32) as u64, 1)[0] & 0xff, 0xbb);
+        crate::shadow::unregister(p + 1, p as u64);
+        crate::shadow::unregister(p, p as u64);
+        drop((outer, inner));
+        crate::watch::tests::free(p);
+    }
 }
 
 #[cfg(all(test, feature = "diagnostics"))]
