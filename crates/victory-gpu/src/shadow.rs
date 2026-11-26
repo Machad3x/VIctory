@@ -127,51 +127,58 @@ const POOL_BYTES: usize = 512 << 20;
 /// a copy-back puts into title memory.
 ///
 /// Equal stretches are skipped a block at a time, and a block that differs is
-/// compared 8 bytes at once: byte by byte, a page the shaders rewrote cost
-/// ~55 us (most marked pages differ in most of their bytes).
+/// compared 64 bytes at once into a bit per byte: most marked pages differ in
+/// most of their bytes.
 fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, usize)> {
     const BLOCK: usize = 1 << 10;
-    const HIGH: u64 = 0x8080_8080_8080_8080;
-    // The high bit of each byte of `x` that is not zero.
-    let set = |x: u64| (((x & !HIGH) + !HIGH) | x) & HIGH;
     let n = host.len().min(title.len());
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut push = |from: usize, to: usize| match runs.last_mut() {
-        Some((_, end)) if *end == from => *end = to,
-        _ => runs.push((from, to)),
-    };
-    // Up to 8 bytes from `at`, zeros past the end (equal in each, so never
-    // in a run).
-    let word = |bytes: &[u8], at: usize| {
-        let mut out = [0; 8];
-        let len = (n - at).min(8);
-        out[..len].copy_from_slice(&bytes[at..at + len]);
-        u64::from_le_bytes(out)
-    };
     let mut block = 0;
     while block < n {
         let block_end = (block + BLOCK).min(n);
         if host[block..block_end] != title[block..block_end] {
-            for at in (block..block_end).step_by(8) {
-                let copy = word(host, at);
-                let mut mask = set(copy ^ word(title, at));
+            for at in (block..block_end).step_by(64) {
+                let end = (at + 64).min(block_end);
+                let mut mask = unequal(&host[at..end], &title[at..end]);
                 if let Some(before) = before {
-                    mask &= set(copy ^ word(before, at));
+                    mask &= unequal(&host[at..end], &before[at..end]);
                 }
-                if mask == HIGH {
-                    push(at, at + 8);
-                    continue;
-                }
+                // Each run of set bits: from its first, the ones that follow.
                 while mask != 0 {
-                    let i = at + mask.trailing_zeros() as usize / 8;
-                    push(i, i + 1);
-                    mask &= mask - 1;
+                    let first = mask.trailing_zeros();
+                    let ones = (!(mask >> first)).trailing_zeros();
+                    let (from, to) = (at + first as usize, at + (first + ones) as usize);
+                    match runs.last_mut() {
+                        Some((_, last)) if *last == from => *last = to,
+                        _ => runs.push((from, to)),
+                    }
+                    mask &= u64::MAX.checked_shl(first + ones).unwrap_or(0);
                 }
             }
         }
         block = block_end;
     }
     runs
+}
+
+/// Bit `i` set where `a[i]` differs from `b[i]`, for up to 64 bytes.
+fn unequal(a: &[u8], b: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if let (Ok(a), Ok(b)) = (<&[u8; 64]>::try_from(a), <&[u8; 64]>::try_from(b)) {
+        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+        let equal = (0..4).fold(0u64, |mask, k| {
+            // SAFETY: 16 bytes inside each 64-byte array, read unaligned;
+            // SSE2 is part of x86-64.
+            let sixteen = unsafe {
+                let x = _mm_loadu_si128(a.as_ptr().add(16 * k).cast());
+                let y = _mm_loadu_si128(b.as_ptr().add(16 * k).cast());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(x, y))
+            };
+            mask | u64::from(sixteen as u16) << (16 * k)
+        });
+        return !equal;
+    }
+    a.iter().zip(b).enumerate().fold(0, |mask, (i, (x, y))| mask | u64::from(x != y) << i)
 }
 
 /// Runs of a copy-back closer than this go into title memory as one span,
@@ -3582,6 +3589,28 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             runs
         };
+        // Dense, irregular differences: runs that start, end and cross at
+        // every offset of a 64-byte step.
+        let mut x = 0x9e37_79b9_u32;
+        let mut noise = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x & 3) as u8
+                })
+                .collect()
+        };
+        for len in [63, 64, 65, 4099, PAGE] {
+            let (host, title, before) = (noise(len), noise(len), noise(len));
+            assert_eq!(
+                differing(&host, &title, Some(&before)),
+                naive(&host, &title, &|i| host[i] != before[i]),
+                "noise, length {len}"
+            );
+            assert_eq!(differing(&host, &title, None), naive(&host, &title, &|_| true), "noise, length {len}");
+        }
         for len in [0, 1, 31, 33, 1023, 1025, PAGE - 7, PAGE] {
             let title = vec![0x5au8; len];
             let mut host = title.clone();
