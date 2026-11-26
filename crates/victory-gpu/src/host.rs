@@ -1521,7 +1521,12 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         ended = wait_for_submission(
-                            || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,
+                            // The event is auto-reset and shared: an earlier wait's
+                            // signal may wake this one (#2899).
+                            || {
+                                WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT
+                                    && self.fence.GetCompletedValue() >= *submitted
+                            },
                             || self.device.GetDeviceRemovedReason().is_err(),
                             |secs| {
                                 tracing::warn!(
