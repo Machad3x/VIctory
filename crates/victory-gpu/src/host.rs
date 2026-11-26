@@ -1723,14 +1723,21 @@ impl Host {
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
         #[cfg(feature = "diagnostics")]
-        crate::lightlog::submission(
-            withholding,
-            runs.iter().zip(&missed).map(|(list, &missed)| {
-                let memory = !list.deferred().missed.is_empty();
-                let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                (memory, missed, pipelines)
-            }),
-        );
+        {
+            // Collected before the log's lock; the hash is `lightlog::RAY`.
+            let lists: Vec<_> = runs
+                .iter()
+                .zip(&missed)
+                .map(|(list, &missed)| {
+                    let memory = !list.deferred().missed.is_empty();
+                    let bound = list.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+                    let logged = memory || bound.iter().any(|p| p.contains("f607780aa8e502d0"));
+                    let pipelines = if logged { bound.clone() } else { Default::default() };
+                    (memory, missed, pipelines)
+                })
+                .collect();
+            crate::lightlog::submission(withholding, lists.into_iter());
+        }
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();

@@ -582,8 +582,10 @@ struct Missed {
     last: u64,
     recent: u16,
     persisted: bool,
-    /// A copy was asked for since the page last went 16 frames unmissed.
+    /// A copy was made since the page last went 16 frames unmissed.
     tried: bool,
+    /// The frame of the last copy asked for and not made.
+    failed: Option<u64>,
 }
 
 /// Every page missed so far. `new` and `persistent_now` count since the last
@@ -614,12 +616,12 @@ impl Misses {
             std::collections::hash_map::Entry::Vacant(e) => {
                 self.new += 1;
                 self.committed += u64::from(committed());
-                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false });
+                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false, failed: None });
                 return false;
             }
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         };
-        if page.last == frame {
+        if frame <= page.last {
             return false;
         }
         let since = u32::try_from(frame.wrapping_sub(page.last)).unwrap_or(u32::MAX);
@@ -640,8 +642,8 @@ impl Misses {
 
     /// The persistent page at `at` was missed in `frame`: asks `copy` (the
     /// bytes it may still make; whether the page has a copy as of this frame,
-    /// and the bytes it made) once while the page stays persistent, if it is
-    /// committed.
+    /// and the bytes it made) until one succeeds while the page stays
+    /// persistent, if it is committed: after a failure, again 16 frames on.
     fn heal(
         &mut self,
         at: u64,
@@ -650,14 +652,15 @@ impl Misses {
         copy: impl FnOnce(u64) -> (bool, u64),
     ) {
         let Some(page) = self.pages.get_mut(&at) else { return };
-        // A tried page was committed when asked: not queried again.
-        if !page.tried {
+        // A tried page has its copy: not queried again.
+        if !page.tried && page.failed.is_none_or(|f| page.last - f >= 16) {
             if !committed() {
                 self.left_empty += 1;
                 return;
             }
-            page.tried = true;
             let (healed, made) = copy(budget.saturating_sub(self.bytes));
+            page.tried = healed;
+            page.failed = (!healed).then_some(page.last);
             self.bytes += made;
             self.bytes_now += made;
             if healed {
@@ -973,6 +976,7 @@ mod tests {
         assert_eq!((m.new, m.committed, m.persistent), (1, 1, 0));
         assert!(m.note(0x10000, 15, || false), "the oldest frame still counted");
         assert!(!m.note(0x10000, 15, || false));
+        assert!(!m.note(0x10000, 14, || false), "an older frame, as the same one");
         assert_eq!((m.persistent, m.persistent_now), (1, 1));
         assert!(!m.note(0x10000, 31, || false), "sixteen frames on");
         assert!(m.note(0x10000, 32, || false));
@@ -982,8 +986,8 @@ mod tests {
         assert_eq!((m.pages.len(), m.new, m.committed), (2, 2, 1));
     }
 
-    /// A persistent committed page asks for a copy once while it stays so,
-    /// with what is left of the budget; an empty one never does.
+    /// A persistent committed page asks for a copy until it gets one, with
+    /// what is left of the budget; an empty one never does.
     #[test]
     fn persistent_committed_pages_ask_for_a_copy_once() {
         let mut m = Misses::default();
@@ -1002,6 +1006,12 @@ mod tests {
             (false, 0)
         });
         assert_eq!((m.bytes, m.left_committed), (60, 2));
+        // A failed copy is asked for again, sixteen frames on.
+        assert!(m.note(0x10000, 49, || true));
+        m.heal(0x10000, 100, || panic!("too soon"), |_| panic!("too soon"));
+        assert!(m.note(0x10000, 64, || true));
+        m.heal(0x10000, 100, || true, |room| (true, room));
+        assert_eq!((m.bytes, m.healed, m.left_committed), (100, 2, 3));
     }
 
     /// A demand copy gives a whole page to any other copy, even a larger one.

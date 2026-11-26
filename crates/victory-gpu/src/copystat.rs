@@ -106,15 +106,16 @@ pub(crate) enum C {
     MirrorWaitUs,
     /// Marked copy-backs: the pull from video memory and the pages' wall
     /// time; thread time bringing the mirror up to date, reading title
-    /// memory, comparing, taking its other bytes, writing it and taking
-    /// pages again; spans written; per submission the smaller of pull and
-    /// wall time.
+    /// memory, comparing, taking its other bytes (these four in
+    /// nanoseconds), writing it and taking pages again; spans written; per
+    /// submission the smaller of pull and wall time (the upper bound a
+    /// future overlap of the two could save, not a measured overlap).
     MarkedPullUs,
     MarkedBackWallUs,
-    MarkedFreshenUs,
-    MarkedReadUs,
-    MarkedDiffUs,
-    MarkedTakeUs,
+    MarkedFreshenNs,
+    MarkedReadNs,
+    MarkedDiffNs,
+    MarkedTakeNs,
     MarkedWriteUs,
     MarkedRetakeUs,
     MarkedSpans,
@@ -138,6 +139,17 @@ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// [`crate::watch::Timed`] in nanoseconds: per-page times under a
+/// microsecond would add as zero.
+pub(crate) struct TimedNs(pub(crate) std::time::Instant, pub(crate) C);
+
+impl Drop for TimedNs {
+    fn drop(&mut self) {
+        let c = std::mem::replace(&mut self.1, C::Submissions);
+        add(c, self.0.elapsed().as_nanos() as u64);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -335,14 +347,14 @@ pub(crate) fn log(frames: f64) {
         },
     );
     tracing::info!(
-        "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (smaller of the two per submission, summed: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans",
+        "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans",
         ms(c[C::MarkedPullUs as usize]),
         ms(c[C::MarkedBackWallUs as usize]),
         ms(c[C::MarkedOverlapUs as usize]),
-        ms(c[C::MarkedFreshenUs as usize]),
-        ms(c[C::MarkedReadUs as usize]),
-        ms(c[C::MarkedDiffUs as usize]),
-        ms(c[C::MarkedTakeUs as usize]),
+        c[C::MarkedFreshenNs as usize] / 1e6,
+        c[C::MarkedReadNs as usize] / 1e6,
+        c[C::MarkedDiffNs as usize] / 1e6,
+        c[C::MarkedTakeNs as usize] / 1e6,
         ms(c[C::MarkedWriteUs as usize]),
         ms(c[C::MarkedRetakeUs as usize]),
         c[C::MarkedSpans as usize],

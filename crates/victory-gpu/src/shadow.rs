@@ -467,7 +467,7 @@ impl Shadow {
             unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
         let title = &mut title[..n];
         #[cfg(feature = "diagnostics")]
-        let reading = marked.then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedReadUs));
+        let reading = marked.then(|| crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MarkedReadNs));
         let read = crate::host::read_into(from as *const u8, title);
         #[cfg(feature = "diagnostics")]
         drop(reading);
@@ -485,7 +485,7 @@ impl Shadow {
             return None;
         }
         #[cfg(feature = "diagnostics")]
-        let comparing = marked.then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedDiffUs));
+        let comparing = marked.then(|| crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MarkedDiffNs));
         let runs = differing(host, title, saved.as_ref().map(|b| &b[from - page..to - page]));
         #[cfg(feature = "diagnostics")]
         drop(comparing);
@@ -496,7 +496,7 @@ impl Shadow {
         let took = saved.is_some();
         if took {
             #[cfg(feature = "diagnostics")]
-            let _taking = marked.then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedTakeUs));
+            let _taking = marked.then(|| crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MarkedTakeNs));
             take_others(host, title, &runs);
         }
         Some((host, runs, took))
@@ -842,7 +842,7 @@ impl Shadow {
                 continue;
             }
             #[cfg(feature = "diagnostics")]
-            let freshening = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedFreshenUs);
+            let freshening = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MarkedFreshenNs);
             self.freshen(from - start, to - start);
             #[cfg(feature = "diagnostics")]
             drop(freshening);
