@@ -1691,8 +1691,8 @@ impl Host {
         // title memory in the copy-backs above, so a deferred copy's source
         // is new now (and its destination is not overwritten by them).
         // A range the copy-back withheld is still old.
-        for &(dst, src, len, title_dst) in &batch.late {
-            copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
+        for &(dst, src, len) in &batch.late {
+            copy_mapped(dst as *mut u8, src as *const u8, len, true);
         }
         for list in runs {
             for work in &list.deferred().after {
@@ -2642,7 +2642,7 @@ impl HostList {
                     // destination they write would lose their bytes to
                     // it. Either way it runs after the copy-backs.
                     if batch.gpu_written(src, len) || batch.gpu_written(dst, len) {
-                        batch.late.push((dst, src, len, true));
+                        batch.late.push((dst, src, len));
                         0
                     } else {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -2650,19 +2650,19 @@ impl HostList {
                     }
                 }
                 &Step::Fill(dst, src, len) => {
-                    let mut fill = |dst: usize, src: usize, len: usize| {
+                    // Always at once, even from a range the shaders write:
+                    // the lists read the destination when they run.
+                    // shortcut: such a fill, and one over a late copy's
+                    // destination, reads the bytes from before; splitting the
+                    // submission there would give the new ones.
+                    let fill = |dst: usize, src: usize, len: usize| {
                         #[cfg(feature = "diagnostics")]
                         {
                             add(C::Copies, 1);
                             add(C::CopyBytes, len as u64);
                         }
-                        if batch.gpu_written(src, len) {
-                            batch.late.push((dst, src, len, false));
-                            0
-                        } else {
-                            copy_mapped(dst as *mut u8, src as *const u8, len, false);
-                            len
-                        }
+                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                        len
                     };
                     let mut copied = fill(dst, src, len);
                     // A run of fills (a list's constant buffers, mostly a
@@ -2756,10 +2756,9 @@ struct Batch {
     /// (start, end): their results reach title memory in the copy-back
     /// after the lists run, so a deferred copy touching one waits for it.
     gpu_writes: Vec<(usize, usize)>,
-    /// Deferred copies kept past the lists' run, in record order (they run
-    /// after the copy-backs): destination, source, bytes, whether the
-    /// destination is title memory.
-    late: Vec<(usize, usize, usize, bool)>,
+    /// Deferred title copies kept past the lists' run, in record order (they
+    /// run after the copy-backs): destination, source, bytes.
+    late: Vec<(usize, usize, usize)>,
 }
 
 impl Batch {
@@ -5015,6 +5014,34 @@ mod copy_order {
         for &p in &pools {
             crate::watch::tests::free(p);
         }
+    }
+
+    /// The lists read a fill's destination when they run, so it is filled
+    /// before them even from a range their shaders write.
+    #[test]
+    fn a_fill_from_a_gpu_written_range_is_copied_before_the_lists_run() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let pool = crate::watch::tests::pool(1);
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (pool as *mut u8).write_volatile(0xAA) };
+        crate::shadow::register(pool, pool as u64, PAGE as u64);
+        let copy = crate::shadow::find(pool as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, pool as u64, PAGE as u64);
+        copy.gpu_writes(&list, pool as u64, PAGE as u64, false);
+        let (_, to) = list.scratch(PAGE as u64).expect("scratch");
+        // SAFETY: the list's scratch memory, `PAGE` bytes.
+        unsafe { to.write_bytes(0, PAGE) };
+        list.defer_fill(to, pool as *const u8, PAGE);
+        list.run_deferred(&mut super::Batch::default());
+        // SAFETY: as above.
+        assert_eq!(unsafe { to.read_volatile() }, 0xAA);
+        crate::shadow::unregister(pool, pool as u64);
+        drop(copy);
+        crate::watch::tests::free(pool);
     }
 }
 
