@@ -341,6 +341,16 @@ pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
 }
 
+/// A dispatch with the title pipeline was not run on the host (`why`): one
+/// of the acceleration-structure builder's holds the builder back
+/// ([`builder::dropped`]).
+#[cfg(windows)]
+pub(crate) fn not_dispatched(this: This, why: &str) {
+    if !this.is_null() && pipeline(this).builder {
+        builder::dropped(&pipeline(this).host, why);
+    }
+}
+
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
 /// structure builder's pipelines are known by its image).
 #[cfg(windows)]
@@ -918,6 +928,91 @@ mod tests {
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
+    }
+
+    /// A compute shader that only ends (`s_endpgm`), translated.
+    #[cfg(windows)]
+    fn ending_shader() -> Arc<Shader> {
+        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
+        use victory_shader::{Container, HwStage, emit, io, ir, resource, structure};
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        };
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host = emit::emit(&c, &native, &p, &st, &io, &res, emit::Target::ANY).unwrap();
+        Shader::for_test(
+            "compute",
+            Translated {
+                host,
+                used: native.used,
+                threads: None,
+            },
+        )
+    }
+
+    /// A dispatch of a made builder pipeline that is dropped all the same
+    /// (as `State::bind` drops one whose root view offset it cannot place)
+    /// holds the builder back at once and in later frames, until the title
+    /// releases that pipeline.
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_builder_dispatch_holds_the_builder() {
+        let _one = builder::test_lock();
+        let image = [0xB0u8; 64];
+        builder::note_title_dll("XboxBvhBuilder.dll", image.as_ptr() as usize, image.len());
+        let mut p: This = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                vec![ending_shader()],
+                None,
+                &[image.as_ptr()],
+                &PIPELINE_IIDS[0],
+                &mut p
+            ),
+            S_OK
+        );
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        let release = || slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
+        assert!(pipeline(p).builder);
+        let made = (0..500).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host)
+        });
+        if made != Some(true) {
+            release();
+            return; // no host GPU here
+        }
+        assert!(
+            !held_back(p),
+            "every builder pipeline made: the builder runs"
+        );
+        not_dispatched(
+            p,
+            "a root view's offset: no root view, or outside title buffers",
+        );
+        assert!(held_back(p), "held back for the rest of the frame");
+        builder::forget_decision();
+        assert!(held_back(p), "and in later frames");
+        release();
+        builder::forget_decision();
+        assert!(builder::runs(), "the pipeline released: the hold is lifted");
     }
 
     #[test]
