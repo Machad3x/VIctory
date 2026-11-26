@@ -880,6 +880,28 @@ because about 110 ms of preparation on the CPU then bounds it. Cutting
 marks pays only together with cheaper preparation. The switch is kept as
 a patch, not committed.
 
+### Read marks no longer close clamp windows (`gpu236` to `gpu240`)
+
+Counters of why clamp windows end (diagnostics) showed about 1,900 of
+1,950 windows a frame closed by an indirect draw "that may store", 1,779
+of them only because its shaders bind the write-mark bitmap. Read marks
+bind the same bitmap, so `view_marks` was true for shaders that only read.
+The translator now reports `view_stores`, set where a write through a
+buffer view is lowered, and the host's store test uses it. Writes through
+images, heap views, root views and title memory are still caught by the
+other clauses.
+
+| Run | Windows a frame | Frame ms | GPU ms |
+|---|---|---|---|
+| `gpu237` (before) | 1,988 | 358-360 | 143-144 |
+| `gpu239` (window check on) | 220 | 352-382 | 168-171 |
+| `gpu240` | 216 | 309-321 | 98-105 |
+
+`gpu239` checked 1.86 million windowed records against fresh clamps: none
+differed, none cut. The GPU time fell by about 40 ms a frame; the frame
+did not, as preparing (125-144 ms) and copy-back (60-67 ms) on the CPU now
+bound it.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per

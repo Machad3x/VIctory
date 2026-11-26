@@ -128,6 +128,7 @@ fn build_native(native: &NativeProgram) -> Result<HostShader, crate::ShaderError
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        view_stores: lowered.view_stores,
     })
 }
 
@@ -1015,6 +1016,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             heap: l.heap,
             heap_writes: l.heap_writes,
             view_marks: false,
+            view_stores: false,
         }
     };
 

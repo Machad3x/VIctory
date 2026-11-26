@@ -68,6 +68,8 @@ pub(crate) struct Lowered {
     /// Marks the pages it writes through buffer views (`emit`, "Write
     /// marks").
     pub view_marks: bool,
+    /// Writes through buffer views (a write mark was asked for).
+    pub view_stores: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1899,6 +1901,7 @@ impl<'a> Lower<'a> {
             heap: self.heap[0],
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
+            view_stores: self.s.view_stores,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -5040,6 +5043,7 @@ impl<'a> Lower<'a> {
     /// only where still clear. Nothing for handles that are no heap view, or
     /// without [`Parts::view_marks`].
     fn mark_view_write(&mut self, h: V, x: V, bytes: u32, guard: Option<V>) {
+        self.s.view_stores = true;
         if !self.x.view_marks {
             return;
         }

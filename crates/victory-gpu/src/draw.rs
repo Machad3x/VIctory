@@ -802,6 +802,12 @@ impl State {
         // A store ends the window of clamped indirect draws first, unless
         // this is the storing indirect draw that closes it.
         if crate::indirect::windows_on() && may_store(p) && !CLOSING.get() {
+            #[cfg(feature = "diagnostics")]
+            if list.clamp_window().is_some() {
+                use crate::copystat::{add, C};
+                let only_table = p.stages.iter().all(|s| !stores_beyond_tables(s.translated()));
+                add(if compute { C::WindowEndCompute } else if only_table { C::WindowEndTableUav } else { C::WindowEndGraphics }, 1);
+            }
             crate::indirect::end_window(list);
         }
         // What its shaders write is withheld only if the program uses title
@@ -2167,6 +2173,28 @@ impl State {
             crate::indirect::done(list, &clamped);
         }
         if closes {
+            #[cfg(feature = "diagnostics")]
+            if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                use crate::copystat::{add, C};
+                add(C::WindowEndClosing, 1);
+                let any = |f: &dyn Fn(&crate::pipeline::Translated) -> bool| p.stages.iter().any(|s| f(s.translated()));
+                add(C::ClosingViewMarks, u64::from(any(&|t| t.host.view_stores)));
+                add(C::ClosingMemory, u64::from(any(&|t| t.host.memory_writes)));
+                add(C::ClosingHeap, u64::from(any(&|t| t.host.heap_writes)));
+                add(C::ClosingRootUavs, u64::from(any(&|t| !t.host.written_root_uavs.is_empty())));
+                add(
+                    C::ClosingRootView,
+                    u64::from(any(&|t| {
+                        t.host.user_data.iter().any(|u| {
+                            u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_UAV_VIEW
+                        })
+                    })),
+                );
+                add(
+                    C::ClosingTable,
+                    u64::from(any(&|t| t.used.iter().any(|u| u.kind == ResourceType::Uav && u.root == RootType::Table))),
+                );
+            }
             crate::indirect::end_window(list);
         }
         if kind == DISPATCH {
@@ -2183,18 +2211,23 @@ fn may_store(p: &HostPipeline) -> bool {
     p.stages.iter().any(|s| stores(s.translated()))
 }
 
-/// Whether a shader may store: marked view writes, title memory, heap
+/// Whether a shader may store: writes through views (not read marks,
+/// which bind the same bitmap), title memory, heap
 /// views, root unordered views, or any unordered view in a table (read or
 /// written).
 fn stores(t: &crate::pipeline::Translated) -> bool {
-    t.host.view_marks
+    stores_beyond_tables(t) || t.used.iter().any(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+}
+
+/// [`stores`] without unordered views in tables.
+fn stores_beyond_tables(t: &crate::pipeline::Translated) -> bool {
+    t.host.view_stores
         || t.host.memory_writes
         || t.host.heap_writes
         || !t.host.written_root_uavs.is_empty()
         || t.host.user_data.iter().any(|u| {
             u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_UAV_VIEW
         })
-        || t.used.iter().any(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -3016,6 +3049,7 @@ uint ps() : SV_Target { return 1; }
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                view_stores: false,
             },
             used: Vec::new(),
             threads: None,
@@ -3034,7 +3068,7 @@ uint ps() : SV_Target { return 1; }
         };
         assert!(!with(|_| {}));
         let storing: [Change; 6] = [
-            |t| t.host.view_marks = true,
+            |t| t.host.view_stores = true,
             |t| t.host.memory_writes = true,
             |t| t.host.heap_writes = true,
             |t| t.host.written_root_uavs.push(0),
@@ -3043,6 +3077,8 @@ uint ps() : SV_Target { return 1; }
         ];
         assert!(storing.into_iter().all(with));
         assert!(!with(|t| t.used.push(used(ResourceType::Srv))));
+        // Read marks bind the write-mark bitmap too: no store.
+        assert!(!with(|t| t.host.view_marks = true));
         assert!(!with(|t| t.host.user_data.push(UserData { index: 0, slot: 0, root: RootType::Descriptor, dword: ROOT_SRV_VIEW })));
     }
 
@@ -3347,6 +3383,7 @@ uint ps() : SV_Target { return 1; }
                     heap: false,
                     heap_writes: false,
                     view_marks: false,
+                    view_stores: false,
                 },
                 used,
                 threads: None,

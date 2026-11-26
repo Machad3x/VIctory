@@ -183,6 +183,8 @@ pub(crate) struct Shader {
     /// handles, once a write through a view is marked.
     pub view_marks: Option<V>,
     pub view_writes: Option<V>,
+    /// Whether any write through a buffer view was lowered (marked or not).
+    pub view_stores: bool,
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
@@ -278,6 +280,7 @@ impl Shader {
             view_addresses: None,
             view_marks: None,
             view_writes: None,
+            view_stores: false,
             view_index: std::collections::HashMap::new(),
             buffer_index: std::collections::HashMap::new(),
             texture_index: std::collections::HashMap::new(),

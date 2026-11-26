@@ -114,6 +114,7 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         heap: result.heap,
         heap_writes: result.heap_writes,
         view_marks: false,
+        view_stores: false,
     };
     match validator::Validator::load(validator::Validator::default_path().as_deref()) {
         Ok(mut v) => {

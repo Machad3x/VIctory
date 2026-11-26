@@ -352,6 +352,9 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Whether it writes through buffer views. Unlike [`Self::view_marks`],
+    /// which read marks also need, false for a shader that only reads.
+    pub view_stores: bool,
 }
 
 impl HostShader {
@@ -817,6 +820,7 @@ fn emit_variant<const PARTIAL: bool>(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        view_stores: l.view_stores,
     })
 }
 
@@ -1755,6 +1759,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            view_stores: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1773,6 +1778,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                view_stores: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

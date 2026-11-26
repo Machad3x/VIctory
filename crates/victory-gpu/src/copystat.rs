@@ -137,10 +137,30 @@ pub(crate) enum C {
     ClampWindows,
     ClampWindowDraws,
     ClampStoring,
+    /// Open windows ended by a storing pipeline: compute, graphics storing
+    /// only through table unordered views (maybe never written), other
+    /// graphics.
+    WindowEndCompute,
+    WindowEndTableUav,
+    WindowEndGraphics,
+    /// Open windows ended by an indirect draw reading another buffer, by
+    /// one that did not fit, and by a storing draw closing its window.
+    WindowEndSource,
+    WindowEndFull,
+    WindowEndClosing,
+    /// Of those closing draws, the stages' reasons to store (several may
+    /// count for one draw): view writes, title memory bitmap bound (reads
+    /// too), heap writes, written root views, root UAV view, table UAVs.
+    ClosingViewMarks,
+    ClosingMemory,
+    ClosingHeap,
+    ClosingRootUavs,
+    ClosingRootView,
+    ClosingTable,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
-const COUNTERS: usize = 82;
+const COUNTERS: usize = C::VideoBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -382,6 +402,27 @@ pub(crate) fn log(frames: f64) {
             c[C::ClampWindows as usize],
             c[C::ClampWindowDraws as usize],
             c[C::ClampStoring as usize],
+        );
+        tracing::info!(
+            "  clamp windows ended per frame by a storing pipeline: {:.0} compute, {:.0} graphics through table UAVs only, {:.0} other graphics",
+            c[C::WindowEndCompute as usize],
+            c[C::WindowEndTableUav as usize],
+            c[C::WindowEndGraphics as usize],
+        );
+        tracing::info!(
+            "  clamp windows ended per frame by a draw: {:.0} reading another buffer, {:.0} not fitting, {:.0} storing (closing)",
+            c[C::WindowEndSource as usize],
+            c[C::WindowEndFull as usize],
+            c[C::WindowEndClosing as usize],
+        );
+        tracing::info!(
+            "  closing draws' reasons per frame: {:.0} view writes, {:.0} title memory, {:.0} heap writes, {:.0} written root UAVs, {:.0} root UAV view, {:.0} table UAVs",
+            c[C::ClosingViewMarks as usize],
+            c[C::ClosingMemory as usize],
+            c[C::ClosingHeap as usize],
+            c[C::ClosingRootUavs as usize],
+            c[C::ClosingRootView as usize],
+            c[C::ClosingTable as usize],
         );
     }
     let held: Vec<String> = crate::watch::held_times()

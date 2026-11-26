@@ -218,6 +218,7 @@ fn program() -> HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        view_stores: l.view_stores,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -588,6 +589,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        view_stores: l.view_stores,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -711,6 +713,7 @@ fn writes_through_views_mark_their_pages() {
     })
     .expect("lower");
     assert!(l.view_marks && !l.memory, "marks without the page table");
+    assert!(l.view_stores, "a marked write is a store");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -727,6 +730,7 @@ fn writes_through_views_mark_their_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        view_stores: l.view_stores,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -856,8 +860,10 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         computed.view_marks && !computed.heap,
         "a read at a computed table entry is marked"
     );
+    assert!(!computed.view_stores, "a marked read is no store");
     let l = lower_with(RootType::ResourceHeap, Vec::new(), 32, false);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
+    assert!(!l.view_stores, "a heap-direct read is no store");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: l.dxil,
@@ -874,6 +880,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        view_stores: l.view_stores,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -985,6 +992,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        view_stores: l.view_stores,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

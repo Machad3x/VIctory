@@ -1024,6 +1024,7 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
                             heap: false,
                             heap_writes: false,
                             view_marks: false,
+                            view_stores: false,
                         },
                         used: Vec::new(),
                         threads: None,

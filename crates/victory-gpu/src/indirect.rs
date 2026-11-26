@@ -675,6 +675,11 @@ pub(crate) fn windowed(
         w.source == source && w.records + records <= WINDOW_RECORDS && w.bytes + bytes <= WINDOW_BYTES
     });
     if !fits {
+        #[cfg(feature = "diagnostics")]
+        if let Some(w) = list.clamp_window().as_ref() {
+            use crate::copystat::{add, C};
+            add(if w.source != source { C::WindowEndSource } else { C::WindowEndFull }, 1);
+        }
         end_window(list);
         let new = open(list, source)?;
         *list.clamp_window() = Some(new);
