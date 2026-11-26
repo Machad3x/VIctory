@@ -168,15 +168,16 @@ pub(crate) enum C {
     HandlerOpenNs,
     HandlerSaves,
     HandlerTrackerWaitNs,
-    /// Heap sync slots found stale: made never (first), from the same view
-    /// entry of an older generation (recycled), from another view entry
-    /// (rewritten), and made while the record is no longer current
-    /// (released).
+    /// Heap sync slots found stale: never made, or nulled earlier (unmade),
+    /// from the same view entry of an older generation (recycled), from
+    /// another view entry (rewritten), and made while the record is not
+    /// current (released, non-view record, or out-of-range index).
     SyncStaleFirst,
     SyncStaleRecycled,
     SyncStaleRewritten,
     SyncStaleReleased,
-    /// Descriptors written through the API (view creation, copies), and
+    /// Descriptors written through the API (view creation, copies into
+    /// shader-visible kinds only, to compare with the stale counts), and
     /// `descriptor::forget` calls (generation bumps on release).
     ApiViewWrites,
     ForgetCalls,
@@ -404,7 +405,7 @@ pub(crate) fn log(frames: f64) {
         },
     );
     tracing::info!(
-        "  heap sync stale by reason per frame: first {:.0}, recycled {:.0}, rewritten {:.0}, released {:.0}; api view writes {:.0}, forgets {:.0}",
+        "  heap sync stale by reason per frame: unmade {:.0}, recycled {:.0}, rewritten {:.0}, released {:.0}; api view writes {:.0}, forgets {:.0}",
         c[C::SyncStaleFirst as usize],
         c[C::SyncStaleRecycled as usize],
         c[C::SyncStaleRewritten as usize],

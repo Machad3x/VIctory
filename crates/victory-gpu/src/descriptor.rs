@@ -688,7 +688,9 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(all(windows, feature = "diagnostics"))]
-        crate::copystat::add(crate::copystat::C::ApiViewWrites, u64::from(count));
+        if kind <= SAMPLERS {
+            crate::copystat::add(crate::copystat::C::ApiViewWrites, u64::from(count));
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);

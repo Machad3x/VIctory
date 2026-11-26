@@ -732,7 +732,7 @@ impl HostHeap {
         let records: Vec<[u32; 3]> =
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
         let current = views_current(&records);
-        // Stale slots by reason: first, recycled, rewritten, released.
+        // Stale slots by reason: unmade, recycled, rewritten, released.
         #[cfg(feature = "diagnostics")]
         let mut reasons = [0u64; 4];
         let stale: Vec<u32> = {
@@ -747,10 +747,10 @@ impl HostHeap {
                     };
                     // Keys are generation << 32 | view index (see `mirror`).
                     #[cfg(feature = "diagnostics")]
-                    if stale && let Some(&m) = made.get(i as usize) {
-                        reasons[match (current, m) {
-                            (true, 0) => 0,
-                            (true, m) if m as u32 == view => 1,
+                    if stale {
+                        reasons[match (current, made.get(i as usize).copied()) {
+                            (_, None) | (true, Some(0)) => 0,
+                            (true, Some(m)) if m as u32 == view => 1,
                             (true, _) => 2,
                             (false, _) => 3,
                         }] += 1;
