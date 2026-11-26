@@ -61,7 +61,7 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let use_quad = mesh_quad || self.helpers_read(quad);
-            let src_ok = self.src_lane_active(src, guard, mesh_quad);
+            let src_ok = self.src_lane_active(inst, src, guard, mesh_quad);
             let mut r = if use_quad {
                 self.quad_pick(x, src)
             } else {
@@ -105,7 +105,7 @@ impl<'a> Lower<'a> {
             let r = self.read_lane(x, lane);
             // Lanes the console never launched give 0, as EXEC's others.
             let on = self
-                .launched_guard(guard)
+                .shuffle_guard(inst, guard)
                 .unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);

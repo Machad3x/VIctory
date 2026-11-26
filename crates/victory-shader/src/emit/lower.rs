@@ -3454,25 +3454,58 @@ impl<'a> Lower<'a> {
         if !self.x.st.active.contains(&mask) {
             return on;
         }
-        let (mut known, mut busy) = (HashMap::new(), HashSet::new());
-        match self.unlaunched(mask, &mut known, &mut busy) {
-            // Taken from EXEC: 0 there.
-            Some(Unlaunched::Console(false)) => self.s.m.bin(at, Bin::And, on, a),
-            // Its complement (`s_not_b64 s, exec`): 1 there.
+        match self.unlaunched_mask(mask) {
+            // Set apart from EXEC on entry (`s_mov_b64 exec, -1`): the
+            // host's bit is the console's.
+            Some(Unlaunched::Same | Unlaunched::Both(true)) => on,
+            // Its complement (`s_not_b64 exec, exec`): 1 there.
             Some(Unlaunched::Console(true)) => {
                 let t = self.s.m.bool(true);
                 let out = self.s.m.bin(at, Bin::Xor, a, t);
                 self.s.m.bin(at, Bin::Or, on, out)
             }
-            // Set apart from EXEC on entry (`s_mov_b64 exec, -1`): the
-            // host's bit is the console's. Not known: left as it is.
-            _ => on,
+            // Taken from EXEC (0 there), or not known: a mask of EXEC's lanes
+            // has only lanes the host's EXEC has, so 0 is the console's bit
+            // unless shown otherwise. Loops (a join whose edges come back
+            // through itself, `busy`) are not known and land here.
+            _ => self.s.m.bin(at, Bin::And, on, a),
+        }
+    }
+
+    /// [`Self::unlaunched`] of the lane mask whose low dword is `lo`, with
+    /// its wave64 high dword's; `None` where the dwords differ.
+    fn unlaunched_mask(&self, lo: Value) -> Option<Unlaunched> {
+        let (mut known, mut busy) = (HashMap::new(), HashSet::new());
+        let u = self.unlaunched(lo, &mut known, &mut busy)?;
+        match self.pair_high(lo) {
+            Some(hi) => (self.unlaunched(hi, &mut known, &mut busy)? == u).then_some(u),
+            None => Some(u),
+        }
+    }
+
+    /// [`Self::launched_guard`] of a shuffle's source lanes. Where EXEC at
+    /// `inst` is set apart from EXEC on entry (a whole-wave section after
+    /// `s_or_saveexec_b64 s, -1`), the console has those lanes active.
+    fn shuffle_guard(&mut self, inst: &Inst, guard: Option<V>) -> Option<V> {
+        let Some(a) = self.partial_active else {
+            return guard;
+        };
+        let exec = inst.read(Reg::S(EXEC)).and_then(|e| self.unlaunched_mask(e));
+        match exec {
+            Some(Unlaunched::Same | Unlaunched::Both(true)) => guard,
+            Some(Unlaunched::Console(true)) => guard.map(|g| {
+                let t = self.s.m.bool(true);
+                let out = self.s.m.bin(self.cur, Bin::Xor, a, t);
+                self.s.m.bin(self.cur, Bin::Or, g, out)
+            }),
+            _ => self.launched_guard(guard),
         }
     }
 
     /// A lane mask's bit, in a lane the console never launched, next to
     /// the host's (whose EXEC on entry has the lane); `None` where that is
-    /// not known. A join in `busy` (a loop's) takes its other edges' bit.
+    /// not known. A join in `busy` (a loop's) takes its other edges' bit;
+    /// a value reaching a join in `busy` through an instruction is `None`.
     fn unlaunched(
         &self,
         v: Value,
@@ -3506,7 +3539,7 @@ impl<'a> Lower<'a> {
             // EXEC on entry has none of those lanes; user and system values
             // are the same.
             let &(reg, _) = p.inputs.iter().find(|i| i.1 == v)?;
-            return Some(if reg == Reg::S(EXEC) {
+            return Some(if reg == Reg::S(EXEC) || reg == Reg::S(EXEC + 1) {
                 Console(false)
             } else {
                 Same
@@ -3531,7 +3564,13 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == v))?;
         let name = inst.name();
-        let exec = inst.read(Reg::S(EXEC));
+        // A wave64 mask's high dword (odd register of its pair) reads the
+        // high dwords of its sources.
+        let hi = match inst.writes.iter().find(|w| w.1 == v)?.0 {
+            Reg::S(r) => u8::from(p.wave64 && r & 1 == 1),
+            _ => 0,
+        };
+        let exec = inst.read(Reg::S(EXEC + hi));
         match &inst.fields {
             // A compare's or carry's mask has EXEC's lanes only.
             Fields::Valu(x) if name.starts_with("v_cmp") || x.carry.is_some() => {
@@ -3553,7 +3592,7 @@ impl<'a> Lower<'a> {
                 let mut arg = |n: usize| -> Option<Unlaunched> {
                     match *src.get(n)? {
                         Operand::Scalar { code, .. } if code != NULL => {
-                            self.unlaunched(inst.read(Reg::S(code))?, known, busy)
+                            self.unlaunched(inst.read(Reg::S(code + hi))?, known, busy)
                         }
                         Operand::Const(c @ 128..=208) => Some(constant(if c <= 192 {
                             u64::from(c) - 128
@@ -3571,7 +3610,7 @@ impl<'a> Lower<'a> {
                 };
                 if let Some((saveexec, f)) = save {
                     // `_saveexec`'s scalar destination gets the old EXEC.
-                    let new = !saveexec || inst.write(Reg::S(EXEC)) == Some(v);
+                    let new = !saveexec || inst.write(Reg::S(EXEC + hi)) == Some(v);
                     let s = if new { Some(arg(0)?) } else { None };
                     let old = self.unlaunched(exec?, known, busy)?;
                     return match s {
@@ -4052,9 +4091,15 @@ impl<'a> Lower<'a> {
     /// branch-structurised control flow). Returns `None` for unguarded pixel
     /// quad ops so WQM helper lanes remain active (`waveActiveBallot` excludes
     /// helper lanes in DXIL).
-    fn src_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> Option<V> {
+    fn src_lane_active(
+        &mut self,
+        inst: &Inst,
+        src: V,
+        guard: Option<V>,
+        mesh_quad: bool,
+    ) -> Option<V> {
         // A lane the console never launched is a source EXEC leaves out.
-        let guard = self.launched_guard(guard);
+        let guard = self.shuffle_guard(inst, guard);
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;
@@ -6699,7 +6744,7 @@ impl<'a> Lower<'a> {
         let src_active = if fi {
             None
         } else {
-            self.src_lane_active(src, guard, mesh_quad)
+            self.src_lane_active(inst, src, guard, mesh_quad)
         };
         let valid = match (inside, src_active) {
             (Some(in_b), Some(act)) => Some(self.s.m.bin(c, Bin::And, in_b, act)),
@@ -7535,8 +7580,11 @@ impl<'a> Lower<'a> {
                     self.read_lane(x, src)
                 } else {
                     // Ballot the console EXEC guard as well as the host's active
-                    // invocations. Never shuffle from an inactive host lane.
-                    let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    // invocations. Never shuffle from an inactive host lane, nor
+                    // from one the console never launched.
+                    let enabled = self
+                        .shuffle_guard(inst, guard)
+                        .unwrap_or_else(|| self.s.m.bool(true));
                     let i32t = self.s.t.i32;
                     let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                     let mask =
