@@ -675,14 +675,101 @@ two later runs of nearly the same build gave 54 (`gpu207`) and 76 ms
   call, each ended in the list that began it, none with a dropped draw inside.
   Their results were made up then; occlusion and binary occlusion queries
   now run on the host GPU (ported from
-  [#159](https://github.com/Marvisak/VIctory/pull/159);
-  `VICTORY_NO_HOST_QUERIES=1` restores the made-up results; not yet run in
-  the game).
+  [#159](https://github.com/Marvisak/VIctory/pull/159), see the next
+  section).
+
+## Host occlusion queries and fixes from upstream reports
+
+Unit tests cover these; none is verified in the game yet.
+
+| Change | What was wrong |
+|---|---|
+| Occlusion and binary occlusion queries begin, end and resolve in a host query heap, and the results reach title memory after the submission ran (ported from [#159](https://github.com/Marvisak/VIctory/pull/159)) | Every query answered 1 << 20, so nothing tested with the GPU could be culled. A query keeps that "visible" answer when a draw in it was not run, it is indirect, or its result cannot be had. `VICTORY_NO_HOST_QUERIES=1` restores the made-up results |
+| Each place of a list submitted twice at once has its own prelude ([#3162](https://github.com/Marvisak/VIctory/pull/3162) reports it) | Both places recorded their barriers into one command list, so the first ran the second's |
+| `v_mac_f32`, `v_mad_f32`, `madak` and `madmk` flush a denormal product, keeping its sign, before the add | The instructions never keep denormals. [#3212](https://github.com/Marvisak/VIctory/pull/3212) flushes to +0; this follows the tree's own flush, and no hardware was measured. Legacy forms and denormal inputs or sums are unchanged |
+| Floating-point `wavePrefixOp` sums pass the signed kind ([#3151](https://github.com/Marvisak/VIctory/pull/3151)) | They passed the unsigned kind, which DXIL allows for integers only |
+| Untracked pages of a partly tracked texture are hashed on every refresh ([#3041](https://github.com/Marvisak/VIctory/pull/3041), issue [#2638](https://github.com/Marvisak/VIctory/issues/2638)) | Only dirty ranges were asked, so a write to an untracked page was never staged. No such texture appears in this title's logs |
+| A barrier batch is submitted before a transition on a resource with a depth twin ([#3129](https://github.com/Marvisak/VIctory/pull/3129)) | The twin copy records at once, so it could come before the transition it depends on |
+| Texture states are masked to texture states, with one write state alone ([#3140](https://github.com/Marvisak/VIctory/pull/3140)) | A state could keep buffer or reserved bits, or join a write state with others, which D3D12 rejects |
+| View heaps with title slots make the view address table when they are created ([#3175](https://github.com/Marvisak/VIctory/pull/3175)) | Made on first use, it could lose addresses noted before, or zero entries |
+
+Timestamps are still made up by the CPU; their use is not yet measured.
+
+## Copy-backs, EXEC, pinned views and pipeline order
+
+None of these is verified in the game.
+
+| Change | What was wrong |
+|---|---|
+| A declared copy-back after a marked run of the same page keeps newer title bytes (upstream [#2436](https://github.com/Marvisak/VIctory/issues/2436)) | It restored old title bytes over a title write made after the run |
+| Partial flush ranges are joined only where that covers no new whole page (upstream [#2473](https://github.com/Marvisak/VIctory/issues/2473)) | Parts of a page could make it count as current with bytes nothing had copied. The check looks only at the pages holding the ends of the two ranges, as no other page can be newly covered |
+| A remap marks only the remapped pages; writes in flight still mark aliases (upstream [#2414](https://github.com/Marvisak/VIctory/issues/2414)) | A remap also marked the other mappings, which had not changed, and their copies lost shaders' writes |
+| Interpolation writes obey EXEC (upstream [#3153](https://github.com/Marvisak/VIctory/issues/3153)) | Inactive lanes lost their destination. A lane whose EXEC differs between `p1` and `p2` still does not get the console's partial value. Exception: f16 packed interpolation whose destination holds its own first half is not guarded |
+| Title resources are pinned while views of them are read (upstream [#3213](https://github.com/Marvisak/VIctory/issues/3213)) | A release on another thread could free a resource still being read. Shader and unordered views only: render target and depth lookups are not pinned |
+| Render targets are resolved when set and replayed on a cut (upstream [#3217](https://github.com/Marvisak/VIctory/issues/3217)) | A cut read the title's descriptors again, which may have changed since |
+| Early pipelines are made in first-use order, and compute pipelines are waited for like screen passes (`VICTORY_COMPUTE_WAIT=0` gives them the other draws' 500 ms instead). Both share the 20 s per-frame wait budget, so a slow compute pipeline can make a screen pass drop | A one-off dispatch dropped while its pipeline was made is lost |
+
+Observation: the scene was dark in runs `gpu196`, `gpu200`, `gpu210` and
+`gpu211` (which dropped passes while pipelines were being made), but also in
+`gpu213`, which dropped none, so dropped passes do not explain it. It was lit
+in `gpu206` to `gpu208` and in `gpu212` (previous build). The cause is not
+established.
+
+- Builds at `c24dd958` (`gpu214`) and `8f3b3193` (`gpu215`) rendered lit;
+  `d7d2ba0c` rendered dark in `gpu210`, `gpu211` and `gpu213`. Each midpoint
+  had one run only.
+- `d7d2ba0c` with the texture state change taken out rendered lit (`gpu216`),
+  and its added warning never fired: the title asked no write state together
+  with shader reads in that run, so the change is unlikely to be the cause.
+- The build with all changes above rendered lit (`gpu217`). A race between runs
+  is the likeliest reading, not shown.
+- An audit of its view address table change found nothing.
+- Dropped first-use computes do not explain it: `gpu213` dropped none and was
+  dark.
+
+## SDWA sign extension into the low word
+
+The shader crate tests pass but one that already failed; one game run
+(`gpu217`) showed no visible change.
+
+| Change | What was wrong |
+|---|---|
+| A 16-bit result written to `WORD_0` with a sign-extending SDWA destination fills the high word with its sign (the `SEXT` arm only of upstream [#3124](https://github.com/Marvisak/VIctory/pull/3124)) | The high word was zeroed |
+
+## Measurements without a change of behaviour
+
+- Diagnostics builds log once each wave32 compute program that keeps a plain
+  group barrier in per-lane control flow, with whether the console control
+  flow could lower it.
+- Diagnostics builds log each pair of pipeline and bound render target formats
+  that differ (invalid in D3D12) and count those draws and the unresolved
+  slots.
+- Diagnostics builds count end-of-pipe clock writes per frame (GPU timestamp
+  and raw system clock).
+- The heap view census of diagnostics builds counts the unordered 3D slots
+  among those left null.
+- Diagnostics builds count the host-written texture marks cleared.
+- Diagnostics builds warn once when a partly tracked texture is sampled, and
+  once when a texture state drops shader read states beside a write state.
+- Test code behind the diagnostics feature was repaired to match current
+  signatures (`pipeline/placed_uav_tests.rs`, tests in `pipeline/make.rs`).
+- Diagnostics builds log each distinct thread affinity, ideal processor,
+  priority and thread creation value the title uses, and call totals.
+  `VICTORY_DSTORAGE_WORKERS` (1 to 64) replaces the default of one
+  DirectStorage worker per logical CPU.
+- `VICTORY_MODE_SCAN` makes `victory translate` count the changes of the MODE
+  register and the initial float modes. One offline scan found only
+  `s_setreg_imm32_b32` of the f16/f64 rounding field with literals 0 and 3,
+  which `emit/lower.rs` already models: no fix. The initial mode was readable
+  for 29 compute programs only (0xc0), none of the pixel programs. The
+  translator assumes 32-bit denormals flushed and does not read the denormal
+  modes.
 
 ## Tried and left out
 
 | Change | Result here |
 |---|---|
+| Copies and read backs taking a newer alias first (local, committed and reverted) | Review: it copied a whole alias on every dispatch binding the source as unordered access and the alias as a view, left the source in a state it cannot be copied from, skipped copies across lists recorded in parallel, and could overwrite texels filled from title memory. No safe small version was found; the stale read ([#3170](https://github.com/Marvisak/VIctory/pull/3170)) stays, noted at `alias_source` |
 | A second heap slot sync during the GPU wait | Preparing 161 ms against 154, frame 445 against 406, title threads waited longer to write views (one run). A slot's view copy now retired with its resource stayed from it |
 | Refreshes of copies in video memory through the copy pool | Refresh batches 69 ms against 64 (one run) |
 | Copy-back reads of title memory in user mode instead of `ReadProcessMemory` | Marked pages 81 ms against 61, copy-back 92 against 67, frame 439 against 390 (one run, a noisy one: preparing varied twice as much as before) |
@@ -705,7 +792,13 @@ two later runs of nearly the same build gave 54 (`gpu207`) and 76 ms
   (view heap cap).
 - The multi-wave barriers of #2214 are called undefined by D3D12 in its own
   review when reached from different places in one group; the pull request is
-  a draft.
+  a draft. Diagnostics builds now report wave32 programs whose lanes may skip
+  a group barrier; those are not changed. Run `gpu209` logged 10 such compute
+  programs, `gpu210` and later runs 11 (9 console wave64, 2 wave32), in groups
+  of 64 to 1024 threads, all lowerable with the console flow; a correct fix
+  needs one barrier site shared by the waves.
+- A copy or read back of a texture can miss what the GPU wrote through another
+  title texture at its memory (see Tried and left out).
 
 ## Testing
 
