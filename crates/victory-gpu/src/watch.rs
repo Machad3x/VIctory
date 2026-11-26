@@ -281,6 +281,59 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
+/// Whether guard faults are counted by the kind of memory they hit
+/// (`VICTORY_DIAG_FAULT_KINDS=1`, read once in [`install`]).
+#[cfg(feature = "diagnostics")]
+static FAULT_KINDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether some tracker holding `page` (or one of its aliases) has it
+/// armed (diagnostics), under the guard lock.
+#[cfg(feature = "diagnostics")]
+fn armed_any(g: &Guards, page: usize) -> bool {
+    let others = g.alias_of.get(&page).into_iter().flatten();
+    std::iter::once(&page).chain(others).any(|p| {
+        g.holders
+            .get(p)
+            .is_some_and(|h| h.iter().any(|c| c.1.lock().unwrap_or_else(|e| e.into_inner()).armed(*p)))
+    })
+}
+
+/// Counts a guard fault on `page` by the kind of memory it hit
+/// (diagnostics), outside the guard lock: a write-watched pool, a mapped
+/// view, a fixed private reservation, or other.
+#[cfg(feature = "diagnostics")]
+fn count_fault_kind(page: usize, armed: bool) {
+    use crate::copystat::{C, add};
+    use windows_sys::Win32::System::Memory::{
+        GetWriteWatch, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let at = page * PAGE;
+    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    // SAFETY: room for one answer; no reset, so nothing changes.
+    let watched =
+        unsafe { GetWriteWatch(0, at as *const _, PAGE, (&raw mut found).cast(), &mut count, &mut granularity) == 0 };
+    if watched {
+        add(C::GuardFaultsPool, 1);
+        if armed {
+            add(C::GuardFaultsPoolArmed, 1);
+        }
+        return;
+    }
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    add(
+        match info.Type {
+            _ if n == 0 => C::GuardFaultsOther,
+            MEM_MAPPED => C::GuardFaultsView,
+            MEM_PRIVATE => C::GuardFaultsFixed,
+            _ => C::GuardFaultsOther,
+        },
+        1,
+    );
+}
+
 #[cfg(not(feature = "diagnostics"))]
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -1271,7 +1324,16 @@ fn install() {
         title_wrote(&g, at / PAGE, at / PAGE + 1);
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            {
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                if FAULT_KINDS.load(Ordering::Relaxed) {
+                    let armed = armed_any(&g, at / PAGE);
+                    drop(_holding);
+                    drop(g);
+                    // Outside the guard lock: two syscalls.
+                    count_fault_kind(at / PAGE, armed);
+                }
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -1283,6 +1345,10 @@ fn install() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     // SAFETY: the handler only touches our guard state and protections.
     ONCE.call_once(|| unsafe {
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_DIAG_FAULT_KINDS").is_some_and(|v| v == "1") {
+            FAULT_KINDS.store(true, Ordering::Relaxed);
+        }
         AddVectoredExceptionHandler(1, Some(on_write));
     });
 }

@@ -200,6 +200,16 @@ pub(crate) enum C {
     DrainFree,
     /// Title fence polls (`GetCompletedValue`), waiting or not.
     FlightFencePolls,
+    /// Guard faults by the memory they hit (`VICTORY_DIAG_FAULT_KINDS=1`):
+    /// write-watched pool (and of those, pages some tracker had armed),
+    /// mapped view, fixed private reservation, other.
+    GuardFaultsPool,
+    GuardFaultsPoolArmed,
+    GuardFaultsView,
+    GuardFaultsFixed,
+    GuardFaultsOther,
+    /// Indirect mesh dispatches dropped (not recorded).
+    MeshIndirectDropped,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -599,6 +609,25 @@ pub(crate) fn log(frames: f64) {
         c[C::DrainFree as usize],
         c[C::FlightFencePolls as usize],
     );
+    let kinds = [
+        C::GuardFaultsPool as usize,
+        C::GuardFaultsPoolArmed as usize,
+        C::GuardFaultsView as usize,
+        C::GuardFaultsFixed as usize,
+        C::GuardFaultsOther as usize,
+        C::MeshIndirectDropped as usize,
+    ];
+    if kinds.iter().any(|&k| c[k] != 0.0) {
+        tracing::info!(
+            "  guard faults by kind per frame: pool {:.0} (armed {:.0}), view {:.0}, fixed {:.0}, other {:.0}; {:.0} indirect mesh dispatches dropped",
+            c[C::GuardFaultsPool as usize],
+            c[C::GuardFaultsPoolArmed as usize],
+            c[C::GuardFaultsView as usize],
+            c[C::GuardFaultsFixed as usize],
+            c[C::GuardFaultsOther as usize],
+            c[C::MeshIndirectDropped as usize],
+        );
+    }
     let times = crate::watch::held_times();
     let handler_hold = c[C::HandlerHoldNs as usize] / 1e6;
     let all_held: f64 = times.iter().map(|(_, total, _)| total / frames).sum();

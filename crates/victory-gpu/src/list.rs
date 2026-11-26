@@ -2048,6 +2048,8 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::MeshIndirectDropped, 1);
             if let Some(list) = super::host_list(this) {
                 list.missed_draw();
             }
