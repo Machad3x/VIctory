@@ -7,6 +7,7 @@ param(
     [switch]$Warm,
     [string]$Skip = '',
     [switch]$Dred,
+    [switch]$Timing,
     [int]$Loop = 4096,
     [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
     [string]$Game = $env:VICTORY_GAME_DIR
@@ -28,6 +29,8 @@ $env:VICTORY_GPU_UPLOAD = '1'
 $env:VICTORY_GPU_UPLOAD_WRITES = '1'
 if ($Dred) { $env:VICTORY_D3D12_DRED = '1'; $env:VICTORY_GPU_TIMING = '1' }
 else { Remove-Item Env:VICTORY_D3D12_DRED, Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue }
+# GPU time per pipeline in the log (each list submitted on its own: slower).
+if ($Timing) { $env:VICTORY_GPU_TIMING = '1' }
 if ($Skip) { $env:VICTORY_SKIP_PIPELINES = $Skip } else { Remove-Item Env:VICTORY_SKIP_PIPELINES -ErrorAction SilentlyContinue }
 
 if ($Warm) {
