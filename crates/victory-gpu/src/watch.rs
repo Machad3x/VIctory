@@ -116,8 +116,8 @@ struct Saved {
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
 }
 
-/// Page buffers [`Changed::save`] reuses: the guard handler saving a page
-/// neither zeroes 64 KiB nor calls the heap (where the faulting thread may
+/// Page buffers [`Changed::save`] reuses: on the success path, the guard
+/// handler saving a page neither zeroes 64 KiB nor calls the heap (where the faulting thread may
 /// hold its lock) while the pool has one. A leaf lock, held for a push or a
 /// pop. Bytes handed out by [`Tracked::saved`] are freed by their taker.
 static SAVE_POOL: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
@@ -135,10 +135,6 @@ fn page_buffer() -> Box<[u8]> {
 fn recycle(bytes: Box<[u8]>) {
     debug_assert_eq!(bytes.len(), PAGE);
     let mut pool = SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-    if pool.capacity() == 0 {
-        // Once, so later pushes never allocate.
-        pool.reserve_exact(SAVE_POOL_MAX);
-    }
     if pool.len() < SAVE_POOL_MAX {
         pool.push(bytes);
         return;
@@ -497,6 +493,13 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
         return None;
     }
     install();
+    {
+        let mut pool = SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.capacity() == 0 {
+            // Once, outside the guard handler, so its pushes never allocate.
+            pool.reserve_exact(SAVE_POOL_MAX);
+        }
+    }
     // The rest of the range, as byte runs.
     let mut untracked: Vec<(usize, usize)> = Vec::new();
     let mut at = start;
@@ -1800,7 +1803,10 @@ pub(crate) mod tests {
         for _ in 0..4 {
             recycle(vec![0xAA; PAGE].into_boxed_slice());
         }
+        let pooled = || SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let before = pooled();
         unsafe { ((p + 8) as *mut u8).write_volatile(0xEE) };
+        assert_eq!(pooled() + 1, before, "the save took a pooled buffer");
         let saved = t.saved(p / PAGE).expect("armed page is saved");
         assert!(saved.iter().enumerate().all(|(i, &b)| b == fill(i)), "saved bytes are the page's");
         t.disarm();
