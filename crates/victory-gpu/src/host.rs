@@ -442,7 +442,8 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
 #[cfg(feature = "diagnostics")]
 static UNTIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
+/// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest, then
+/// totals by kind.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
     let untimed = UNTIMED.swap(0, Ordering::Relaxed);
@@ -464,6 +465,19 @@ fn log_gpu_times(frames: f64) {
     by.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     for (key, (ms, n)) in by.iter().take(25) {
         tracing::info!("  GPU {:.2} ms/frame in {:.1} commands/frame: {key}", ms / frames, *n as f64 / frames);
+    }
+    // The 25 above leave a long tail; totals by kind (the key's first word) cover all of it.
+    let mut kinds: Vec<(&str, f64, u64)> = Vec::new();
+    for (key, (ms, n)) in &by {
+        let kind = key.split([' ', '[']).next().unwrap_or("");
+        match kinds.iter_mut().find(|k| k.0 == kind) {
+            Some(k) => (k.1, k.2) = (k.1 + ms, k.2 + n),
+            None => kinds.push((kind, *ms, *n)),
+        }
+    }
+    kinds.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (kind, ms, n) in kinds {
+        tracing::info!("  GPU kind {:.2} ms/frame in {:.1} commands/frame: {kind}", ms / frames, n as f64 / frames);
     }
 }
 
