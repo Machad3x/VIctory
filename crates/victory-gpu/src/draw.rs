@@ -3658,6 +3658,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         let a = crate::resource::host_copy(object).unwrap();
         let b = crate::resource::host_copy(placed as This).unwrap();
         assert!(std::sync::Arc::ptr_eq(&a, &b), "one host texture");
+        // A target view in 67 of the read-only view names the shared stand-in.
+        let mut slot = [0u8; 112];
+        crate::descriptor::create_rtv(std::ptr::null(), placed as This, &[67, 4, 0, 0, 0, 0], slot.as_mut_ptr() as u64);
+        let record = crate::descriptor::rtv_record(slot.as_ptr() as u64).unwrap();
+        assert_eq!(record.desc().unwrap().Format.0, 26, "a stand-in target view");
         let unordered = View::Unordered(object as usize, 0, Some([67, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
         slots.make(0, &unordered);
         slots.make(1, &view);

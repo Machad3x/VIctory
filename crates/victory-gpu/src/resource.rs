@@ -275,9 +275,11 @@ pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D1
 /// Packed colour targets use RGBA8 when the device lacks either writable use;
 /// shared-exponent R9G9B9E5 (67), a Series S full-screen target no PC GPU
 /// renders to, uses R11G11B10 float (32 bits, unsigned, no alpha like it).
-/// shortcut: GPU copies between a stand-in and native texels are skipped
-/// (`crate::texture::incompatible_copy`) and raw uint views over a 67
-/// stand-in read R11G11B10 bits as wrong colours; convert if a pass needs it.
+/// A 67 stand-in copied into a native 67 texture is converted on the GPU
+/// (`crate::texture::copy_stand_in_to_67`).
+/// shortcut: other GPU copies between a stand-in and native texels are
+/// skipped (`crate::texture::incompatible_copy`), and raw uint views over a
+/// 67 stand-in read R11G11B10 bits as wrong colours; convert if a pass needs it.
 #[cfg(windows)]
 pub(crate) fn target_format(format: u32) -> u32 {
     packed_target_format(format, format_support)
@@ -303,14 +305,18 @@ fn stand_in_format(guest: u32, host: u32) -> bool {
 }
 
 /// The format a target view of `this` (null: no texture) in `format` is
-/// made in: the stand-in, but for a 67 view of a read-only texture (its
-/// host copy is native or an alias of other texels, [`writable_67`]).
+/// made in: the stand-in, but a 67 view keeps 67 unless its host texture
+/// is a stand-in (a read-only 67 texture may share one, or be native or
+/// an alias of other texels); before the host texture is made, unless the
+/// title texture is writable ([`writable_67`]).
 #[cfg(windows)]
 pub(crate) fn target_view_format(this: This, format: u32) -> u32 {
-    if format == 67 && !this.is_null() && resource(this).desc.flags & (TARGET | UNORDERED) == 0 {
-        return format;
+    if format != 67 || this.is_null() {
+        return target_format(format);
     }
-    target_format(format)
+    let stand_in = made_copy(this)
+        .map_or(resource(this).desc.flags & (TARGET | UNORDERED) != 0, |c| c.packed() == Some(67));
+    if stand_in { target_format(format) } else { format }
 }
 
 /// Whether a title texture of `desc` in the shared-exponent format gets a
@@ -1420,8 +1426,10 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    // A read-only alias can acquire writable uses from another title texture.
-    if d.flags & (TARGET | UNORDERED) != 0 {
+    // A read-only alias can acquire writable uses from another title texture;
+    // not a read-only 67 one, whose key has no stand-in (`writable_67`): its
+    // texels stay 67 bits (the sky's R32_UINT tables written as such).
+    if d.flags & (TARGET | UNORDERED) != 0 && key.is_none_or(|k| k.packed.is_some() || d.format != 67) {
         d.format = target_format(d.format);
     }
     let mut t = make_texture(&d, state, clear)?;

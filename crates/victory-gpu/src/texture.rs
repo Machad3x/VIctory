@@ -43,6 +43,124 @@ pub(crate) fn incompatible_copy(src: Option<u32>, dst: Option<u32>) -> bool {
     true
 }
 
+/// R11G11B10 float words to R9G9B9E5, in place in a buffer of `pitch`-byte
+/// rows (`width` texels each): [`small_float`] and [`rgb9e5`] on the GPU.
+const STAND_IN_TO_67: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
+cbuffer C : register(b0) { uint width; uint pitch; };
+RWByteAddressBuffer buf : register(u0);
+float small(uint bits, uint man) {
+    uint e = (bits >> man) & 0x1f;
+    uint m = bits & ((1u << man) - 1);
+    if (e == 31) return m != 0 ? 0.0 : 65408.0;
+    if (e == 0) return (float)m * asfloat((127 - 14 - man) << 23);
+    return asfloat(((e + 112) << 23) | (m << (23 - man)));
+}
+uint pack(float3 c) {
+    c = min(c, 65408.0);
+    float mx = max(c.r, max(c.g, c.b));
+    int e = max(-16, (int)(asuint(mx) >> 23) - 127) + 16;
+    float denom = asfloat((uint)(e - 24 + 127) << 23);
+    if (floor(mx / denom + 0.5) >= 512.0) { denom *= 2.0; e += 1; }
+    uint3 q = (uint3)floor(c / denom + 0.5);
+    return q.r | q.g << 9 | q.b << 18 | (uint)e << 27;
+}
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width) return;
+    uint a = id.y * pitch + id.x * 4;
+    uint v = buf.Load(a);
+    buf.Store(a, pack(float3(small(v & 0x7ff, 6), small((v >> 11) & 0x7ff, 6), small(v >> 22, 5))));
+}
+"#;
+
+/// Copies subresource `from_sub` (the region `b`, or all of it) of an
+/// R9G9B9E5 stand-in (R11G11B10, [`crate::resource::target_format`]) into
+/// subresource `to_sub` at `at` of a native R9G9B9E5 texture: through the
+/// shared scratch buffer, converted there by a compute pass (the list's
+/// compute state is set again after, `need_rebind`). Both textures are in
+/// the copy states already. False if the pass is not available.
+/// shortcut: 2D regions of one slice; the other direction (native 67 into
+/// a stand-in) is still skipped by [`incompatible_copy`].
+pub(crate) fn copy_stand_in_to_67(
+    list: &HostList,
+    to: &ID3D12Resource,
+    to_sub: u32,
+    at: [u32; 3],
+    from: &ID3D12Resource,
+    from_sub: u32,
+    b: Option<&D3D12_BOX>,
+) -> bool {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static PASS: std::sync::OnceLock<Option<crate::twin::Converter>> = std::sync::OnceLock::new();
+    let Some(c) = PASS
+        .get_or_init(|| crate::twin::compile(STAND_IN_TO_67).inspect_err(|e| tracing::warn!(error = %e, "no R9G9B9E5 conversion")).ok())
+        .as_ref()
+    else {
+        return false;
+    };
+    // SAFETY: a live texture.
+    let d = unsafe { from.GetDesc() };
+    let mip = from_sub % u32::from(d.MipLevels.max(1));
+    let (width, height) = match b {
+        Some(b) => (b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top)),
+        None => (((d.Width >> mip).max(1)) as u32, (d.Height >> mip).max(1)),
+    };
+    if width == 0 || height == 0 {
+        return true;
+    }
+    let pitch = (width * 4).next_multiple_of(256);
+    let Some(scratch) = crate::twin::shared_scratch(u64::from(pitch) * u64::from(height)) else {
+        return false;
+    };
+    let placed = |format: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the copy does not release.
+        pResource: unsafe { std::mem::transmute_copy(&scratch) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT(format as i32),
+                    Width: width,
+                    Height: height,
+                    Depth: 1,
+                    RowPitch: pitch,
+                },
+            },
+        },
+    };
+    let sub = |r: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(r) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+    };
+    let state = |a, z| crate::host::transition(&scratch, a, z);
+    let constants = [width, pitch];
+    // SAFETY: an open list; live resources in the states named (the scratch
+    // buffer starts common: its first copy promotes it).
+    unsafe {
+        let l = &list.list;
+        l.CopyTextureRegion(&placed(26), 0, 0, 0, &sub(from, from_sub), b.map(std::ptr::from_ref));
+        l.ResourceBarrier(&[state(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, scratch.GetGPUVirtualAddress());
+        l.Dispatch(width.div_ceil(64), height, 1);
+        l.ResourceBarrier(&[
+            crate::twin::uav_barrier(),
+            state(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        ]);
+        l.CopyTextureRegion(&sub(to, to_sub), at[0], at[1], at[2], &placed(67), None);
+        l.ResourceBarrier(&[state(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+    }
+    list.need_rebind();
+    true
+}
+
 /// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
 /// (the 11- and 10-bit floats of R11G11B10).
 pub(crate) fn small_float(bits: u32, man: u32) -> f32 {

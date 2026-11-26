@@ -764,7 +764,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             let to = dst_write.resource().clone();
-            if crate::texture::incompatible_copy(crate::resource::packed_format(src), crate::resource::packed_format(dst)) {
+            let (src_packed, dst_packed) = (crate::resource::packed_format(src), crate::resource::packed_format(dst));
+            let convert = stand_in_to_67(src_packed, dst_packed, &to);
+            if !convert && crate::texture::incompatible_copy(src_packed, dst_packed) {
                 return;
             }
             if crate::texture::title_written(&from) {
@@ -777,6 +779,19 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             dst_write.record(list);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            if convert {
+                // Every subresource (mips by array slices), whole.
+                // SAFETY: a live texture.
+                let d = unsafe { to.GetDesc() };
+                let count = u32::from(d.MipLevels.max(1)) * u32::from(d.DepthOrArraySize.max(1));
+                for i in 0..count {
+                    if !crate::texture::copy_stand_in_to_67(list, &to, i, [0; 3], &from, i, None) {
+                        crate::texture::incompatible_copy(Some(67), None);
+                        break;
+                    }
+                }
+                return;
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(&to, &from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -792,6 +807,16 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
     copy_resource(this, dst, src);
+}
+
+/// Whether a copy from a texture whose host copy is a stand-in for `src`
+/// into one for `dst` (host texture `to`) converts R11G11B10 to native
+/// R9G9B9E5 (`crate::texture::copy_stand_in_to_67`): the scene colour's
+/// copy into a read-only 67 texture.
+#[cfg(windows)]
+fn stand_in_to_67(src: Option<u32>, dst: Option<u32>, to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    // SAFETY: a live texture.
+    src == Some(67) && dst.is_none() && unsafe { to.GetDesc() }.Format.0 == 67
 }
 
 /// A copy location as titles pass it, laid out as the host's: a resource,
@@ -839,6 +864,8 @@ extern "system" fn copy_texture_region(
         let packed = crate::resource::packed_format(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        // An R9G9B9E5 stand-in source into a native R9G9B9E5 texture: converted.
+        let mut convert = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -882,7 +909,10 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if crate::texture::incompatible_copy(crate::resource::packed_format(src.resource), packed) {
+            let src_packed = crate::resource::packed_format(src.resource);
+            if stand_in_to_67(src_packed, packed, &to) {
+                convert = Some(texture.clone());
+            } else if crate::texture::incompatible_copy(src_packed, packed) {
                 return;
             }
             if crate::texture::title_written(&texture) {
@@ -929,6 +959,16 @@ extern "system" fn copy_texture_region(
                 Some(range) => list.note_read(text, range),
                 None => list.note_op(text),
             }
+        }
+        if let Some(texture) = convert {
+            // A subresource index is the first word of the location's union.
+            let sub = |l: &CopyLocation| l.footprint.offset as u32;
+            // SAFETY: the title's box (same layout as the host's) or null.
+            let b = host_box.and_then(|b| unsafe { b.as_ref() });
+            if !crate::texture::copy_stand_in_to_67(list, &to, sub(&dst), [x, y, z], &texture, sub(&src), b) {
+                crate::texture::incompatible_copy(Some(67), None);
+            }
+            return;
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());

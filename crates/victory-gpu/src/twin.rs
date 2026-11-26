@@ -231,7 +231,7 @@ static SCRATCH: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::n
 /// The shared scratch buffer of at least `size` bytes: the one of `size`'s
 /// power-of-two class, made on first use. All of them together hold at
 /// most twice the largest.
-fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
+pub(crate) fn shared_scratch(size: u64) -> Option<ID3D12Resource> {
     let class = size.max(1 << 16).next_power_of_two();
     let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
@@ -522,7 +522,7 @@ impl Twin {
     }
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -563,9 +563,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 "#;
 
-struct Converter {
-    root: ID3D12RootSignature,
-    pso: ID3D12PipelineState,
+/// A compute pass of ours (root signature inside the shader).
+pub(crate) struct Converter {
+    pub(crate) root: ID3D12RootSignature,
+    pub(crate) pso: ID3D12PipelineState,
 }
 
 // SAFETY: D3D12 objects are free-threaded.
@@ -575,7 +576,7 @@ unsafe impl Sync for Converter {}
 
 fn converter() -> Option<&'static Converter> {
     static MADE: std::sync::OnceLock<Option<Converter>> = std::sync::OnceLock::new();
-    MADE.get_or_init(|| match compile() {
+    MADE.get_or_init(|| match compile(SOURCE) {
         Ok(c) => Some(c),
         Err(e) => {
             tracing::warn!(error = %e, "no depth conversion: 16-bit depth written through unordered views does not reach the depth texture");
@@ -585,19 +586,20 @@ fn converter() -> Option<&'static Converter> {
     .as_ref()
 }
 
-fn compile() -> windows::core::Result<Converter> {
+/// A compute pass from HLSL `source` (entry `main`, cs_5_1).
+pub(crate) fn compile(source: &str) -> windows::core::Result<Converter> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
-        D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("depth"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
+        D3DCompile(source.as_ptr().cast(), source.len(), s!("conversion"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
     };
     if let Err(e) = compiled {
         if let Some(errors) = errors {
             // SAFETY: the blob's own bytes.
             let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
-            tracing::warn!("depth conversion: {}", String::from_utf8_lossy(text));
+            tracing::warn!("compute conversion: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }

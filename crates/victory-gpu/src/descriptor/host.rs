@@ -1776,7 +1776,15 @@ fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, O
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+/// `packed`: the guest format whose stand-in the texture is
+/// (`HostTexture::packed`); a view in it takes the texture's format.
+fn fits(
+    texture: &ID3D12Resource,
+    castable: &[u32],
+    packed: Option<u32>,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -1807,6 +1815,10 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Only a stand-in maps a 67 view to its R11G11B10: a native R11G11B10
+    // texture's 67 view is a cast (86/115 keep the format check).
+    let stand_in = view != own
+        && (packed == Some(view) || (view != 67 && crate::resource::target_format(view) == own));
     // A typed unordered view in a format the host cannot store to
     // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
     // texture's own format too: the slot stays null, its writes dropped.
@@ -1814,7 +1826,7 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     // texture's own unless the requested one is castable (below), and a
     // stand-in's for its guest format (R9G9B9E5 is castable to R11G11B10).
     let typed = if view == 0
-        || crate::resource::target_format(view) == own
+        || stand_in
         || (!typeless && !castable.contains(&view))
     {
         own
@@ -1828,7 +1840,7 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     if view == 0 {
         return !typeless && (!unordered || typed_store(own));
     }
-    if view != own && crate::resource::target_format(view) == own {
+    if stand_in {
         if let Some(format) = format {
             *format = d.Format;
         }
@@ -1926,7 +1938,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 {
                     desc.Format = DXGI_FORMAT(format as i32);
                 }
-                if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(texture, &copy.castable, copy.packed(), desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
@@ -1974,7 +1986,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             {
                 desc.Format = DXGI_FORMAT(format as i32);
             }
-            if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(texture, &copy.castable, copy.packed(), desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -3174,12 +3186,12 @@ mod tests {
         let mut fmt = DXGI_FORMAT(B5G5R5A1_UNORM as i32);
         // Unsupported typed UAV format must be refused even when castable.
         assert_eq!(
-            super::fits(&tex, &[B5G5R5A1_UNORM], Some(&mut fmt), true),
+            super::fits(&tex, &[B5G5R5A1_UNORM], None, Some(&mut fmt), true),
             super::typed_store(B5G5R5A1_UNORM)
         );
         // SRV with the same castable format remains allowed.
         let mut srv_fmt = DXGI_FORMAT(B5G5R5A1_UNORM as i32);
-        assert!(super::fits(&tex, &[B5G5R5A1_UNORM], Some(&mut srv_fmt), false));
+        assert!(super::fits(&tex, &[B5G5R5A1_UNORM], None, Some(&mut srv_fmt), false));
     }
 
     #[test]
@@ -3223,22 +3235,34 @@ mod tests {
         };
 
         let typeless = make_tex(DXGI_FORMAT_R8G8B8A8_TYPELESS);
-        assert!(!super::fits(&typeless, &[], None, true));
+        assert!(!super::fits(&typeless, &[], None, None, true));
         for format in [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UINT] {
             let mut fmt = format;
-            assert!(super::fits(&typeless, &[], Some(&mut fmt), true));
+            assert!(super::fits(&typeless, &[], None, Some(&mut fmt), true));
             assert_eq!(fmt, format);
         }
         let mut srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        assert!(super::fits(&typeless, &[], Some(&mut srgb), true));
+        assert!(super::fits(&typeless, &[], None, Some(&mut srgb), true));
         assert_eq!(srgb, DXGI_FORMAT_R8G8B8A8_UNORM);
 
         for format in [DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R16G16B16A16_FLOAT] {
             let typed = make_tex(format);
-            assert!(super::fits(&typed, &[], None, true));
+            assert!(super::fits(&typed, &[], None, None, true));
             let mut fmt = format;
-            assert!(super::fits(&typed, &[], Some(&mut fmt), true));
+            assert!(super::fits(&typed, &[], None, Some(&mut fmt), true));
         }
+
+        // R9G9B9E5 (67) views of an R11G11B10 texture: the stand-in's
+        // (shader and unordered) take R11G11B10, a native one's is a cast.
+        let r11 = make_tex(DXGI_FORMAT_R11G11B10_FLOAT);
+        for unordered in [false, true] {
+            let mut fmt = DXGI_FORMAT(67);
+            assert!(super::fits(&r11, &[67], Some(67), Some(&mut fmt), unordered));
+            assert_eq!(fmt, DXGI_FORMAT_R11G11B10_FLOAT);
+        }
+        let mut fmt = DXGI_FORMAT(67);
+        assert!(super::fits(&r11, &[67], None, Some(&mut fmt), false));
+        assert_eq!(fmt.0, 67);
     }
 
     /// Title, dynamic and pair slots end before the three null views; a
