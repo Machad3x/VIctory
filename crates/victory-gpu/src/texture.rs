@@ -43,8 +43,72 @@ pub(crate) fn incompatible_copy(src: Option<u32>, dst: Option<u32>) -> bool {
     true
 }
 
-/// Converts one row from the title's little-endian BGRA bits to host RGBA8.
+/// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
+/// (the 11- and 10-bit floats of R11G11B10).
+pub(crate) fn small_float(bits: u32, man: u32) -> f32 {
+    let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
+    match exp {
+        0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
+        31 => f32::INFINITY,
+        e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
+    }
+}
+
+/// `v` as a float of a 5-bit exponent and `man` mantissa bits, rounded to
+/// nearest, denormals kept; NaN and negatives are 0, larger than the
+/// largest finite (65024 for 11 bits, 64512 for 10) clamps to it.
+fn small_bits(v: f32, man: u32) -> u32 {
+    let max = 30 << man | ((1 << man) - 1);
+    if v.is_nan() || v <= 0.0 {
+        return 0;
+    }
+    let b = v.to_bits();
+    let exp = (b >> 23) as i32 - 127;
+    let bits = if exp < -14 {
+        (v * 2f32.powi(14 + man as i32)).round() as u32
+    } else {
+        let shift = 23 - man;
+        ((((exp + 15) as u32) << 23 | (b & 0x7f_ffff)) + (1 << (shift - 1))) >> shift
+    };
+    bits.min(max)
+}
+
+/// Channels (clamped to 0..=65408, NaN to 0) as R9G9B9E5 bits: the
+/// standard shared exponent, bumped when the largest mantissa rounds over.
+fn rgb9e5(c: [f32; 3]) -> u32 {
+    let c = c.map(|v| if v > 0.0 { v.min(65408.0) } else { 0.0 });
+    let max = c[0].max(c[1]).max(c[2]);
+    let mut exp = ((max.to_bits() >> 23) as i32 - 127).max(-16) + 16;
+    let mut denom = 2f32.powi(exp - 24);
+    if (max / denom + 0.5).floor() >= 512.0 {
+        denom *= 2.0;
+        exp += 1;
+    }
+    let m = c.map(|v| (v / denom + 0.5).floor() as u32);
+    m[0] | m[1] << 9 | m[2] << 18 | (exp as u32) << 27
+}
+
+/// R9G9B9E5 bits (`mantissa * 2^(e-24)`) as the R11G11B10 float stand-in.
+fn rgb9e5_to_r11g11b10(bits: u32) -> u32 {
+    let scale = 2f32.powi((bits >> 27) as i32 - 24);
+    let c = |shift: u32| (bits >> shift & 0x1ff) as f32 * scale;
+    small_bits(c(0), 6) | small_bits(c(9), 6) << 11 | small_bits(c(18), 5) << 22
+}
+
+fn r11g11b10_to_rgb9e5(bits: u32) -> u32 {
+    rgb9e5([small_float(bits & 0x7ff, 6), small_float(bits >> 11 & 0x7ff, 6), small_float(bits >> 22, 5)])
+}
+
+/// Converts one row from the title's little-endian BGRA bits to host RGBA8
+/// (R9G9B9E5: to R11G11B10 float, 4 bytes each).
 pub(crate) fn expand_row(format: u32, packed: &[u8], rgba: &mut [u8]) {
+    if format == 67 {
+        for (p, c) in packed.as_chunks::<4>().0.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut()) {
+            *c = rgb9e5_to_r11g11b10(u32::from_le_bytes(*p)).to_le_bytes();
+        }
+        return;
+    }
     for (p, c) in packed.as_chunks::<2>().0.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut()) {
         let bits = u16::from_le_bytes(*p);
         let channel = |shift: u32, max: u16| (((bits >> shift & max) * 255 + max / 2) / max) as u8;
@@ -58,6 +122,12 @@ pub(crate) fn expand_row(format: u32, packed: &[u8], rgba: &mut [u8]) {
 }
 
 pub(crate) fn pack_row(format: u32, rgba: &[u8], packed: &mut [u8]) {
+    if format == 67 {
+        for (c, p) in rgba.as_chunks::<4>().0.iter().zip(packed.as_chunks_mut::<4>().0.iter_mut()) {
+            *p = r11g11b10_to_rgb9e5(u32::from_le_bytes(*c)).to_le_bytes();
+        }
+        return;
+    }
     for (c, p) in rgba.as_chunks::<4>().0.iter().zip(packed.as_chunks_mut::<2>().0.iter_mut()) {
         let channel = |i: usize, max: u16| (u16::from(c[i]) * max + 127) / 255;
         let bits = match format {
@@ -1123,7 +1193,7 @@ impl Staging {
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(next as usize), len) };
             let detile = |dst: &mut [u8], pitch| self.layout.detile(tiled, mip, slice, dst, pitch, pitch * rows as usize);
             let result = if let Some(format) = self.packed {
-                let row = f.Width as usize * 2;
+                let row = f.Width as usize * crate::resource::element(format).map_or(2, |e| e.0 as usize);
                 let mut packed = vec![0; row * rows as usize * f.Depth as usize];
                 detile(&mut packed, row).map(|()| {
                     for (src, dst) in packed.chunks_exact(row).zip(linear.chunks_mut(pitch)) {
@@ -1547,6 +1617,45 @@ mod tests {
             copied: Default::default(),
             packed: None,
         })
+    }
+
+    /// R9G9B9E5 texels expand to R11G11B10 float and pack back: exact
+    /// where both formats hold the value, clamped to the 11- and 10-bit
+    /// maxima, denormals kept, NaN and negatives 0.
+    #[test]
+    fn shared_exponent_texels_round_trip_through_the_stand_in() {
+        let floats = |b: u32| {
+            let scale = 2f32.powi((b >> 27) as i32 - 24);
+            [0, 9, 18].map(|s| (b >> s & 0x1ff) as f32 * scale)
+        };
+        let tiny = 2f32.powi(-20); // the smallest 11-bit denormal
+        for (c, want) in [
+            ([1.0, 0.5, 0.25], [1.0, 0.5, 0.25]),
+            ([0.0; 3], [0.0; 3]),
+            ([65408.0; 3], [65024.0, 65024.0, 64512.0]),
+            ([tiny, 0.0, 0.0], [tiny, 0.0, 0.0]),
+            ([-1.0, f32::NAN, 1.0], [0.0, 0.0, 1.0]),
+        ] {
+            let word = rgb9e5(c);
+            let mut host = [0; 4];
+            expand_row(67, &word.to_le_bytes(), &mut host);
+            let h = u32::from_le_bytes(host);
+            let got = [small_float(h & 0x7ff, 6), small_float(h >> 11 & 0x7ff, 6), small_float(h >> 22, 5)];
+            assert_eq!(got, want, "{c:?}");
+            let mut back = [0; 4];
+            pack_row(67, &host, &mut back);
+            for (b, w) in floats(u32::from_le_bytes(back)).into_iter().zip(want) {
+                assert!((b - w).abs() <= w / 256.0, "{c:?}: {b} for {w}");
+            }
+        }
+        assert_eq!(small_bits(-1.0, 6), 0);
+        assert_eq!(small_bits(f32::NAN, 5), 0);
+        assert_eq!(small_bits(1e9, 6), 0x7bf);
+        assert_eq!(small_bits(1e9, 5), 0x3df);
+        // A NaN R11G11B10 channel packs to 0.
+        assert_eq!(r11g11b10_to_rgb9e5(0x7c1) & 0x1ff, 0);
+        // A mantissa rounding to 512 takes the next exponent.
+        assert_eq!(floats(rgb9e5([511.9, 0.0, 0.0]))[0], 512.0);
     }
 
     #[test]

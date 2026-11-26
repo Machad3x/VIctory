@@ -272,7 +272,12 @@ pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D1
     flags
 }
 
-/// Packed colour targets use RGBA8 when the device lacks either writable use.
+/// Packed colour targets use RGBA8 when the device lacks either writable use;
+/// shared-exponent R9G9B9E5 (67), a Series S full-screen target no PC GPU
+/// renders to, uses R11G11B10 float (32 bits, unsigned, no alpha like it).
+/// shortcut: GPU copies between a stand-in and native texels are skipped
+/// (`crate::texture::incompatible_copy`) and raw uint views over a 67
+/// stand-in read R11G11B10 bits as wrong colours; convert if a pass needs it.
 #[cfg(windows)]
 pub(crate) fn target_format(format: u32) -> u32 {
     packed_target_format(format, format_support)
@@ -285,16 +290,35 @@ fn packed_target_format(
 ) -> u32 {
     use windows::Win32::Graphics::Direct3D12::*;
     let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
-    if matches!(format, 86 | 115) && !support(format).contains(both) {
-        28
-    } else {
-        format
+    match format {
+        86 | 115 if !support(format).contains(both) => 28,
+        67 if !support(format).contains(both) => 26,
+        _ => format,
     }
 }
 
 /// Whether the host texture contains expanded texels for this packed format.
 fn stand_in_format(guest: u32, host: u32) -> bool {
-    matches!(guest, 86 | 115) && host == 28
+    matches!((guest, host), (86 | 115, 28) | (67, 26))
+}
+
+/// The format a target view of `this` (null: no texture) in `format` is
+/// made in: the stand-in, but for a 67 view of a read-only texture (its
+/// host copy is native or an alias of other texels, [`writable_67`]).
+#[cfg(windows)]
+pub(crate) fn target_view_format(this: This, format: u32) -> u32 {
+    if format == 67 && !this.is_null() && resource(this).desc.flags & (TARGET | UNORDERED) == 0 {
+        return format;
+    }
+    target_format(format)
+}
+
+/// Whether a title texture of `desc` in the shared-exponent format gets a
+/// stand-in: only writable ones (a read-only 67 texture can be native
+/// texels, or the sky's R32_UINT tables read through a 67 view).
+#[cfg(windows)]
+fn writable_67(desc: &ResourceDesc) -> bool {
+    desc.format != 67 || desc.flags & (TARGET | UNORDERED) != 0
 }
 
 /// The typeless format of a format's family (itself if it has none).
@@ -924,7 +948,7 @@ impl HostTexture {
     pub(crate) fn packed(&self) -> Option<u32> {
         let format = self.key?.packed?;
         // SAFETY: a live texture.
-        (unsafe { self.texture.GetDesc() }.Format.0 == 28).then_some(format)
+        stand_in_format(format, unsafe { self.texture.GetDesc() }.Format.0 as u32).then_some(format)
     }
 
     /// A host texture made outside the title's resources (twins).
@@ -1305,8 +1329,16 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         depth: desc.flags & DEPTH != 0,
         // A read-only alias can inherit writable uses later.
         #[cfg(windows)]
-        packed: (target_format(desc.format) != desc.format).then_some(desc.format),
+        packed: (target_format(desc.format) != desc.format && writable_67(desc)).then_some(desc.format),
     })
+}
+
+/// For a read-only 67 title texture, the key of its memory's stand-in
+/// target ([`writable_67`]), which it reads first when live.
+#[cfg(windows)]
+fn stand_in_key(key: Option<MemoryKey>, desc: &ResourceDesc) -> Option<MemoryKey> {
+    let packed = target_format(desc.format) != desc.format && !writable_67(desc);
+    key.filter(|_| packed).map(|k| MemoryKey { packed: Some(desc.format), ..k })
 }
 
 /// The formats a host texture of `format` is made castable to: every
@@ -1347,9 +1379,19 @@ fn shared_texture(
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    let live = key
-        .and_then(|k| map.get(&k)?.upgrade())
-        .filter(|t| t.pending_host_writes.load(std::sync::atomic::Ordering::Acquire) & EVICTED == 0);
+    let live_at = |k: MemoryKey| {
+        map.get(&k)?
+            .upgrade()
+            .filter(|t| t.pending_host_writes.load(std::sync::atomic::Ordering::Acquire) & EVICTED == 0)
+    };
+    // A read-only 67 texture shares its memory's stand-in target if live.
+    if let Some(t) = stand_in_key(key, desc).and_then(live_at)
+        && takes(&t, &d)
+    {
+        SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(t);
+    }
+    let live = key.and_then(live_at);
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1427,9 +1469,15 @@ fn current(this: This) -> bool {
         return true;
     };
     let map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|m| m.get(&k)?.upgrade())
-        .is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
+    let live_at = |k: MemoryKey| map.as_ref().and_then(|m| m.get(&k)?.upgrade());
+    // As `shared_texture` looks: a read-only 67 texture's stand-in first.
+    if let Some(live) = stand_in_key(Some(k), &r.desc)
+        .and_then(live_at)
+        .filter(|t| t.pending_host_writes.load(std::sync::atomic::Ordering::Acquire) & EVICTED == 0)
+    {
+        return std::sync::Arc::ptr_eq(&live, &h);
+    }
+    live_at(k).is_none_or(|live| std::sync::Arc::ptr_eq(&live, &h))
 }
 
 /// A host texture of host description `d` in GPU memory, castable to
@@ -2579,7 +2627,11 @@ mod tests {
             }
             assert_eq!(packed_target_format(format, |_| rt | uav), format);
         }
-        for format in [28, 85, 87] {
+        for support in [D3D12_FORMAT_SUPPORT1_NONE, rt, uav] {
+            assert_eq!(packed_target_format(67, |_| support), 26);
+        }
+        assert_eq!(packed_target_format(67, |_| rt | uav), 67);
+        for format in [26, 28, 85, 87] {
             assert_eq!(packed_target_format(format, |_| unreachable!()), format);
         }
     }
@@ -2613,8 +2665,63 @@ mod tests {
             assert!(stand_in_format(format, 28));
             assert!(!stand_in_format(format, format));
         }
+        assert!(stand_in_format(67, 26));
+        assert!(!stand_in_format(67, 28));
+        assert!(!stand_in_format(86, 26));
         assert!(!stand_in_format(28, 28));
         assert!(!stand_in_format(29, 27));
+    }
+
+    /// A shared-exponent (R9G9B9E5) target, which the Series S profile
+    /// renders to and PC GPUs do not, has a host copy in the stand-in, and
+    /// the title's target views in its format, of it and of no texture (a
+    /// typed null view), leave the device be. Ported from Biskwit's
+    /// `a_shared_exponent_target_has_a_host_copy` (VIctory-reloaded 571b41b7).
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_exponent_target_has_a_host_copy() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            flags: TARGET | UNORDERED,
+            ..texture(64, 64, 67, 1)
+        };
+        let mut image = null;
+        assert_eq!(
+            create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image),
+            S_OK
+        );
+        let copy = host_resource(image).expect("a host copy of the target");
+        // SAFETY: a live resource.
+        assert_eq!(unsafe { copy.GetDesc() }.Format.0 as u32, target_format(67));
+        let heap_desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+            NumDescriptors: 1,
+            ..Default::default()
+        };
+        // SAFETY: plain creation.
+        let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&heap_desc) }.unwrap();
+        let view = [67u32, 4, 0, 0, 0, 0];
+        for resource in [image, null] {
+            let mut slot = [0u8; 112];
+            crate::descriptor::create_rtv(null, resource, &view, slot.as_mut_ptr() as u64);
+            let record = crate::descriptor::rtv_record(slot.as_ptr() as u64).unwrap();
+            let view_desc = record.desc().expect("a typed view");
+            assert_eq!(view_desc.Format.0 as u32, target_format(67));
+            // SAFETY: a live heap; the resource is live or none.
+            unsafe {
+                host.device.CreateRenderTargetView(
+                    host_resource(record.resource).as_ref(),
+                    Some(&view_desc),
+                    heap.GetCPUDescriptorHandleForHeapStart(),
+                )
+            };
+        }
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[cfg(windows)]

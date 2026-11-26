@@ -3632,6 +3632,59 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A shared-exponent (R9G9B9E5) target, filled by the GPU through an
+    /// unordered view (its R11G11B10 stand-in), reads through a read-only
+    /// placed view in its format: one host texture, no copy, the texel
+    /// written.
+    #[test]
+    fn a_shared_exponent_target_reads_through_a_placed_view() {
+        let _alone = ALIAS_COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        if crate::resource::target_format(67) == 67 {
+            return; // a host that renders to R9G9B9E5: no stand-in
+        }
+        let slots = Slots::new(4);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = title_memory(1 << 20);
+        const TARGET_AND_UNORDERED: u32 = 5;
+        let object = texture_at_address(address, &texture_words(64, 64, 67, 0x105, TARGET_AND_UNORDERED));
+        let view = placed_view(address, texture_words(64, 64, 67, 0x105, 0));
+        let Some(View::Shader(placed, _)) = crate::descriptor::host::placed_texture(&view) else {
+            panic!("a placed texture");
+        };
+        let a = crate::resource::host_copy(object).unwrap();
+        let b = crate::resource::host_copy(placed as This).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &b), "one host texture");
+        let unordered = View::Unordered(object as usize, 0, Some([67, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        slots.make(0, &unordered);
+        slots.make(1, &view);
+        let write = compile_cs(
+            r#"#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<float4> o : register(u0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) { o[id.xy] = float4(1, 0.5, 0.25, 1); }"#,
+        );
+        let list = host.new_list().unwrap();
+        let copies = crate::texture::ALIAS_COPIES.load(Ordering::Relaxed);
+        readable(&list, &used(ResourceType::Uav), &unordered, false);
+        run(&list, &slots, &write, 0, None, (8, 8));
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        run(&list, &slots, &read, 1, Some(&out), (8, 8));
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(crate::texture::ALIAS_COPIES.load(Ordering::Relaxed), copies, "no copy");
+        for i in [0usize, 7, 64 * 9 + 33, 64 * 64 - 1] {
+            let (x, y) = (i % 64, i / 64);
+            // SAFETY: inside the mapped output.
+            let got = unsafe { (data.add((y * 64 + x) * 16) as *const [f32; 4]).read() };
+            assert_eq!(got, [1.0, 0.5, 0.25, 1.0], "texel {x},{y}");
+        }
+    }
+
     /// A texture the title wrote, read through tables by two lists of one
     /// submission, is uploaded once; the next submission uploads it again
     /// only after the title writes it (run perf7 uploaded the same textures

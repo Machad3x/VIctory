@@ -1811,8 +1811,16 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
     // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
     // texture's own format too: the slot stays null, its writes dropped.
     // The format checked is the one the view is made in: a typed
-    // texture's own unless the requested one is castable (below).
-    let typed = if view == 0 || (!typeless && !castable.contains(&view)) { own } else { view };
+    // texture's own unless the requested one is castable (below), and a
+    // stand-in's for its guest format (R9G9B9E5 is castable to R11G11B10).
+    let typed = if view == 0
+        || crate::resource::target_format(view) == own
+        || (!typeless && !castable.contains(&view))
+    {
+        own
+    } else {
+        view
+    };
     if unordered && !(view == 0 && typeless) && !typed_store(typed) {
         once!(view = typed, own, "an unordered view in a format the host cannot store");
         return false;

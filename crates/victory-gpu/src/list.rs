@@ -862,7 +862,7 @@ extern "system" fn copy_texture_region(
                     crate::host::copy_mapped(guest.as_mut_ptr(), data as *const u8, guest.len(), false);
                     // SAFETY: the mapped upload spans the expanded footprint.
                     let rgba = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, host_bytes as usize) };
-                    let row = footprint.width as usize * 2;
+                    let row = footprint.width as usize * crate::resource::element(format).map_or(2, |e| e.0 as usize);
                     for (src, dst) in guest.chunks(src.footprint.row_pitch as usize).zip(rgba.chunks_mut(footprint.row_pitch as usize)) {
                         crate::texture::expand_row(format, &src[..row], dst);
                     }
@@ -999,18 +999,20 @@ unsafe fn replaces_whole(to: &windows::Win32::Graphics::Direct3D12::ID3D12Resour
         && block(format) == block(d.Format.0 as u32)
 }
 
-/// Doubling a packed pitch preserves its alignment and doubles every texel offset.
+/// Scaling a packed pitch to the stand-in's 4 bytes a texel (x2 for 16-bit,
+/// x1 for R9G9B9E5) preserves its alignment and scales every texel offset.
 #[cfg(windows)]
 fn host_footprint(mut f: crate::resource::PlacedFootprint, packed: Option<u32>) -> Option<crate::resource::PlacedFootprint> {
     f.offset = 0;
-    if packed.is_some() {
-        if crate::resource::element(f.format) != Some((2, 1)) || f.width == 0 || f.height == 0 || f.depth == 0
-            || f.width.checked_mul(2)? > f.row_pitch || !f.row_pitch.is_multiple_of(256)
+    if let Some(packed) = packed {
+        let bytes = crate::resource::element(packed)?.0 as u32;
+        if crate::resource::element(f.format) != crate::resource::element(packed) || f.width == 0 || f.height == 0 || f.depth == 0
+            || f.width.checked_mul(bytes)? > f.row_pitch || !f.row_pitch.is_multiple_of(256)
         {
             return None;
         }
-        f.format = 28;
-        f.row_pitch = f.row_pitch.checked_mul(2)?;
+        f.format = crate::resource::target_format(packed);
+        f.row_pitch = f.row_pitch.checked_mul(4 / bytes)?;
     }
     Some(f)
 }
@@ -1125,14 +1127,16 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
         )
     };
     let (data, title) = (data as usize, title as usize);
+    // Host bytes per title byte: 2 for 16-bit packed texels, 1 for R9G9B9E5.
+    let scale = packed.and_then(crate::resource::element).map_or(1, |e| 4 / e.0 as usize);
     list.defer_after(move || {
         let mut row = Vec::new();
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
             let _writing = crate::watch::writing_ours(title + at, n);
             let src = if let Some(format) = packed {
-                // SAFETY: the same region in the expanded footprint has twice the offset and length.
-                let rgba = unsafe { std::slice::from_raw_parts((data + at * 2) as *const u8, n * 2) };
+                // SAFETY: the same region in the expanded footprint has `scale` times the offset and length.
+                let rgba = unsafe { std::slice::from_raw_parts((data + at * scale) as *const u8, n * scale) };
                 row.resize(n, 0);
                 crate::texture::pack_row(format, rgba, &mut row);
                 row.as_ptr()
@@ -2402,6 +2406,20 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// A shared-exponent footprint keeps its pitch in the R11G11B10 stand-in
+    /// (4 bytes a texel both); another element size is refused.
+    #[cfg(windows)]
+    #[test]
+    fn a_shared_exponent_footprint_keeps_its_pitch_in_the_stand_in() {
+        if crate::resource::target_format(67) == 67 {
+            return; // a host that renders to R9G9B9E5
+        }
+        let f = crate::resource::PlacedFootprint { offset: 512, format: 67, width: 64, height: 4, depth: 1, row_pitch: 256 };
+        let h = host_footprint(f, Some(67)).unwrap();
+        assert_eq!((h.offset, h.format, h.width, h.row_pitch), (0, 26, 64, 256));
+        assert_eq!(host_footprint(crate::resource::PlacedFootprint { format: 86, ..f }, Some(67)), None);
     }
 
     #[cfg(windows)]

@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use crate::texture::small_float;
+
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -597,18 +599,6 @@ fn half(h: u16) -> f32 {
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
     if sign == 1 { -v } else { v }
-}
-
-/// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
-/// (the 11- and 10-bit floats of R11G11B10).
-fn small_float(bits: u32, man: u32) -> f32 {
-    let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
-    match exp {
-        0 => m / (1 << man) as f32 * 2f32.powi(-14),
-        31 if m != 0.0 => f32::NAN,
-        31 => f32::INFINITY,
-        e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
-    }
 }
 
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
