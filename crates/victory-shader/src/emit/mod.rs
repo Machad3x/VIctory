@@ -541,6 +541,129 @@ pub fn emit_with(
     emit_variant::<false>(c, native, p, st, io, res, options)
 }
 
+/// What [`divergent_barrier`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergentBarrier {
+    /// Threads per group.
+    pub threads: u32,
+    /// The console wave size.
+    pub wave: u32,
+    /// Whether the console control flow would lower the program, or why not.
+    pub console: Result<(), String>,
+}
+
+/// A measurement, changing no translation: whether a compute program keeps a
+/// group barrier in per-lane control flow that its lanes may reach from
+/// different places (undefined on the host). `None` too for what does not
+/// get as far as lowering, and for programs that already take the console flow.
+pub fn divergent_barrier(container: &[u8], options: Options) -> Option<DivergentBarrier> {
+    let c = Container::parse(container).ok()?;
+    let dxil = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC))?;
+    let native = crate::native_programs(dxil.data)
+        .ok()?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Cs)?;
+    divergent_barrier_in(&native, options)
+}
+
+fn divergent_barrier_in(native: &NativeProgram, options: Options) -> Option<DivergentBarrier> {
+    let crate::native::StageIo::Cs(cs) = &native.io else {
+        return None;
+    };
+    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs).ok()?;
+    let st = st.ok()?;
+    if !barrier_diverges(&p, &st) {
+        return None;
+    }
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+    let io = io::raise(&p, native).ok()?;
+    let lower = |st: &structure::Structured, console_cf| {
+        lower::lower_variant::<false>(&lower::Parts {
+            native,
+            p: &p,
+            st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            target: options.target,
+            console_cf,
+            per_lane_only: false,
+            view_marks: options.view_marks,
+        })
+    };
+    let wants_console = matches!(
+        lower(&st, false),
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW
+    );
+    // A dry run on programs that never take this path must not end the title.
+    let console = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let console = structure::structure_console(&p)?;
+        lower(&console, true).map(drop)
+    }))
+    .map_or_else(|_| Err("panicked".to_owned()), |r| r.map_err(|e| e.to_string()));
+    if wants_console && console.is_ok() {
+        return None;
+    }
+    Some(DivergentBarrier {
+        threads: cs.threads.iter().product(),
+        wave: if native.wave64 { 64 } else { 32 },
+        console,
+    })
+}
+
+/// Whether some non-uniform branch sends lanes both to a barrier's block and,
+/// on another path, to the program's end without it.
+// shortcut: a branch inside a loop that rejoins before a uniform loop exit
+// behind the barrier is reported too; needs post-dominance per iteration if
+// such reports show up.
+fn barrier_diverges(p: &ir::Program, st: &structure::Structured) -> bool {
+    use structure::{Atom, LaneExit};
+    // Whether a path from `from` reaches a block `goal` accepts, never
+    // entering `avoid`.
+    let reaches = |from: usize, avoid: Option<usize>, goal: &dyn Fn(usize) -> bool| {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut todo = vec![from];
+        while let Some(b) = todo.pop() {
+            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            if goal(b) {
+                return true;
+            }
+            todo.extend(p.blocks[b].exit.successors());
+        }
+        false
+    };
+    let ends = |b: usize| p.blocks[b].exit.successors().into_iter().next().is_none();
+    let barriers: Vec<usize> = (0..p.blocks.len())
+        .filter(|&b| p.blocks[b].insts.iter().any(|i| i.name() == "s_barrier"))
+        .collect();
+    st.exits.iter().any(|e| {
+        let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = *e
+        else {
+            return false;
+        };
+        let divergent = st
+            .bools
+            .support(when)
+            .iter()
+            .any(|a| !matches!(a, Atom::Uniform(_)));
+        divergent
+            && barriers.iter().any(|&barrier| {
+                let next = [taken, not_taken];
+                next.iter().any(|&s| reaches(s, None, &|b| b == barrier))
+                    && next.iter().any(|&s| reaches(s, Some(barrier), &ends))
+            })
+    })
+}
+
 fn emit_variant<const PARTIAL: bool>(
     c: &Container,
     native: &NativeProgram,

@@ -189,6 +189,26 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
+                // Once per hash: the shader is shared by content.
+                #[cfg(feature = "diagnostics")]
+                if self.stage == "compute" && done.is_ok() {
+                    let options = victory_shader::emit::Options {
+                        view_marks: true,
+                        target: crate::shader_cache::host_target(),
+                    };
+                    if let Some(b) =
+                        victory_shader::emit::divergent_barrier(&self.container, options)
+                    {
+                        let console = b.console.map_or_else(|e| e, |()| "ok".to_owned());
+                        tracing::warn!(
+                            hash = %self.hash,
+                            threads = b.threads,
+                            wave = b.wave,
+                            console = %console,
+                            "group barrier in divergent per-lane control flow"
+                        );
+                    }
+                }
                 done.ok()
             })
             .as_ref()

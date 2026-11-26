@@ -1466,3 +1466,24 @@ fn sgpr_spills_across_a_divergent_branch_stay_per_lane() {
         .collect();
     assert_eq!(out, want);
 }
+
+#[test]
+fn a_barrier_lanes_may_skip_is_reported() {
+    let found = |words: &[u32]| {
+        super::divergent_barrier_in(
+            &super::tests::compute_of(words, false, 32),
+            super::Options::default(),
+        )
+    };
+    let skipped = found(&[
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0xBE8A_3C6A, // s_and_saveexec_b32 s10, vcc_lo
+        0xBF88_0001, // s_cbranch_execz +1
+        0xBF8A_0000, // s_barrier
+        0xBEFE_030A, // s_mov_b32 exec_lo, s10
+        S_ENDPGM,
+    ])
+    .expect("reported");
+    assert_eq!((skipped.threads, skipped.wave), (32, 32));
+    assert_eq!(found(&[0xBF8A_0000, S_ENDPGM]), None);
+}
