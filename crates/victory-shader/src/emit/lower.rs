@@ -271,6 +271,68 @@ fn half_shift(width: u32) -> u32 {
 /// parameter and byte offset.
 type EntryAddress = (usize, u32);
 
+/// A lane mask's bit in a lane the console never launched (a partial final
+/// group's, kept for its barriers), next to the host's, which has the lane
+/// in EXEC on entry ([`Lower::launched`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unlaunched {
+    /// The host's: nothing it derives from differs (constants, user data,
+    /// compares of data).
+    Same,
+    /// Both have this bit (a mask of no lanes or of every lane).
+    Both(bool),
+    /// The console has this bit, whatever the host's (EXEC on entry: 0).
+    Console(bool),
+}
+
+impl Unlaunched {
+    fn not(self) -> Self {
+        match self {
+            Self::Same => Self::Same,
+            Self::Both(b) => Self::Both(!b),
+            Self::Console(b) => Self::Console(!b),
+        }
+    }
+
+    fn bit(self) -> Option<bool> {
+        match self {
+            Self::Both(b) | Self::Console(b) => Some(b),
+            Self::Same => None,
+        }
+    }
+
+    /// `s_<f>_b64 d, a, c` (`Structured`'s lane-mask meaning of `f`).
+    fn combine(f: &str, a: Self, c: Self) -> Option<Self> {
+        let (base, a, c, invert) = match f {
+            "and" | "or" | "xor" => (f, a, c, false),
+            "andn2" => ("and", a, c.not(), false),
+            "orn2" => ("or", a, c.not(), false),
+            "andn1" => ("and", a.not(), c, false),
+            "orn1" => ("or", a.not(), c, false),
+            "nand" => ("and", a, c, true),
+            "nor" => ("or", a, c, true),
+            "xnor" => ("xor", a, c, true),
+            _ => return None,
+        };
+        let g = |x: bool, y: bool| match base {
+            "and" => x & y,
+            "or" => x | y,
+            _ => x ^ y,
+        };
+        let r = match (a, c) {
+            (Self::Both(x), Self::Both(y)) => Self::Both(g(x, y)),
+            (Self::Same | Self::Both(_), Self::Same | Self::Both(_)) => Self::Same,
+            _ => match (a.bit(), c.bit()) {
+                (Some(x), Some(y)) => Self::Console(g(x, y)),
+                (Some(false), _) | (_, Some(false)) if base == "and" => Self::Console(false),
+                (Some(true), _) | (_, Some(true)) if base == "or" => Self::Console(true),
+                _ => return None,
+            },
+        };
+        Some(if invert { r.not() } else { r })
+    }
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -3386,9 +3448,151 @@ impl<'a> Lower<'a> {
     /// final group keeps for its barriers, when the mask holds only EXEC's
     /// lanes (`Structured::active`): the console never launched them.
     fn launched(&mut self, at: usize, on: V, mask: Value) -> V {
-        match self.partial_active {
-            Some(a) if self.x.st.active.contains(&mask) => self.s.m.bin(at, Bin::And, on, a),
+        let Some(a) = self.partial_active else {
+            return on;
+        };
+        if !self.x.st.active.contains(&mask) {
+            return on;
+        }
+        let (mut known, mut busy) = (HashMap::new(), HashSet::new());
+        match self.unlaunched(mask, &mut known, &mut busy) {
+            // Taken from EXEC: 0 there.
+            Some(Unlaunched::Console(false)) => self.s.m.bin(at, Bin::And, on, a),
+            // Its complement (`s_not_b64 s, exec`): 1 there.
+            Some(Unlaunched::Console(true)) => {
+                let t = self.s.m.bool(true);
+                let out = self.s.m.bin(at, Bin::Xor, a, t);
+                self.s.m.bin(at, Bin::Or, on, out)
+            }
+            // Set apart from EXEC on entry (`s_mov_b64 exec, -1`): the
+            // host's bit is the console's. Not known: left as it is.
             _ => on,
+        }
+    }
+
+    /// A lane mask's bit, in a lane the console never launched, next to
+    /// the host's (whose EXEC on entry has the lane); `None` where that is
+    /// not known. A join in `busy` (a loop's) takes its other edges' bit.
+    fn unlaunched(
+        &self,
+        v: Value,
+        known: &mut HashMap<Value, Option<Unlaunched>>,
+        busy: &mut HashSet<Value>,
+    ) -> Option<Unlaunched> {
+        if let Some(&u) = known.get(&v) {
+            return u;
+        }
+        if !busy.insert(v) {
+            return None;
+        }
+        let u = self.unlaunched_def(v, known, busy);
+        busy.remove(&v);
+        known.insert(v, u);
+        u
+    }
+
+    fn unlaunched_def(
+        &self,
+        v: Value,
+        known: &mut HashMap<Value, Option<Unlaunched>>,
+        busy: &mut HashSet<Value>,
+    ) -> Option<Unlaunched> {
+        use Unlaunched::{Both, Console, Same};
+        let p = self.x.p;
+        if let Some(&r) = self.x.st.restored.get(&v) {
+            return self.unlaunched(r, known, busy);
+        }
+        let Some(&b) = self.def_block.get(&v) else {
+            // EXEC on entry has none of those lanes; user and system values
+            // are the same.
+            let &(reg, _) = p.inputs.iter().find(|i| i.1 == v)?;
+            return Some(if reg == Reg::S(EXEC) {
+                Console(false)
+            } else {
+                Same
+            });
+        };
+        if let Some(phi) = p.blocks[b].phis.iter().find(|q| q.value == v) {
+            let mut all = None;
+            for &arg in &phi.args {
+                if busy.contains(&arg) {
+                    continue;
+                }
+                let u = self.unlaunched(arg, known, busy)?;
+                if all.is_some_and(|a| a != u) {
+                    return None;
+                }
+                all = Some(u);
+            }
+            return all;
+        }
+        let inst = p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))?;
+        let name = inst.name();
+        let exec = inst.read(Reg::S(EXEC));
+        match &inst.fields {
+            // A compare's or carry's mask has EXEC's lanes only.
+            Fields::Valu(x) if name.starts_with("v_cmp") || x.carry.is_some() => {
+                let e = self.unlaunched(exec?, known, busy)?;
+                Unlaunched::combine("and", Same, e)
+            }
+            Fields::Sop { src, .. } => {
+                let wave64 = p.wave64;
+                let width = if wave64 { "_b64" } else { "_b32" };
+                let op = name.strip_prefix("s_")?.strip_suffix(width)?;
+                let constant = |x: u64| {
+                    let x = if wave64 { x } else { x & 0xFFFF_FFFF };
+                    match x {
+                        0 => Both(false),
+                        _ if x == u64::MAX >> (32 * u8::from(!wave64)) => Both(true),
+                        _ => Same,
+                    }
+                };
+                let mut arg = |n: usize| -> Option<Unlaunched> {
+                    match *src.get(n)? {
+                        Operand::Scalar { code, .. } if code != NULL => {
+                            self.unlaunched(inst.read(Reg::S(code))?, known, busy)
+                        }
+                        Operand::Const(c @ 128..=208) => Some(constant(if c <= 192 {
+                            u64::from(c) - 128
+                        } else {
+                            (192 - i64::from(c)) as u64
+                        })),
+                        Operand::Literal(x) => Some(constant(u64::from(x))),
+                        _ => None,
+                    }
+                };
+                let save = match (op.strip_suffix("_saveexec"), op.strip_suffix("_wrexec")) {
+                    (Some(f), _) => Some((true, f)),
+                    (_, Some(f)) => Some((false, f)),
+                    _ => None,
+                };
+                if let Some((saveexec, f)) = save {
+                    // `_saveexec`'s scalar destination gets the old EXEC.
+                    let new = !saveexec || inst.write(Reg::S(EXEC)) == Some(v);
+                    let s = if new { Some(arg(0)?) } else { None };
+                    let old = self.unlaunched(exec?, known, busy)?;
+                    return match s {
+                        Some(s) => Unlaunched::combine(f, s, old),
+                        None => Some(old),
+                    };
+                }
+                match op {
+                    "mov" => arg(0),
+                    "not" => Some(arg(0)?.not()),
+                    "cselect" => {
+                        let (a, c) = (arg(0)?, arg(1)?);
+                        (a == c).then_some(a)
+                    }
+                    _ => {
+                        let (a, c) = (arg(0)?, arg(1)?);
+                        Unlaunched::combine(op, a, c)
+                    }
+                }
+            }
+            _ => None,
         }
     }
 
