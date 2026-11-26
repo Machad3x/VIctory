@@ -1902,6 +1902,7 @@ pub(crate) fn freed(start: u64, len: u64) -> Freeing {
 static FREEING: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// One range in [`FREEING`], until dropped.
+#[must_use = "held until the memory is released"]
 pub(crate) struct Freeing((u64, u64));
 
 impl Drop for Freeing {
@@ -3977,7 +3978,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy.write_host(p as u64 + 24, &[0x99]);
         // The title gives the range back before the copy-back has run...
         unregister(p, p as u64);
-        freed(p as u64, PAGE as u64);
+        drop(freed(p as u64, PAGE as u64));
         // SAFETY: our own allocation, freed once.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // ...and takes the addresses again for something of its own.
@@ -4014,7 +4015,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy.writing(p, 64, true);
         copy.write_host(p as u64 + 24, &[0x99]);
         unregister(p, p as u64);
-        freed(p as u64, PAGE as u64);
+        drop(freed(p as u64, PAGE as u64));
         assert_eq!(copy.copy_back_run(&[p]), 0);
         // SAFETY: a byte of our pool.
         assert_eq!(unsafe { ((p + 24) as *const u8).read_volatile() }, 0);
@@ -4029,7 +4030,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             return; // no host GPU here
         };
         assert!(std::sync::Arc::ptr_eq(&view, &exact(p + 256, 256, 4).unwrap()));
-        freed(p, PAGE as u64);
+        drop(freed(p, PAGE as u64));
         assert!(view.gone.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!std::sync::Arc::ptr_eq(&view, &exact(p + 256, 256, 4).unwrap()));
     }
@@ -4289,7 +4290,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let copy = loose(at, at + 4).unwrap();
         assert!(copy.demanded());
         unregister(p, p as u64);
-        freed(at + PAGE as u64, PAGE as u64);
+        drop(freed(at + PAGE as u64, PAGE as u64));
         assert!(copy.gone.load(Ordering::Relaxed));
         assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(at, WINDOW)));
         let freeing = freed(at, PAGE as u64);

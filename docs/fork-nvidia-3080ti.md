@@ -807,6 +807,24 @@ From logs and code; no fix yet and no proven cause of the dark interiors.
 `VICTORY_DEMAND_COPIES=1` is an experiment against these misses: copies for
 the pages missed 8 frames running. Off by default, not yet run in the game.
 
+## Rectangles, 16-bit and typed loads, root UAV pages
+
+Not yet run in the game.
+
+| Change | What was wrong |
+|---|---|
+| The range a root UAV can write is declared in whole 64 KiB pages (first part of [#1963](https://github.com/Marvisak/VIctory/pull/1963)) | A marked page partly in the range was left out of the page copy-back, losing what shaders wrote in its other part. A page the table reads from another copy is still not covered |
+| Both triangles of a rectangle start with v0, on the geometry shader and CPU paths ([#2970](https://github.com/Marvisak/VIctory/pull/2970)) | The second triangle took flat attributes from another vertex |
+| `buffer_load_format_d16_x` and `_xyz` keep the high half of their last register ([#1441](https://github.com/Marvisak/VIctory/pull/1441)) | It was zeroed. Evidence: Mesa and LLVM treat it as preserved; AMD's ISA text does not say |
+| Typed buffer loads read 0 in every missing channel ([#1516](https://github.com/Marvisak/VIctory/pull/1516), issue [#1060](https://github.com/Marvisak/VIctory/issues/1060)) | W read 1. Evidence: the ISA's identity channel selection and a measurement on RDNA2 desktop hardware |
+
+Rejected: [#2297](https://github.com/Marvisak/VIctory/pull/2297) (textures
+upload once, before all lists, so forgetting the uploaded set changes
+nothing here).
+
+`lower.rs` had passed the asset policy's 512 KiB limit; the lane spill
+helpers moved to `lower/spill.rs`.
+
 ## Tried and left out
 
 | Change | Result here |
