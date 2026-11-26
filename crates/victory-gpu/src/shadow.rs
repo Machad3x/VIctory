@@ -140,7 +140,7 @@ fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, us
             for at in (block..block_end).step_by(64) {
                 let end = (at + 64).min(block_end);
                 let mut mask = unequal(&host[at..end], &title[at..end]);
-                if let Some(before) = before {
+                if let Some(before) = before.filter(|_| mask != 0) {
                     mask &= unequal(&host[at..end], &before[at..end]);
                 }
                 // Each run of set bits: from its first, the ones that follow.
