@@ -2694,7 +2694,8 @@ mod tests {
             bindings: &[],
             threads: [0; 3],
             wave_size: None,
-            geometry: None,
+            gs: None,
+            validator18: false,
         });
         let bytes = crate::dxbc::build(&[
             (super::FourCC::ISG1, &isg1),
@@ -2706,7 +2707,7 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
-        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).unwrap();
         let host = super::Container::parse(&out.dxil).unwrap();
         let modes = super::psv_interps(host.part(super::FourCC::PSV0).unwrap().data, true).unwrap();
         assert_eq!(modes.get(&(true, 0, 0, 0)), Some(&1));
