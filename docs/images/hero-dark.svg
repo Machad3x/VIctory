@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-label="VIctory · NVIDIA: Xbox Series compatibility runtime for Windows, tuned for NVIDIA. Rust, DirectX 12">
+<title>VIctory · NVIDIA</title>
+<defs>
+  <pattern id="cells" x="882" y="28" width="22" height="22" patternUnits="userSpaceOnUse">
+    <rect width="16" height="16" rx="3" fill="#222e27"/>
+  </pattern>
+  <pattern id="lit" x="882" y="28" width="22" height="22" patternUnits="userSpaceOnUse">
+    <rect width="16" height="16" rx="3" fill="#84cc16"/>
+  </pattern>
+  <linearGradient id="fade" x1="882" y1="0" x2="1256" y2="0" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+    <stop offset="1" stop-color="#fff" stop-opacity="1"/>
+  </linearGradient>
+  <!-- diagonal wavefront bands sweeping across the cell grid -->
+  <linearGradient id="wave" x1="900" y1="292" x2="1060" y2="132" gradientUnits="userSpaceOnUse" spreadMethod="repeat">
+    <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+    <stop offset="0.28" stop-color="#fff" stop-opacity="0"/>
+    <stop offset="0.5" stop-color="#fff" stop-opacity="1"/>
+    <stop offset="0.72" stop-color="#fff" stop-opacity="0"/>
+    <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+  </linearGradient>
+  <mask id="m-fade" maskUnits="userSpaceOnUse" x="882" y="28" width="374" height="264">
+    <rect x="882" y="28" width="374" height="264" fill="url(#fade)"/>
+  </mask>
+  <mask id="m-wave" maskUnits="userSpaceOnUse" x="882" y="28" width="374" height="264">
+    <rect x="882" y="28" width="374" height="264" fill="url(#wave)"/>
+  </mask>
+</defs>
+<rect width="1280" height="320" rx="16" fill="#0d1210"/>
+<rect x="0.5" y="0.5" width="1279" height="319" rx="16" fill="none" stroke="#26302a"/>
+
+<!-- shader wavefront grid -->
+<g mask="url(#m-fade)">
+  <rect x="882" y="28" width="374" height="264" fill="url(#cells)"/>
+  <rect x="882" y="28" width="374" height="264" fill="url(#lit)" mask="url(#m-wave)"/>
+</g>
+
+<!-- chip mark -->
+<g transform="translate(64 74)">
+  <g stroke="#93a399" stroke-width="3" stroke-linecap="round">
+    <path d="M22 -8V0M44 -8V0M66 -8V0M22 88V96M44 88V96M66 88V96M-8 22H0M-8 44H0M-8 66H0M88 22H96M88 44H96M88 66H96"/>
+  </g>
+  <rect width="88" height="88" rx="14" fill="#141b17" stroke="#93a399" stroke-width="3"/>
+  <g fill="#2a372f">
+    <rect x="35" y="11" width="18" height="18" rx="3"/><rect x="59" y="11" width="18" height="18" rx="3"/>
+    <rect x="11" y="35" width="18" height="18" rx="3"/><rect x="59" y="35" width="18" height="18" rx="3"/>
+    <rect x="11" y="59" width="18" height="18" rx="3"/><rect x="35" y="59" width="18" height="18" rx="3"/>
+  </g>
+  <g fill="#84cc16">
+    <rect x="11" y="11" width="18" height="18" rx="3"/><rect x="35" y="35" width="18" height="18" rx="3"/><rect x="59" y="59" width="18" height="18" rx="3"/>
+  </g>
+</g>
+
+<text x="190" y="132" font-family="Segoe UI Variable Display, Segoe UI, Inter, system-ui, Helvetica, Arial, sans-serif" font-size="64" font-weight="600" fill="#e8efe9" letter-spacing="-1">VIctory <tspan fill="#93a399" font-weight="400">·</tspan> <tspan fill="#84cc16">NVIDIA</tspan></text>
+<text x="192" y="172" font-family="Segoe UI Variable Display, Segoe UI, Inter, system-ui, Helvetica, Arial, sans-serif" font-size="20" fill="#93a399">Xbox Series compatibility runtime for Windows, tuned for NVIDIA · Rust · DirectX 12</text>
+
+<!-- translation pipeline -->
+<g font-family="ui-monospace, Cascadia Mono, Consolas, Menlo, monospace" font-size="13" text-anchor="middle">
+  <g fill="none" stroke="#26302a" stroke-width="1.5">
+    <rect x="192" y="222" width="176" height="30" rx="15"/>
+    <rect x="404" y="222" width="176" height="30" rx="15"/>
+    <rect x="616" y="222" width="112" height="30" rx="15"/>
+  </g>
+  <rect x="764" y="222" width="84" height="30" rx="15" fill="#84cc16"/>
+  <g fill="none" stroke="#93a399" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M376 237H394M389 232L394 237L389 242"/>
+    <path d="M588 237H606M601 232L606 237L601 242"/>
+    <path d="M736 237H754M749 232L754 237L749 242"/>
+  </g>
+  <g fill="#93a399">
+    <text x="280" y="241.5">guest instructions</text>
+    <text x="492" y="241.5">shader translation</text>
+    <text x="672" y="241.5">DirectX 12</text>
+  </g>
+  <text x="806" y="241.5" fill="#0d1210" font-weight="600">frames</text>
+</g>
+</svg>
