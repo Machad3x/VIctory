@@ -91,6 +91,9 @@ pub(crate) struct Staging {
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
     last: Mutex<Last>,
+    /// The last detile failed after its changed pages were taken: the
+    /// tracker no longer says so, so the next refresh reads everything.
+    retry: std::sync::atomic::AtomicBool,
     /// Uploads [`record_upload`] recorded, and the subresources they
     /// copied.
     uploads: std::sync::atomic::AtomicU64,
@@ -831,7 +834,8 @@ impl Staging {
     pub(crate) fn maybe_changed(&self) -> bool {
         // After initialization a writable stand-in keeps the GPU's contents.
         (self.packed.is_none() || self.uploads.load(std::sync::atomic::Ordering::Relaxed) == 0)
-            && self.tracked.as_ref().is_none_or(|t| !t.clean())
+            && (self.retry.load(std::sync::atomic::Ordering::Relaxed)
+                || self.tracked.as_ref().is_none_or(|t| !t.clean()))
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -858,11 +862,12 @@ impl Staging {
         if let Some(t) = &self.tracked {
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() {
+            let retry = self.retry.load(std::sync::atomic::Ordering::Relaxed);
+            if !retry && t.clean() {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if ranges.is_empty() {
+            if !retry && ranges.is_empty() {
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
@@ -873,7 +878,7 @@ impl Staging {
             let touched: Vec<usize> = (0..n)
                 .filter(|&i| {
                     let (a, b) = span(i);
-                    ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    retry || ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
                 })
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
@@ -906,7 +911,7 @@ impl Staging {
                 .filter(|&i| {
                     let (a, b) = span(i);
                     let (a0, b0) = (start + a, start + b);
-                    if ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    if retry || ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
                         last.hashes[i] = None;
                         return true;
                     }
@@ -919,11 +924,7 @@ impl Staging {
                 return (bytes, None);
             }
             let buffer = self.detile(read, &fresh);
-            if buffer.is_none() {
-                for &i in &fresh {
-                    last.hashes[i as usize] = None;
-                }
-            }
+            self.retry.store(buffer.is_none(), std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
@@ -1166,6 +1167,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
         last: Mutex::default(),
+        retry: Default::default(),
         uploads: Default::default(),
         copied: Default::default(),
     });
@@ -1182,14 +1184,76 @@ mod tests {
     /// buffer are the formats crate's detile of its memory.
     #[test]
     fn a_render_target_xor_texture_is_staged() {
+        let Some(mut staging) = xor_staging() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let memory: Vec<u8> = (0..staging.layout.size as usize)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        staging.memory = memory.as_ptr();
+        let (footprint, rows) = (staging.footprints[0], staging.rows[0]);
+        let (_, upload) = staging.refresh_now();
+        let (buffer, at, list) = upload.expect("staged");
+        assert_eq!(list, [0]);
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let mut want = vec![0; pitch * rows as usize];
+        let len = want.len();
+        staging
+            .layout
+            .detile(&memory, 0, 0, &mut want, pitch, len)
+            .unwrap();
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: an upload buffer, mapped to read what was staged.
+        unsafe { buffer.Map(0, None, Some(&mut mapped)) }.unwrap();
+        let at = (footprint.Offset + at) as usize;
+        for row in 0..rows as usize {
+            // SAFETY: the staged rows of the subresource.
+            let got = unsafe {
+                std::slice::from_raw_parts(mapped.cast::<u8>().add(at + row * pitch), 256 * 4)
+            };
+            assert_eq!(got, &want[row * pitch..][..256 * 4], "row {row}");
+        }
+        // SAFETY: unmaps what was mapped above.
+        unsafe { buffer.Unmap(0, None) };
+    }
+
+    /// A detile that fails after the tracker's pages were taken is tried
+    /// again, with no further write to the memory.
+    #[test]
+    fn a_failed_detile_of_tracked_memory_is_retried() {
+        use crate::watch::{PAGE, tests as watch};
+        let Some(mut staging) = xor_staging() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let size = staging.layout.size as usize;
+        let p = watch::pool(size.div_ceil(PAGE));
+        staging.memory = p as *const u8;
+        staging.tracked = crate::watch::track(p, size, true);
+        assert!(staging.tracked.is_some());
+        // No room for the subresource: the detile fails.
+        let total = std::mem::replace(&mut staging.size, 0);
+        assert!(staging.refresh_now().1.is_none());
+        assert!(staging.tracked.as_ref().unwrap().clean());
+        assert!(staging.maybe_changed());
+        staging.size = total;
+        let (_, _, list) = staging.refresh_now().1.expect("retried");
+        assert_eq!(list, [0]);
+        assert!(!staging.maybe_changed());
+        assert!(staging.refresh_now().1.is_none());
+        drop(staging);
+        watch::free(p);
+    }
+
+    /// The staging state of a 256x256 RGBA8 `SW_64KB_R_X` texture with no
+    /// memory yet (`None` without a host device).
+    fn xor_staging() -> Option<Staging> {
         use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
         };
-        let Some(host) = host() else {
-            eprintln!("no host device; skipped");
-            return;
-        };
+        let host = host()?;
         let layout = Layout::new(&Desc {
             dimension: Dimension::Tex2d,
             width: 256,
@@ -1231,46 +1295,21 @@ mod tests {
                 Some(&mut total),
             );
         }
-        let memory: Vec<u8> = (0..layout.size as usize)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
-            .collect();
-        let staging = Staging {
+        Some(Staging {
             size: total,
             spans: spans(&layout, 1, 1),
             footprints: vec![footprint],
             rows: vec![rows],
             layout,
             mips: 1,
-            memory: memory.as_ptr(),
+            memory: std::ptr::null(),
             tracked: None,
             last: Mutex::default(),
+            retry: Default::default(),
             uploads: Default::default(),
             copied: Default::default(),
             packed: None,
-        };
-        let (_, upload) = staging.refresh_now();
-        let (buffer, at, list) = upload.expect("staged");
-        assert_eq!(list, [0]);
-        let pitch = footprint.Footprint.RowPitch as usize;
-        let mut want = vec![0; pitch * rows as usize];
-        let len = want.len();
-        staging
-            .layout
-            .detile(&memory, 0, 0, &mut want, pitch, len)
-            .unwrap();
-        let mut mapped = std::ptr::null_mut();
-        // SAFETY: an upload buffer, mapped to read what was staged.
-        unsafe { buffer.Map(0, None, Some(&mut mapped)) }.unwrap();
-        let at = (footprint.Offset + at) as usize;
-        for row in 0..rows as usize {
-            // SAFETY: the staged rows of the subresource.
-            let got = unsafe {
-                std::slice::from_raw_parts(mapped.cast::<u8>().add(at + row * pitch), 256 * 4)
-            };
-            assert_eq!(got, &want[row * pitch..][..256 * 4], "row {row}");
-        }
-        // SAFETY: unmaps what was mapped above.
-        unsafe { buffer.Unmap(0, None) };
+        })
     }
 
     #[test]
