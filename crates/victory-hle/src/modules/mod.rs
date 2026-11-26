@@ -31,6 +31,8 @@ pub mod net;
 pub mod rpcrt4;
 pub mod speech;
 pub mod storage;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub mod topology;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -74,6 +76,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    #[cfg(all(windows, feature = "diagnostics"))]
+    all.push(topology::module());
     #[cfg(windows)]
     if fidelityfx::serving() {
         all.push(fidelityfx::module());
