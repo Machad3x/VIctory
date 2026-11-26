@@ -669,6 +669,8 @@ mod tests {
             eprintln!("skipped host_results_go_back_whatever_the_shaders_read: no host GPU");
             return;
         }
+        // The miss this makes is process wide: no other test may see it.
+        let _alone = crate::memory::without_a_miss();
         let triangle = Triangle::new();
         let (queue, allocator, list) = list();
         let occlusion = heap(OCCLUSION_HEAP, 1);

@@ -8,7 +8,8 @@
 //! "Changed" means a page of the memory changed since the last detiling
 //! ([`crate::watch`], which follows writes through every mapping of the
 //! same physical pages) in the runtime's memory; elsewhere, a content hash
-//! of the whole memory at every submission that samples it.
+//! at every submission that samples it (of the subresources on untracked
+//! pages, or of the whole memory if none is tracked).
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Textures read through descriptor tables are brought up to date, and for
@@ -896,8 +897,21 @@ impl Staging {
         if let Some(t) = &self.tracked {
             t.take(self.memory as usize, self.memory as usize + self.layout.size as usize);
             t.watch_overwrite();
-            // The host texture no longer holds what was hashed.
-            last.hashes.clear();
+            // The host texture no longer holds what was hashed. Hashes on
+            // untracked pages stay: unchanged memory must not replace it.
+            // shortcut: the kept hash is the last refresh's, so a title write
+            // between it and here uploads over the host's texels; and a
+            // partly tracked texture hashes whole subresources on every
+            // sampling submission. Re-hash here, and hash only the untracked
+            // bytes, if a title has such textures (none logged so far).
+            let (start, size) = (self.memory as usize, self.layout.size as usize);
+            let untracked = t.untracked(start, start + size);
+            for (i, hash) in last.hashes.iter_mut().enumerate() {
+                let (a, b) = self.spans.get(i).copied().unwrap_or((0, size));
+                if !untracked.iter().any(|&(f, e)| f - start < b && a < e - start) {
+                    *hash = None;
+                }
+            }
         }
     }
 
@@ -940,18 +954,22 @@ impl Staging {
                 return (0, None);
             }
             let ranges = t.take(start, start + size);
-            if !retry && ranges.is_empty() {
+            let untracked = t.untracked(start, start + size);
+            if !retry && ranges.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
             // Only the subresources in the pages that changed (streamed
             // textures change page by page; a whole re-read and detile of
-            // each cost up to 430 MB a frame, run integ2).
+            // each cost up to 430 MB a frame, run integ2), and those on
+            // untracked pages, which can change unseen.
             let n = self.footprints.len();
             let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
-            let touched: Vec<usize> = (0..n)
-                .filter(|&i| {
+            let touched: Vec<(usize, bool)> = (0..n)
+                .filter_map(|i| {
                     let (a, b) = span(i);
-                    retry || ranges.iter().any(|&(f, e)| f - start < b && a < e - start)
+                    let overlaps = |&(f, e): &(usize, usize)| f - start < b && a < e - start;
+                    let unseen = untracked.iter().any(overlaps);
+                    (retry || unseen || ranges.iter().any(overlaps)).then_some((i, unseen))
                 })
                 .collect();
             // Read through the copy, which stands unmapped pages: memory of
@@ -960,7 +978,7 @@ impl Staging {
             // are written, and only they are hashed and detiled.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
-            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&i| span(i)).collect();
+            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&(i, _)| span(i)).collect();
             merge_spans(&mut spans);
             let mut bytes = 0;
             for (a, b) in spans {
@@ -975,23 +993,25 @@ impl Staging {
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
-            // (small textures): its own bytes decide. (Hashing a movie frame
-            // cost 8 ms a frame.)
+            // (small textures), and untracked pages: its own bytes decide.
+            // (Hashing a movie frame cost 8 ms a frame.)
             let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
             let mut fresh: Vec<u32> = touched
                 .into_iter()
-                .filter(|&i| {
+                .filter(|&(i, unseen)| {
                     let (a, b) = span(i);
                     let (a0, b0) = (start + a, start + b);
-                    if retry || ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)) {
+                    if !unseen
+                        && (retry || ranges.iter().any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0)))
+                    {
                         last.hashes[i] = None;
                         return true;
                     }
                     let hash = blake3::hash(&read[a..b]);
-                    last.hashes[i].replace(hash) != Some(hash)
+                    last.hashes[i].replace(hash) != Some(hash) || retry
                 })
-                .map(|i| i as u32)
+                .map(|(i, _)| i as u32)
                 .collect();
             if fresh.is_empty() {
                 return (bytes, None);
@@ -1326,6 +1346,39 @@ mod tests {
         assert!(!staging.maybe_changed());
         drop(staging);
         watch::free(p);
+    }
+
+    /// A write to the untracked page of a partly tracked texture is staged,
+    /// though the tracker reports nothing.
+    #[test]
+    fn a_write_to_an_untracked_page_is_staged() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(mut staging) = xor_staging() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let size = staging.layout.size as usize;
+        // SAFETY: a new reservation, decommitted below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!p.is_null());
+        // Plain committed memory is untracked; the reserved tail is tracked.
+        // SAFETY: committing the first page of the reservation above.
+        assert_eq!(unsafe { VirtualAlloc(p, PAGE, MEM_COMMIT, PAGE_READWRITE) }, p);
+        staging.memory = p as *const u8;
+        staging.tracked = crate::watch::track(p as usize, size, true);
+        assert!(staging.tracked.is_some());
+        assert!(staging.refresh_now().1.is_some());
+        assert!(staging.refresh_now().1.is_none());
+        // SAFETY: inside the committed page.
+        unsafe { p.cast::<u8>().write(0xff) };
+        let (_, _, list) = staging.refresh_now().1.expect("staged");
+        assert_eq!(list, [0]);
+        // A host write: unchanged memory does not replace it.
+        staging.drain();
+        assert!(staging.refresh_now().1.is_none());
+        drop(staging);
+        crate::watch::tests::free(p as usize);
     }
 
     /// A subresource that cannot be detiled does not take the others of the
