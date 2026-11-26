@@ -1513,7 +1513,9 @@ fn buffer_srv(
     };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    let Some(format) = host_buffer_format(desc.Format, buffer.StructureByteStride, raw) else {
+    let typed = |f| buffer_view_support(f, false);
+    let Some(format) = host_buffer_format(desc.Format, buffer.StructureByteStride, raw, typed)
+    else {
         once!(format = ?desc.Format, raw, "buffer view of a format the host refuses");
         return None;
     };
@@ -1552,8 +1554,15 @@ fn in_buffer(buffer: &ID3D12Resource, first: u64, count: u32, element: u64) -> b
 /// such views (made for its own runtime, or old ones in slots it does not
 /// use). A raw or structured view reads its bytes whatever the format
 /// says, so it takes the one the host wants; a raw view with a stride, or
-/// a typed view of no format or a typeless one, has none.
-fn host_buffer_format(format: DXGI_FORMAT, stride: u32, raw: bool) -> Option<DXGI_FORMAT> {
+/// a typed view of no format, a typeless one or one `typed` says the
+/// host's buffer views do not take (block-compressed, depth, sRGB...),
+/// has none.
+fn host_buffer_format(
+    format: DXGI_FORMAT,
+    stride: u32,
+    raw: bool,
+    typed: impl Fn(DXGI_FORMAT) -> bool,
+) -> Option<DXGI_FORMAT> {
     if raw {
         return (stride == 0).then_some(DXGI_FORMAT_R32_TYPELESS);
     }
@@ -1563,7 +1572,45 @@ fn host_buffer_format(format: DXGI_FORMAT, stride: u32, raw: bool) -> Option<DXG
     let f = format.0 as u32;
     let family = crate::resource::family;
     let typeless = family(f) == f && family(f + 1) == f;
-    (f != 0 && !typeless).then_some(format)
+    (f != 0 && !typeless && typed(format)).then_some(format)
+}
+
+/// Whether the host makes typed buffer views of `format`: shader views
+/// (buffer and shader-load support), or unordered views (buffer and typed
+/// unordered-access support). Asked once a format and kind.
+fn buffer_view_support(format: DXGI_FORMAT, unordered: bool) -> bool {
+    static KNOWN: Mutex<Vec<(i32, bool, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(.., ok)) = known
+        .iter()
+        .find(|&&(f, u, _)| f == format.0 && u == unordered)
+    {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: format,
+        ..Default::default()
+    };
+    let wanted = D3D12_FORMAT_SUPPORT1_BUFFER.0
+        | if unordered {
+            D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0
+        } else {
+            D3D12_FORMAT_SUPPORT1_SHADER_LOAD.0
+        };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & wanted == wanted
+    });
+    known.push((format.0, unordered, ok));
+    ok
 }
 
 fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
@@ -1625,7 +1672,9 @@ fn buffer_uav(
     };
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-    let Some(format) = host_buffer_format(desc.Format, buffer.StructureByteStride, raw) else {
+    let typed = |f| buffer_view_support(f, true);
+    let Some(format) = host_buffer_format(desc.Format, buffer.StructureByteStride, raw, typed)
+    else {
         once!(format = ?desc.Format, raw, "unordered buffer view of a format the host refuses");
         return None;
     };
@@ -2276,6 +2325,28 @@ mod tests {
         assert_eq!(raw_window(0, u32::MAX, 8), None);
     }
 
+    /// Typed buffer views take only formats the host's buffer views do:
+    /// not block-compressed or depth ones (the device's format support
+    /// says so), as unsigned integers and plain colours do.
+    #[test]
+    fn typed_buffer_views_take_only_formats_the_device_buffers_take() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        for unordered in [false, true] {
+            let typed = |f| host_buffer_format(f, 0, false, |f| buffer_view_support(f, unordered));
+            assert_eq!(typed(DXGI_FORMAT_R32_UINT), Some(DXGI_FORMAT_R32_UINT));
+            for refused in [DXGI_FORMAT_BC1_UNORM, DXGI_FORMAT_D32_FLOAT] {
+                assert_eq!(typed(refused), None, "{refused:?}, unordered {unordered}");
+            }
+        }
+        let shader = |f| host_buffer_format(f, 0, false, |f| buffer_view_support(f, false));
+        assert_eq!(
+            shader(DXGI_FORMAT_R8G8B8A8_UNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+    }
+
     /// Buffer views in formats the D3D12 debug layer refuses (checked on
     /// WARP: raw of another format than R32_TYPELESS, structured with a
     /// format, typed of a typeless format) take the format the host wants
@@ -2283,7 +2354,7 @@ mod tests {
     /// do; typed views keep theirs.
     #[test]
     fn buffer_views_take_a_format_the_host_takes() {
-        let host = host_buffer_format;
+        let host = |format, stride, raw| host_buffer_format(format, stride, raw, |_| true);
         let (typeless, unknown) = (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN);
         assert_eq!(host(typeless, 0, true), Some(typeless));
         assert_eq!(host(DXGI_FORMAT_R32_UINT, 0, true), Some(typeless));
