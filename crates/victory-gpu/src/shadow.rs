@@ -240,14 +240,6 @@ fn take_and_read(t: &crate::watch::Tracked, page: usize, from: usize, host: &mut
     crate::host::read_into(from as *const u8, host);
 }
 
-/// A copy-back's read of title memory at `from`: false if it cannot be read.
-fn read_title(from: usize, title: &mut [u8]) -> bool {
-    let read = crate::host::read_into(from as *const u8, title);
-    #[cfg(test)]
-    tests::after_read();
-    read
-}
-
 thread_local! {
     /// Title memory as a copy-back reads it, a page at most: a fresh zeroed
     /// buffer cost a page's memset per page, thousands per world frame.
@@ -461,27 +453,14 @@ impl Shadow {
         if self.gone.load(Ordering::Relaxed) {
             return None;
         }
-        let title = &mut title[..to - from];
-        let read = read_title(from, title);
-        self.compare_read(page, from, to, saved, title, read)
-    }
-
-    /// [`Shadow::compare`] with title memory's bytes already in `title`
-    /// (`read`: whether they could be read).
-    #[allow(clippy::mut_from_ref)] // the mapping, not `self`
-    fn compare_read(
-        &self,
-        page: usize,
-        from: usize,
-        to: usize,
-        saved: Option<Box<[u8]>>,
-        title: &[u8],
-        read: bool,
-    ) -> Back<'_> {
+        let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe {
-            std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), to - from)
-        };
+        let host =
+            unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
+        let title = &mut title[..n];
+        let read = crate::host::read_into(from as *const u8, title);
+        #[cfg(test)]
+        tests::after_read();
         // Our own write below must not save the page for this copy again.
         let saved = match &self.tracked {
             Some(t) => {
@@ -831,9 +810,9 @@ impl Shadow {
             return 0;
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        // The pages to compare, each armed: (page, from, to, saved).
-        let mut armed = Vec::with_capacity(pages.len());
-        for &page in pages {
+        // Each page compared with title memory, still guarded.
+        let mut compared: Vec<Compared> = Vec::with_capacity(pages.len());
+        for (&page, title) in pages.iter().zip(title.chunks_mut(PAGE)) {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
                 continue;
@@ -848,36 +827,7 @@ impl Shadow {
             }
             // A title write while the page is read saves its bytes from before.
             t.arm(from, to);
-            armed.push((page, from, to, saved));
-        }
-        let gone = self.gone.load(Ordering::Relaxed);
-        // Title memory read once for each stretch of adjacent pages (a call
-        // per page cost more), into `title` packed in page order.
-        let mut read = Vec::with_capacity(armed.len());
-        if !gone {
-            let mut at = 0;
-            for stretch in armed.chunk_by(|a, b| a.2 == b.1) {
-                let (from, to) = (stretch[0].1, stretch[stretch.len() - 1].2);
-                let all = read_title(from, &mut title[at..at + to - from]);
-                for &(_, from, to, _) in stretch {
-                    // Page by page after a failure: one unreadable page must
-                    // not drop the others.
-                    read.push(all || read_title(from, &mut title[at..at + to - from]));
-                    at += to - from;
-                }
-            }
-        }
-        // Each page compared with title memory, still guarded.
-        let mut compared: Vec<Compared> = Vec::with_capacity(armed.len());
-        let mut at = 0;
-        for (i, (page, from, to, saved)) in armed.into_iter().enumerate() {
-            let title = &title[at..at + to - from];
-            at += to - from;
-            let back = if gone {
-                None
-            } else {
-                self.compare_read(page, from, to, saved, title, read[i])
-            };
+            let back = self.compare(page, from, to, saved, title);
             compared.push(Compared { page, from, to, back });
         }
         let mut written = 0;
@@ -3782,35 +3732,6 @@ void main(uint3 id : SV_DispatchThreadID) {
             let title = if page == TITLE_PAGE { 0xaa } else { 0 };
             assert_eq!((at(10), at(20)), (shader, title), "page {page}");
         }
-        copy.copy_back(p, len);
-        unregister(p, p as u64);
-    }
-
-    /// A run read in one go, with a title write just after the read: every
-    /// page takes the shader's byte, and the title's byte stays.
-    #[test]
-    fn a_marked_run_read_at_once_keeps_a_title_write() {
-        const PAGES: usize = 4;
-        let p = crate::watch::tests::pool(PAGES);
-        let len = PAGES * PAGE;
-        register(p, p as u64, len as u64);
-        let Some(copy) = find(p as u64, len as u64) else {
-            unregister(p, p as u64);
-            return; // no host GPU here
-        };
-        copy.update(p, len);
-        copy.writing(p, len, true);
-        let marked: Vec<usize> = (0..PAGES).map(|page| p + page * PAGE).collect();
-        for &page in &marked {
-            copy.write_host((page + 10) as u64, &[5]);
-        }
-        AFTER_READ.with(|w| *w.borrow_mut() = vec![(p + 2 * PAGE + 40, 0x77)]);
-        assert_eq!(copy.copy_back_run(&marked), len);
-        // SAFETY: bytes of our pool.
-        let read = |at: usize| unsafe { (at as *const u8).read_volatile() };
-        assert!(marked.iter().all(|&page| read(page + 10) == 5));
-        assert_eq!(read(p + 2 * PAGE + 40), 0x77, "the title's byte");
-        assert_eq!(copy.read_host((p + 2 * PAGE + 40) as u64, 1)[0] & 0xff, 0x77, "in the copy too");
         copy.copy_back(p, len);
         unregister(p, p as u64);
     }
