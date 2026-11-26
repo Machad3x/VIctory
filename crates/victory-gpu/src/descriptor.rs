@@ -180,22 +180,24 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
+        // Slots past the host heap (NVIDIA cap) have no host slot: `mirror`
+        // passes them by, so their pages are not read at all.
+        // TODO: count draws reading title slots past `host.count()` (now only
+        // the `mirror` warning) to size a remap into the host heap.
+        let count = u64::from(heap.desc.count.min(host.count()));
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let (page, end) = (page.max(from), (page + page_size).min(to));
-                if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
+                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step).min(count));
+                if first >= last || !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }
-                let (first, last) = ((page as u64 - start) / step, (end as u64 - start).div_ceil(step));
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(
-                    crate::copystat::C::SyncSlots,
-                    last.min(u64::from(heap.desc.count)).saturating_sub(first),
-                );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                crate::copystat::add(crate::copystat::C::SyncSlots, last - first);
+                host.sync_slots(first as u32, last as u32, start, step);
             }
         }
     }

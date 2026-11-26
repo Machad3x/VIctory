@@ -727,6 +727,11 @@ impl HostHeap {
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        // Slots past the host heap have no host slot: `mirror` passes them by.
+        let last = last.min(self.count);
+        if first >= last {
+            return;
+        }
         let at = |i: u32| start + u64::from(i) * step;
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
@@ -2906,6 +2911,43 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
+    /// A sync of slots past the host heap (NVIDIA cap) reads no record
+    /// there: records end at a page with nothing mapped behind it, and the
+    /// slots below are still made.
+    #[test]
+    fn heap_syncs_stop_at_the_host_heap() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title = crate::descriptor::heap(heap).start;
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], title);
+        let Some(host) = HostHeap::new(false, 2) else {
+            return;
+        };
+        assert_eq!(host.count(), 2);
+        const PAGE: usize = 4096;
+        // SAFETY: a reserved range whose first page alone is committed.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: as above.
+        let committed = unsafe { VirtualAlloc(base as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!committed.is_null());
+        // Two records end the committed page; slots 2 and up lie past it.
+        let start = (base + PAGE - 2 * 32) as u64;
+        // SAFETY: slot 0 of the title heap and the committed page, 32 bytes each.
+        unsafe { std::ptr::copy_nonoverlapping(title as *const u8, start as *mut u8, 32) };
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && !host.made(1));
+        // SAFETY: the range reserved above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
