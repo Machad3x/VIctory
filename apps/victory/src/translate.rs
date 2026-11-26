@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
+use victory_shader::gfx10::Fields;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -71,6 +72,8 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// With `VICTORY_MODE_SCAN`: float mode settings and their counts.
+    modes: BTreeMap<String, usize>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -132,6 +135,9 @@ impl Tally {
         self.ms_pipelines += other.ms_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
+        }
+        for (k, n) in other.modes {
+            *self.modes.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
@@ -320,6 +326,9 @@ pub fn run(
             };
             println!("pair {v} + {p}: {made}");
         }
+    }
+    for (mode, n) in &t.modes {
+        println!("mode {n:>7}  {mode}");
     }
     let mut lines = t.lines;
     lines.sort();
@@ -526,12 +535,24 @@ fn translate(
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    let scan = std::env::var_os("VICTORY_MODE_SCAN").is_some();
     for p in programs {
         t.programs += 1;
+        if scan {
+            // An FSPX part holds exactly this one program.
+            let mode = victory_shader::native::fspx_float_mode(dxil)
+                .map_or("unknown".into(), |m| format!("{m:#04x}"));
+            *t.modes
+                .entry(format!("{:?} initial FLOAT_MODE {mode}", p.stage))
+                .or_default() += 1;
+        }
         match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
             Ok((program, structured)) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+                if scan {
+                    tally_modes(&program, t);
+                }
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
                 let lanes = structured.as_ref().ok();
@@ -728,6 +749,28 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
         ],
     };
     [a, b, c, d].into_iter().nth(k).expect("0 to 3")
+}
+
+fn tally_modes(program: &ir::Program, t: &mut Tally) {
+    for inst in program.blocks.iter().flat_map(|b| &b.insts) {
+        let name = inst.name();
+        let key = match &inst.fields {
+            Fields::Sopp { imm } if matches!(name, "s_denorm_mode" | "s_round_mode") => {
+                format!("{name} {imm:#x}")
+            }
+            // Hardware register 1 is MODE.
+            Fields::Sop {
+                src, imm: Some(h), ..
+            } if name.starts_with("s_setreg") && h & 0x3F == 1 => format!(
+                "{name} MODE offset {} size {} source {:?}",
+                h >> 6 & 0x1F,
+                (h >> 11) + 1,
+                src.first()
+            ),
+            _ => continue,
+        };
+        *t.modes.entry(key).or_default() += 1;
+    }
 }
 
 fn tally_io(r: &io::Io, t: &mut Tally) {

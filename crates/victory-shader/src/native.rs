@@ -479,17 +479,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if count > MAX_XDAT_ENTRIES {
         return Err(Malformed("implausible FSPX entry count"));
     }
-    let entry = |kind: u32| -> Result<&[u8], ShaderError> {
-        for i in 0..count {
-            let at = FSPX_HEADER + 16 * i;
-            if u32_at(part, at)? == kind {
-                let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
-                return bytes(part, offset.into(), size.into())
-                    .ok_or(Malformed("FSPX entry out of bounds"));
-            }
-        }
-        Err(Malformed("FSPX entry missing"))
-    };
+    let entry = |kind| fspx_entry(part, count, kind);
     let packet = entry(FSPX_PACKET)?;
     let code = entry(FSPX_CODE)?;
     let meta = entry(FSPX_METADATA)?;
@@ -563,6 +553,30 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }),
         code: code.to_vec(),
     })
+}
+
+fn fspx_entry(part: &[u8], count: usize, kind: u32) -> Result<&[u8], ShaderError> {
+    for i in 0..count {
+        let at = FSPX_HEADER + 16 * i;
+        if u32_at(part, at)? == kind {
+            let (offset, size) = (u32_at(part, at + 4)?, u32_at(part, at + 8)?);
+            return bytes(part, offset.into(), size.into())
+                .ok_or(Malformed("FSPX entry out of bounds"));
+        }
+    }
+    Err(Malformed("FSPX entry missing"))
+}
+
+/// The initial `FLOAT_MODE` (`COMPUTE_PGM_RSRC1` bits 19:12) of a part
+/// [`fspx_program`] accepts. `None` for other layouts: no FSSM field is
+/// known to hold RSRC1.
+pub fn fspx_float_mode(part: &[u8]) -> Option<u8> {
+    if !part.starts_with(b"FSPX") {
+        return None;
+    }
+    let count = (u32_at(part, 8).ok()? as usize).min(MAX_XDAT_ENTRIES);
+    let packet = fspx_entry(part, count, FSPX_PACKET).ok()?;
+    Some((u32_at(packet, PACKET_RSRC1).ok()? >> 12) as u8)
 }
 
 fn unpack(blob: &[u8]) -> Result<Vec<u8>, ShaderError> {
