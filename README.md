@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/hero-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="assets/readme/hero-light.svg">
+  <img src="assets/readme/hero-light.svg" alt="VIctory NVIDIA: Xbox Series compatibility runtime for Windows, tuned for NVIDIA, in Rust on DirectX 12">
+</picture>
+
 # VIctory (NVIDIA RTX 3080 Ti fork)
 
 > **This is a fork** of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
