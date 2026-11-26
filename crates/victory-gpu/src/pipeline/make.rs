@@ -21,8 +21,8 @@
 //! frame, behind more than a thousand other pipelines. Dropped, the tables
 //! stay empty for the whole run. Idea from Belobug's fork (18e57db).
 //! Compute pipelines wait in the same class, as a one-off dispatch dropped
-//! is lost for the rest of the scene (`VICTORY_COMPUTE_WAIT=0` turns that
-//! off).
+//! is lost for the rest of the scene (`VICTORY_COMPUTE_WAIT=0` gives them
+//! the other draws' budget instead).
 //!
 //! shortcut: both budgets are guesses; any other draw the title runs only
 //! once and whose pipeline takes longer than half a second is lost.

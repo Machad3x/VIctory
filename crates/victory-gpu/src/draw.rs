@@ -430,10 +430,13 @@ impl State {
     /// submission-time work (refreshes, uploads) runs with it: fresh tables,
     /// root views and the title-memory page table. Not replayed, as nothing
     /// of it is on the host list: depth bounds and shading rate (ignored),
-    /// queries (resolved with plain values), the 0x4a0 upload memory (the
-    /// title list's own), texture states and twins (each segment has its
-    /// own, made from the real states at its submission). Clears and copies
-    /// are commands, recorded once in the segment they belong to.
+    /// the 0x4a0 upload memory (the title list's own), texture states and
+    /// twins (each segment has its own, made from the real states at its
+    /// submission). Clears and copies are commands, recorded once in the
+    /// segment they belong to. Occlusion queries are recorded on the host
+    /// list but not replayed: the segment's close ends those running
+    /// ([`HostList::close`]), and the title's later end is dropped. Other
+    /// queries are resolved with plain values.
     pub(crate) fn cut(&mut self, list: &HostList) {
         self.host_state_lost();
         self.fresh_tables.clear();

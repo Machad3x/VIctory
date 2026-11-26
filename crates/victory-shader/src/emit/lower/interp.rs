@@ -71,7 +71,9 @@ impl<'a> Lower<'a> {
         // VINTRP/VINTERP obey EXEC: inactive lanes keep the destination.
         // shortcut: p1 writes the whole interpolation, so a lane whose EXEC
         // differs between p1 and p2 does not get the console's partial value.
-        let mut guard = self.guard(site.0, site.1)?;
+        // An EXEC the pass cannot give leaves the write unguarded, not the
+        // program untranslated.
+        let mut guard = self.guard(site.0, site.1).ok().flatten();
         // A packed first half has no host value, so a destination holding one
         // has nothing correct to keep.
         // shortcut: inactive lanes take the result there; guard it once first
