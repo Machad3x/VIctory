@@ -311,6 +311,23 @@ The first run after a translator change is black in the world for minutes
 while the host pipelines are made (about 2,300 queued here, done during the
 second run).
 
+## Rendering ports on the rebase
+
+On top of the rebase, taken from open upstream pull requests: #2928, #2923,
+#2915, #2917 (shader semantics), #2882 with #2896, #2782, #2771, #2884,
+#2926, #2802, #2830, #2843, #2873, #2879 (64 KiB render-target XOR tiling),
+#2895 (descriptor table reuse) and #2810 (a deferred copy of memory the
+submission's shaders write runs after the copy-backs). The wait for a host
+submission also checks the fence value (as #2899). From other forks:
+interpolation modes from the console container's `PSV0`, and the textures of
+aliasing and unordered access barriers held until the list is reset.
+
+Last run (warm shader cache, cell window, 4,900 to 5,100 draws): median
+637 ms a frame, 298 ms on the GPU, no draws dropped, no device removal; the
+block walls and the poster were lit. Interior walls still come out black in
+some runs of the same build (open). #2810 did not change that; the cutscene
+looked better with it.
+
 ## Tried and left out
 
 | Change | Result here |

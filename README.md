@@ -26,7 +26,7 @@ second, with rendering defects.
 
 | At the cell window (median of one 7-minute run) | |
 |---|---|
-| Frame time | about 670 ms (about 920 ms before the video-memory copies and the later changes) |
+| Frame time | about 640 to 670 ms (about 920 ms before the video-memory copies and the later changes) |
 | GPU step | about 300 ms |
 | Draws and dispatches dropped per frame | 0 in most reports |
 | Device removals in recent runs | none |
