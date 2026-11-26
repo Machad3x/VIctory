@@ -1231,8 +1231,10 @@ impl Shadow {
 
     /// Before the CPU reads offsets `[from, to)` of a mirrored copy: the
     /// pages there the mirror is behind on come from video memory (one GPU
-    /// copy; nothing when none is).
+    /// copy; nothing when none is). Never while a riding pull records on
+    /// this thread: its copy would be recorded, not run, before the read.
     fn freshen(&self, from: usize, to: usize) {
+        debug_assert!(!crate::host::riding_active(), "freshen inside a riding pull");
         let mut runs = self.stale_runs(from, to);
         bring_back(&mut runs);
     }
@@ -1728,6 +1730,9 @@ pub(crate) fn snapshots_done(ranges: &[(Arc<Shadow>, usize, usize)]) {
 /// in one list; the pages are current in the mirrors after. Each copy's
 /// stale pages stay locked over the GPU copy: a refresh meanwhile marks
 /// its page again once the lock is released, so the bit is not lost.
+/// Its `copy_now` is recorded instead while the thread records a riding
+/// pull (`crate::host::riding_active`): that needs a single submitting
+/// thread, the one whose submission runs the recorded list.
 fn bring_back(runs: &mut [(&Shadow, usize, usize)]) {
     if runs.is_empty() {
         return;

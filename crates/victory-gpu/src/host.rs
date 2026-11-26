@@ -95,6 +95,11 @@ thread_local! {
     static RIDING: std::cell::RefCell<Option<Regions>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Whether this thread is recording a riding pull ([`Host::pull_riding`]).
+pub(crate) fn riding_active() -> bool {
+    RIDING.with(|r| r.borrow().is_some())
+}
+
 /// The list a submission's pull rides in ([`Host::pull_riding`]).
 struct PullList {
     allocator: ID3D12CommandAllocator,
@@ -1981,10 +1986,23 @@ impl Host {
         // Done with the lists when it rode them (`riding`): what ran on the
         // CPU since keeps video memory and the mirrors alike, or marks the
         // pages stale.
-        drop(riding);
         if !pulled {
             crate::shadow::pull(&snapshots);
+            if let Some(Some(r)) = &mut riding {
+                static FELL_BACK: std::sync::Once = std::sync::Once::new();
+                FELL_BACK.call_once(|| tracing::warn!("a riding pull was not waited for: it pulled on its own"));
+                // The pull's own copy waited on this queue after the riding one.
+                r.guard.busy = false;
+            }
         }
+        struct Kept(Regions);
+        // SAFETY: D3D12 resources are free-threaded; only released there.
+        unsafe impl Send for Kept {}
+        // Not waited for: its buffers go with the submission's (`back`).
+        let kept = match riding.take() {
+            Some(Some(r)) if unwaited => Some(Kept(r._regions)),
+            _ => None,
+        };
         static RETAKE_ALL: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RETAKE_ALL").is_some_and(|v| v != "0"));
         for (shadow, address, len, goes_back, marked) in &back {
@@ -2054,7 +2072,7 @@ impl Host {
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
-        release_later(Box::new((batch, back, withheld, heaps)));
+        release_later(Box::new((batch, back, withheld, heaps, kept)));
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
@@ -4896,9 +4914,18 @@ impl Host {
         if guard.busy {
             return None;
         }
+        // Unset on every way out, an unwind included.
+        struct Recording;
+        impl Drop for Recording {
+            fn drop(&mut self) {
+                RIDING.with(|r| r.borrow_mut().take());
+            }
+        }
         RIDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        let recording = Recording;
         crate::shadow::pull(snapshots);
         let regions = RIDING.with(|r| r.borrow_mut().take()).unwrap_or_default();
+        drop(recording);
         if regions.is_empty() {
             return Some(None);
         }
