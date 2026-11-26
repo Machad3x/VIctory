@@ -76,6 +76,8 @@ pub(crate) struct State {
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
+    /// The root arguments the host list holds under them.
+    root_args: [RootArgs; 2],
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
@@ -99,6 +101,76 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+}
+
+/// Whether root arguments the host list already holds are not set again
+/// (on unless `VICTORY_ROOT_SKIP=0`).
+fn root_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_ROOT_SKIP"))
+}
+
+/// The root arguments set on a host list since its root signature (graphics
+/// or compute) was: one set again to what it holds is skipped. Setting a
+/// root signature leaves every root argument undefined, so all are
+/// forgotten with it ([`RootArgs::set_root`]).
+#[derive(Default)]
+struct RootArgs {
+    /// The root signature they were set under (0: none known).
+    root: usize,
+    /// By root parameter: its values (constants, or a view's address as
+    /// two DWORDs); empty where unknown.
+    params: Vec<Vec<u32>>,
+}
+
+impl RootArgs {
+    /// The list was given root signature `root` (0: unknown): it holds no
+    /// root arguments.
+    fn set_root(&mut self, root: usize) {
+        self.root = root;
+        self.params.iter_mut().for_each(Vec::clear);
+    }
+
+    /// Whether `param` must be set to `values` under root signature `root`:
+    /// it holds other values or unknown ones. They are what it holds after.
+    fn changed(&mut self, root: usize, param: u32, values: &[u32]) -> bool {
+        if !root_skip() {
+            return true;
+        }
+        if self.root != root {
+            self.set_root(root);
+        }
+        let param = param as usize;
+        if self.params.len() <= param {
+            self.params.resize_with(param + 1, Vec::new);
+        }
+        let held = &mut self.params[param];
+        if !held.is_empty() && held[..] == *values {
+            return false;
+        }
+        held.clear();
+        held.extend_from_slice(values);
+        true
+    }
+
+    /// Root view `param` (`kind`: 0 CBV, 1 SRV, 2 UAV) set to `gpu`, unless
+    /// the list holds it. The caller keeps what `gpu` reaches alive.
+    fn view(&mut self, l: &ID3D12GraphicsCommandList, root: usize, compute: bool, kind: u8, param: u32, gpu: u64) {
+        if !self.changed(root, param, &[gpu as u32, (gpu >> 32) as u32]) {
+            return;
+        }
+        // SAFETY: an open list with root signature `root`; `gpu` is live.
+        unsafe {
+            match (compute, kind) {
+                (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
+                (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
+                (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
+            }
+        }
+    }
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -474,6 +546,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.root_args.iter_mut().for_each(|a| a.set_root(0));
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -838,6 +911,7 @@ impl State {
                 }
             }
             self.host_roots[usize::from(compute)] = root;
+            self.root_args[usize::from(compute)].set_root(root);
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
@@ -872,19 +946,13 @@ impl State {
                 return false;
             };
             list.keep(table);
-            // SAFETY: an open list; the table lives while the list holds it,
-            // the bitmap for good.
-            unsafe {
-                let table = table.GetGPUVirtualAddress();
-                if compute {
-                    l.SetComputeRootShaderResourceView(table_param, table);
-                    l.SetComputeRootUnorderedAccessView(bitmap_param, bitmap);
-                } else {
-                    l.SetGraphicsRootShaderResourceView(table_param, table);
-                    l.SetGraphicsRootUnorderedAccessView(bitmap_param, bitmap);
-                }
-                Some((table_param, table, bitmap_param, bitmap))
-            }
+            // SAFETY: a live table; it lives while the list holds it, the
+            // bitmap for good.
+            let table = unsafe { table.GetGPUVirtualAddress() };
+            let args = &mut self.root_args[usize::from(compute)];
+            args.view(l, root, compute, 1, table_param, table);
+            args.view(l, root, compute, 2, bitmap_param, bitmap);
+            Some((table_param, table, bitmap_param, bitmap))
         } else {
             None
         };
@@ -920,12 +988,15 @@ impl State {
                 unsafe {
                     if compute {
                         l.SetComputeRootSignature(&p.root);
-                        if let Some((tp, table, bp, bitmap)) = marks {
-                            l.SetComputeRootShaderResourceView(tp, table);
-                            l.SetComputeRootUnorderedAccessView(bp, bitmap);
-                        }
                     }
                     l.SetPipelineState(&p.pso);
+                }
+                if compute {
+                    self.root_args[1].set_root(root);
+                    if let Some((tp, table, bp, bitmap)) = marks {
+                        self.root_args[1].view(l, root, true, 1, tp, table);
+                        self.root_args[1].view(l, root, true, 2, bp, bitmap);
+                    }
                 }
                 self.host_pipeline = p.pso.as_raw() as usize;
                 self.host_roots[1] = if compute { root } else { 0 };
@@ -946,7 +1017,9 @@ impl State {
             // their addresses go into the page table.
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // A root signature holds at most 64 DWORDs.
+                let mut values = [0u32; 64];
+                let values = &mut values[..dwords as usize];
                 for u in &t.host.user_data {
                     if THREADS && u.root == victory_shader::emit::DISPATCH_THREADS {
                         values[u.index as usize] = dims[u.dword as usize];
@@ -1000,12 +1073,14 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if self.root_args[usize::from(compute)].changed(root, param, values) {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
@@ -1023,38 +1098,22 @@ impl State {
                             return false;
                         };
                         list.keep(table);
-                        // SAFETY: an open list; the table lives while the list
-                        // holds it.
-                        unsafe {
-                            let gpu = table.GetGPUVirtualAddress();
-                            if compute {
-                                l.SetComputeRootShaderResourceView(param, gpu);
-                            } else {
-                                l.SetGraphicsRootShaderResourceView(param, gpu);
-                            }
-                        }
+                        // SAFETY: a live table; it lives while the list holds it.
+                        let gpu = unsafe { table.GetGPUVirtualAddress() };
+                        self.root_args[usize::from(compute)].view(l, root, compute, 1, param, gpu);
                         continue;
                     }
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
                     let writes = kind == 2 && t.host.written_root_uavs.contains(&slot);
-                    let Some(gpu) = root_view(list, *address, kind == 1, kind == 2, writes) else {
+                    let Some(gpu) = root_view(list, address, kind == 1, kind == 2, writes) else {
                         continue;
                     };
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, kind) {
-                            (false, 0) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, 1) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (false, _) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
-                            (true, 0) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, 1) => l.SetComputeRootShaderResourceView(param, gpu),
-                            (true, _) => l.SetComputeRootUnorderedAccessView(param, gpu),
-                        }
-                    }
+                    // The address is in live memory (`root_view` keeps it).
+                    self.root_args[usize::from(compute)].view(l, root, compute, kind, param, gpu);
                 }
             }
             if let Some(param) = stage.view_addresses {
@@ -1067,14 +1126,8 @@ impl State {
                     not_run("view addresses without a view heap");
                     return false;
                 };
-                // SAFETY: an open list; the heap's buffer lives with the heap.
-                unsafe {
-                    if compute {
-                        l.SetComputeRootShaderResourceView(param, gpu);
-                    } else {
-                        l.SetGraphicsRootShaderResourceView(param, gpu);
-                    }
-                }
+                // The heap's buffer lives with the heap.
+                self.root_args[usize::from(compute)].view(l, root, compute, 1, param, gpu);
             }
             if let Some(param) = stage.memory {
                 let Some((table, dirty)) = self.memory_map(list) else {
@@ -1098,20 +1151,11 @@ impl State {
                         map.precise(from, len);
                     }
                 }
-                // SAFETY: an open list; list memory alive until it is reset.
-                unsafe {
-                    if compute {
-                        l.SetComputeRootShaderResourceView(param, table);
-                    } else {
-                        l.SetGraphicsRootShaderResourceView(param, table);
-                    }
-                    if let Some(param) = stage.memory_dirty {
-                        if compute {
-                            l.SetComputeRootUnorderedAccessView(param, dirty);
-                        } else {
-                            l.SetGraphicsRootUnorderedAccessView(param, dirty);
-                        }
-                    }
+                // List memory alive until it is reset.
+                let args = &mut self.root_args[usize::from(compute)];
+                args.view(l, root, compute, 1, param, table);
+                if let Some(param) = stage.memory_dirty {
+                    args.view(l, root, compute, 2, param, dirty);
                 }
             }
         }
@@ -5214,5 +5258,29 @@ mod root_view_tests {
         assert!(is_root_view_offset(&entry(RootType::Descriptor)));
         assert!(!is_root_view_offset(&entry(RootType::Constants)));
         assert!(!is_root_view_offset(&entry(RootType::Table)));
+    }
+}
+
+#[cfg(test)]
+mod root_args_tests {
+    use super::RootArgs;
+
+    #[test]
+    fn root_arguments_held_are_skipped_until_the_root_signature_is_set() {
+        let mut args = RootArgs::default();
+        args.set_root(1);
+        assert!(args.changed(1, 0, &[1, 2]), "unknown at first");
+        assert!(!args.changed(1, 0, &[1, 2]), "held");
+        assert!(args.changed(1, 0, &[1, 3]), "other values");
+        assert!(args.changed(1, 3, &[1, 3]), "another parameter");
+        assert!(!args.changed(1, 0, &[1, 3]));
+        args.set_root(1);
+        assert!(args.changed(1, 0, &[1, 3]), "setting the root signature again forgets them");
+        assert!(args.changed(2, 0, &[1, 3]), "another root signature");
+        assert!(args.changed(1, 0, &[1, 3]), "and back");
+        args.set_root(0);
+        assert!(args.changed(1, 0, &[1, 3]), "the host list's state lost");
+        assert!(args.changed(1, 4, &[]), "no values are never held");
+        assert!(args.changed(1, 4, &[]));
     }
 }

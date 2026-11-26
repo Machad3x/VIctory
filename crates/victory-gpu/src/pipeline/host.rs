@@ -930,13 +930,61 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        Ok((shared_root(device, bytes)?, bytes.to_vec()))
     }
+}
+
+/// Root signatures by device and serialized blob: pipelines with the same
+/// layout share one, so switching between them keeps the list's root
+/// signature and its root arguments (`crate::draw`).
+struct Roots(std::collections::HashMap<(usize, Vec<u8>), ID3D12RootSignature>);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Roots {}
+
+static ROOTS: std::sync::Mutex<Option<Roots>> = std::sync::Mutex::new(None);
+
+/// The device's root signature for `blob`, made on its first use. A root
+/// signature holds its device, so a device address is never reused while
+/// it is a key.
+fn shared_root(device: &ID3D12Device, blob: &[u8]) -> windows::core::Result<ID3D12RootSignature> {
+    let key = (device.as_raw() as usize, blob.to_vec());
+    let mut roots = ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let roots = &mut roots.get_or_insert_with(|| Roots(Default::default())).0;
+    if let Some(root) = roots.get(&key) {
+        return Ok(root.clone());
+    }
+    // SAFETY: a serialized root signature.
+    let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, blob)? };
+    roots.insert(key, root.clone());
+    Ok(root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same layout, same root signature object; another layout, another.
+    #[test]
+    fn identical_root_signatures_are_shared() {
+        let Some(host) = host() else {
+            eprintln!("no D3D12 host; skipped");
+            return;
+        };
+        let constants = |n| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: n },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let make = |n, compute| root_signature(&host.device, &[constants(n)], &[], compute).unwrap();
+        let (a, blob_a) = make(4, true);
+        let (b, blob_b) = make(4, true);
+        assert_eq!(blob_a, blob_b);
+        assert_eq!(a.as_raw(), b.as_raw(), "one object for one blob");
+        assert_ne!(make(5, true).0.as_raw(), a.as_raw(), "another layout");
+        assert_ne!(make(4, false).0.as_raw(), a.as_raw(), "other flags");
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ColorStream {
