@@ -406,13 +406,16 @@ those at the other addresses showing the pages. The idea is fxceless's fork's
 
 Cell window, one run each, medians:
 
-| | Before | After |
-|---|---|---|
-| Frame | 448 ms | 418 ms |
-| Copy-back | 102 ms | 76 ms |
-| Marked pages | 102 ms | 71 ms |
+| | Before | Run 1 | Run 2 |
+|---|---|---|---|
+| Frame | 448 ms | 418 ms | 430 ms |
+| Copy-back | 102 ms | 76 ms | 84 ms |
+| Marked pages | 102 ms | 71 ms | 78 ms |
 
-No draws dropped and no device removal.
+Run 2 has the fixes from a review: the pages stay busy while written (a take
+meanwhile could copy part of a write), the other addresses showing them at
+the write's start are marked at its end, and a section's view is unmapped
+only with no write under way. No draws dropped and no device removal.
 
 ## Tried and left out
 
