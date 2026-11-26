@@ -193,7 +193,9 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+/// The entry format: VSH2 added the written root UAVs (an entry of VSH1
+/// is translated again).
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -249,6 +251,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
         memory,
         memory_writes,
         view_addresses,
@@ -306,6 +309,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, written_root_uavs.len() as u32);
+    out.extend(written_root_uavs);
     out
 }
 
@@ -367,6 +372,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let written_root_uavs = r.list()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -376,6 +382,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
@@ -409,6 +416,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            written_root_uavs: vec![4],
             memory: true,
             memory_writes: true,
             view_addresses: true,

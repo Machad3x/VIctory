@@ -49,6 +49,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// Root UAVs among `root_uavs` an operation may write.
+    pub written_root_uavs: Vec<u8>,
     /// Reads title memory at computed addresses (the page table).
     pub memory: bool,
     /// Writes there (the written-pages bitmap).
@@ -1907,6 +1909,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs: self.s.written_root_uavs.clone(),
             memory,
             memory_writes,
             view_addresses,

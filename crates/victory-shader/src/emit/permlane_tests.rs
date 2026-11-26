@@ -107,6 +107,7 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         root_cbvs: result.root_cbvs,
         root_srvs: result.root_srvs,
         root_uavs: result.root_uavs,
+        written_root_uavs: result.written_root_uavs,
         memory: result.memory,
         memory_writes: result.memory_writes,
         view_addresses: result.view_addresses,

@@ -107,6 +107,7 @@ fn host_shader(lowered: lower::Lowered) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
