@@ -853,6 +853,12 @@ struct Resource {
     /// Live [`Pin`]s.
     #[cfg(windows)]
     pins: std::sync::atomic::AtomicU32,
+    /// The [`TEXTURES_AT`] change count of its memory's bucket when
+    /// [`alias_source`] last found no other title texture the GPU writes at
+    /// its memory: while the count is the same there is still none (0: not
+    /// found yet).
+    #[cfg(windows)]
+    no_writer_seen: std::sync::atomic::AtomicU64,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1929,6 +1935,8 @@ fn hand_out_resource(
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
         #[cfg(windows)]
         pins: Default::default(),
+        #[cfg(windows)]
+        no_writer_seen: Default::default(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1943,6 +1951,7 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
+        textures_at_changed(resource.data() as u64);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1955,6 +1964,28 @@ fn hand_out_resource(
 #[cfg(windows)]
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Changes to [`TEXTURES_AT`], counted in buckets of memory addresses: what
+/// [`alias_source`] found for a texture holds while its memory's bucket has
+/// not changed. Read for every texture a draw reads; written, under the map's
+/// lock, only when a title texture is made or released.
+#[cfg(windows)]
+static TEXTURES_AT_CHANGES: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(1) }; 1024];
+
+/// The change count of the bucket holding memory `at`.
+#[cfg(windows)]
+fn textures_at_changes(at: u64) -> &'static std::sync::atomic::AtomicU64 {
+    // The page number, spread over the 1024 buckets.
+    let bucket = (at >> 12).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - 10);
+    &TEXTURES_AT_CHANGES[bucket as usize]
+}
+
+/// [`TEXTURES_AT`] changed at memory `at` (called under its lock).
+#[cfg(windows)]
+fn textures_at_changed(at: u64) {
+    textures_at_changes(at).fetch_add(1, std::sync::atomic::Ordering::Release);
+}
 
 /// Keeps a resource allocated: its `Drop` waits for every pin.
 #[cfg(windows)]
@@ -2000,7 +2031,23 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         return None;
     }
     let b = resource(placed);
+    // Most textures a draw reads share their memory with no texture the GPU
+    // writes: found once, then known without the map's lock (which every
+    // recording thread took for each texture read) until a title texture of a
+    // memory in the same bucket is made or released.
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let changes = textures_at_changes(b.data() as u64);
+    if b.no_writer_seen.load(Relaxed) == changes.load(Acquire) {
+        return None;
+    }
     let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    // Flags only: whether two host textures differ can change without the map.
+    let writer = |&r: &usize| r as This != placed && resource(r as This).desc.flags & WRITTEN != 0;
+    if !map.get(&(b.data() as u64)).is_some_and(|all| all.iter().any(writer)) {
+        // Under the lock, the count matches the map.
+        b.no_writer_seen.store(changes.load(Relaxed), Relaxed);
+        return None;
+    }
     let bytes = |d: &ResourceDesc| {
         let (size, block) = element(d.format)?;
         let swizzle = texture_layout(d).map_or(d.layout, |t| t.planes[0].layout.desc.swizzle.0);
@@ -2057,6 +2104,7 @@ impl Drop for Resource {
                     map.remove(&at);
                 }
             }
+            textures_at_changed(at);
         }
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         // No view of it is current now, so no new pins: those taken before
@@ -2573,6 +2621,41 @@ mod tests {
     #[test]
     fn a_null_view_has_no_alias_source() {
         assert_eq!(alias_source(std::ptr::null()), None);
+    }
+
+    /// A texture read finds the texture the GPU writes at its memory once one
+    /// is made there, though it found none before (and kept that), and none
+    /// again once that one is released.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_read_finds_a_writer_made_at_its_memory_later() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let h = heap(1 << 20);
+        let place = |desc: &ResourceDesc| {
+            let mut out = null;
+            let iid = &RESOURCE_IIDS[0];
+            assert_eq!(create_placed(null, h, 0, desc, 0, null.cast(), iid, &mut out), S_OK);
+            out
+        };
+        // BC1 64x64 and R32G32_UINT 16x16 with unordered access: the same
+        // layout, in host textures that cannot view each other.
+        let read = place(&texture(64, 64, 71, 1));
+        assert!(host_copy(read).is_some());
+        assert_eq!(alias_source(read), None, "alone at its memory");
+        assert_eq!(alias_source(read), None, "still alone");
+        let target = place(&ResourceDesc { flags: UNORDERED, ..texture(16, 16, 17, 1) });
+        let (r, t) = (host_copy(read).unwrap(), host_copy(target).unwrap());
+        assert!(!std::sync::Arc::ptr_eq(&r, &t), "two host textures");
+        assert_eq!(alias_source(read), Some(target), "the writer made since");
+        assert_eq!(alias_source(target), None, "nothing else writes there");
+        drop((r, t));
+        assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+        assert_eq!(alias_source(read), None, "the writer released");
+        assert_eq!(slot::<Release>(read, 0x10)(read), 0);
+        assert_eq!(slot::<Release>(h, 0x10)(h), 0);
     }
 
     #[test]
