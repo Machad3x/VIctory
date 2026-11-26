@@ -4454,7 +4454,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             return;
         }
         let pages = 2 * WINDOW as usize / PAGE;
-        let p = crate::watch::tests::pool(pages);
+        // A window more than the buffer: `at` rounds up, and the two windows
+        // freed from it below stay in our pool, not another test's memory.
+        let p = crate::watch::tests::pool(pages + WINDOW as usize / PAGE);
         let at = (p as u64).next_multiple_of(WINDOW);
         register(p, p as u64, (pages * PAGE) as u64);
         let page = PAGE as u64;
