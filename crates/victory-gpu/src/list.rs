@@ -830,6 +830,10 @@ extern "system" fn copy_texture_region(
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
+        // A box may not cover a texture never uploaded; marked host-written, it never would be.
+        if crate::texture::title_written(&to) {
+            crate::texture::upload(list, dst.resource, &to);
+        }
         ensure_state(list, dst.resource, COPY_DEST);
         dst_write.record(list);
         let mut to_location = dst;
@@ -2312,6 +2316,112 @@ mod tests {
                 panic!("released list dropped its slots")
             })
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_box_copy_into_a_never_uploaded_texture_keeps_title_texels_outside_it() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut title = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title),
+            S_OK
+        );
+        // Runtime memory the change journal follows; RGBA8 64x64, linear.
+        let address = crate::watch::tests::pool(1) as u64;
+        // SAFETY: the texture's memory, 256-byte rows of 64 texels.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut dst = null;
+        assert_eq!(
+            crate::resource::create_at_address(null, address, words.as_ptr().cast(), 0, null.cast(), &iid, &mut dst),
+            S_OK
+        );
+        // The source: a committed texture, zeroed by the host.
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 8,
+            Height: 8,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(28),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut src = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &PAGEABLE_IIDS[0],
+                &mut src,
+            ),
+            S_OK
+        );
+        // SAFETY: all integers; zero is subresource index 0.
+        let footprint = unsafe { std::mem::zeroed() };
+        let to = CopyLocation { resource: dst, kind: 0, footprint };
+        let from = CopyLocation { resource: src, kind: 0, footprint };
+        copy_texture_region(title, &to, 0, 0, 0, &from, null.cast());
+
+        let list = host_list(title).expect("host command list");
+        ensure_state(list, dst, COPY_SOURCE);
+        let result = crate::resource::host_resource(dst).unwrap();
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut bytes = 0;
+        // SAFETY: one output footprint for the live destination.
+        unsafe {
+            host.device.GetCopyableFootprints(&result.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
+        }
+        let (buffer, mapped) = host.shared_buffer(bytes).unwrap();
+        // SAFETY: both resources outlive submission; the locations borrow
+        // their pointers and the footprint describes the whole texture.
+        unsafe {
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&result),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.Close().expect("the list closes");
+        }
+        host.execute(&[list]);
+        let texel = |x: usize, y: usize| {
+            let at = footprint.Offset as usize + y * footprint.Footprint.RowPitch as usize + x * 4;
+            // SAFETY: inside the completed 64x64 copy.
+            unsafe { mapped.add(at).cast::<u32>().read_unaligned() }
+        };
+        assert_eq!(texel(0, 0), 0, "inside the box: the source's");
+        assert_eq!(texel(32, 32), 0x4040_4040, "outside the box: title memory's");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [dst, src, title, allocator] {
+            release(object);
+        }
     }
 }
 
