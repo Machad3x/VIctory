@@ -2197,6 +2197,17 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
     (d.dimension != BUFFER).then(|| footprint(&d).map(|f| f.size)).flatten()
 }
 
+/// [`texture_at`]'s resource if it is made, current and has its host
+/// texture; makes nothing.
+#[cfg(windows)]
+pub(crate) fn made_texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let r = *map.get(&(address, desc))? as This;
+    (current(r) && made_copy(r).is_some()).then_some(r)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

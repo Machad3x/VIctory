@@ -859,7 +859,8 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        let later = !for_draw && is_placed_texture(&view);
+        // A copy given up after this check is remade below (that one texture).
+        let later = !for_draw && is_placed_texture(&view) && !made_without_new_texture(&view);
         if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
@@ -2023,6 +2024,22 @@ fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
 
+/// Whether a host view of the placed texture view `view` needs no new host
+/// texture: its copy is made, and the twin an unordered view of depth writes.
+fn made_without_new_texture(view: &View) -> bool {
+    let View::Placed(unordered, resource, desc) = view else {
+        return false;
+    };
+    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let Some(copy) = crate::resource::made_texture_at(address, resource).and_then(crate::resource::made_copy) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    !*unordered
+        || unsafe { copy.texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0
+        || copy.twin.get().is_some()
+}
+
 /// Makes what a host view of `view` needs, if it is not made yet: the
 /// texture it views (made on first use) or the host copy of the buffer
 /// memory it views. The slot's view is then quick to make.
@@ -2546,6 +2563,42 @@ mod tests {
         assert!(host.kept(0), "made for the draw");
     }
 
+    /// A slot the title rewrites with a placed texture already made is viewed
+    /// at once, not left null until read.
+    #[test]
+    fn a_rewritten_slot_of_a_made_placed_texture_keeps_its_view() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        // A 12x1 RGBA8 texture, linear, and a 2D view. A width of its own:
+        // other tests expect theirs unmade at whatever address they get.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 12, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let record =|| unsafe { (title_heap.start as *const [u32; 3]).read_unaligned() };
+        crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
+        let first = record();
+        let host = title_heap.host().expect("a host view heap");
+        assert!(host.mirror(0, title_heap.start, true).is_some());
+        assert!(host.kept(0), "made for the draw");
+        // Another view of it (every channel red): a new record in the slot.
+        let mut red = view;
+        red[2] = 0x1000;
+        crate::descriptor::create_placed_srv(null, &words, &red, title_heap.start);
+        assert_ne!(record(), first, "a new generation");
+        assert!(host.mirror(0, title_heap.start, false).is_some());
+        assert!(host.kept(0), "viewed at once");
+    }
+
     /// A slot viewing a texture given up (`crate::resource::evict`) holds it
     /// no more: heap syncs pass it by, a draw reading it through a table
     /// makes it again.
@@ -2619,11 +2672,14 @@ mod tests {
         crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap);
     }
 
-    /// Work to run while a view's texture is prepared, once (tests).
-    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+    thread_local! {
+        /// Work to run while this thread prepares a view's texture, once.
+        /// Per thread: another test's prepare would take a shared one.
+        static WHILE_PREPARING: std::cell::RefCell<Option<crate::descriptor::tests::Work>> = Default::default();
+    }
 
     pub(crate) fn while_preparing() {
-        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let work = WHILE_PREPARING.take();
         if let Some(work) = work {
             work();
         }
@@ -2645,7 +2701,9 @@ mod tests {
         let s = 960u32;
         let at = title_heap.start + u64::from(s) * 32;
         let memory = vec![0u8; 1 << 17];
-        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        // A width of its own: a texture another test made at a reused
+        // address would be viewed at once.
+        let words: [u32; 14] = [3, 0, 0, 0, 16, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
         let view_of = |address: u64| {
             let mut view = [0u32; 16];
             view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
@@ -2657,14 +2715,14 @@ mod tests {
         let host = title_heap.host().expect("a host view heap");
         let (done, waited) = std::sync::mpsc::channel();
         let second_view = view_of(second);
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        WHILE_PREPARING.set(Some(Box::new(move || {
             // The title writes the other record into the slot meanwhile.
             std::thread::spawn(move || {
                 crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
                 done.send(()).unwrap();
             });
             assert!(waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the write waits");
-        }));
+        })));
         // A draw reads the slot: its first record is prepared.
         assert!(host.mirror(s, at, true).is_some());
         let second_texture = crate::resource::texture_at(second, &words).expect("its resource");
@@ -2687,7 +2745,9 @@ mod tests {
         let title_heap = crate::descriptor::heap(heap);
         let (first, second) = (950u32, 951u32);
         let memory = vec![0u8; 1 << 17];
-        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        // A width of its own: a texture another test made at a reused
+        // address would be viewed at once.
+        let words: [u32; 14] = [3, 0, 0, 0, 20, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
         let slot = |i: u32| title_heap.start + u64::from(i) * 32;
         for (i, at) in [(first, 0u64), (second, 1 << 16)] {
             let address = memory.as_ptr() as u64 + at;
@@ -2700,7 +2760,7 @@ mod tests {
         let heap_at = title_heap.start;
         let heap = heap as usize;
         let (done, waited) = std::sync::mpsc::channel();
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        WHILE_PREPARING.set(Some(Box::new(move || {
             std::thread::spawn(move || {
                 let h = crate::descriptor::heap(heap as crate::object::This);
                 h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
@@ -2710,9 +2770,9 @@ mod tests {
                 waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
                 "a view bound while another slot's texture is made waits"
             );
-        }));
+        })));
         assert!(host.mirror(first, slot(first), true).is_some());
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(WHILE_PREPARING.with_borrow(Option::is_none), "the prepare ran");
         assert!(host.kept(first) && host.kept(second), "both made");
     }
 
@@ -2733,7 +2793,9 @@ mod tests {
         // A 4x1 RGBA8 texture, linear, in memory of its own, and a 2D view.
         let memory = vec![0u8; 1 << 16];
         let address = memory.as_ptr() as u64;
-        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        // A width of its own: a texture another test made at a reused
+        // address would be viewed at once.
+        let words: [u32; 14] = [3, 0, 0, 0, 24, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
         let mut view = [0u32; 16];
         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
         (view[10], view[11]) = (address as u32, (address >> 32) as u32);
@@ -3295,15 +3357,16 @@ mod tests {
             let slot_addr = slots[idx].as_mut_ptr() as u64;
             crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &desc, slot_addr);
             let view = crate::descriptor::view(slot_addr).unwrap();
-            assert!(matches!(
-                placed_texture(&view),
-                Some(View::Unordered(_, 0, Some(_)))
-            ));
+            // Before the texture is made (below): left for a draw to make.
             assert!(heap.mirror(idx as u32, slot_addr, false).is_some());
             assert!(
                 heap.kept.lock().unwrap()[idx].is_none(),
                 "case {idx} mirror(false) should defer host creation"
             );
+            assert!(matches!(
+                placed_texture(&view),
+                Some(View::Unordered(_, 0, Some(_)))
+            ));
             let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
             let dyn_slot = heap.count + idx as u32;
             heap.make_at(dyn_slot, &mirrored);
