@@ -963,18 +963,6 @@ fn shared_root(device: &ID3D12Device, blob: &[u8]) -> windows::core::Result<ID3D
     Ok(root)
 }
 
-/// Drops `device`'s shared root signatures, which otherwise keep it alive.
-// The host device is a process-lifetime static (`crate::host::host`): no
-// release path calls this yet; one that tears the device down must.
-#[allow(dead_code)]
-pub(crate) fn forget_device_roots(device: &ID3D12Device) {
-    let device = device.as_raw() as usize;
-    let mut roots = ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(roots) = roots.as_mut() {
-        roots.0.retain(|(d, _), _| *d != device);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
