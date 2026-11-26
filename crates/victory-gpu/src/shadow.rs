@@ -1559,7 +1559,6 @@ pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
 
 fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
     let mut map = buffers();
-    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     MAX_SPAN.fetch_max(len, Ordering::Relaxed);
     if len >= BIG_LEN {
         big().insert((start, resource), start.saturating_add(len));
@@ -1574,14 +1573,18 @@ fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
             read_only,
         },
     );
+    // After the buffers changed: a count read before is looked at again.
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
-    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     big().remove(&(start, resource));
-    if map.remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    let removed = map.remove(&(start, resource));
+    // Counted once the map has changed.
+    OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
+    if removed.is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
 }
