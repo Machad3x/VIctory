@@ -1486,7 +1486,8 @@ impl<'a> Lower<'a> {
         for &(_, w) in &inst.writes {
             let val = if self.section_out.contains(&w) {
                 let shape = self.sections[&b][&start].shapes.get(&w).copied();
-                match shape.ok_or(ended).and_then(|sh| self.shape(sh)) {
+                let why = self.sections[&b][&start].reasons.get(&w).copied().unwrap_or(ended);
+                match shape.ok_or(why).and_then(|sh| self.shape(sh)) {
                     Ok(x) => Val::I32(x),
                     Err(why) => Val::Missing(why),
                 }
