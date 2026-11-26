@@ -421,7 +421,13 @@ mod tests {
         assert!(lane(true, true) < lane(false, true));
         assert!(lane(false, true) < lane(true, false));
         assert_eq!(lane(true, false), lane(false, false));
-        assert!(!Pending::new(Vec::new(), None).screen());
+        let p = Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        );
+        assert!(!p.screen());
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -452,6 +458,7 @@ mod tests {
             hash: "0123456789abcdef".into(),
             container: Vec::new(),
             translated: OnceLock::new(),
+            partial: OnceLock::new(),
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

@@ -74,7 +74,7 @@ fn store_shader() -> Arc<Shader> {
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let host = emit::emit(&c, &native, &p, &st, &io, &res, emit::Target::ANY).unwrap();
     Arc::new(Shader {
         stage: "compute",
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
@@ -82,7 +82,9 @@ fn store_shader() -> Arc<Shader> {
         translated: OnceLock::from(Some(Translated {
             host,
             used: native.used,
+            threads: None,
         })),
+        partial: OnceLock::new(),
     })
 }
 
@@ -185,7 +187,7 @@ fn placed_uav_dispatch_writes_its_texture() {
     state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
     state.set_table(true, 1, handle);
     let dispatched = crate::draw::dispatched();
-    state.dispatch(&list, 1, 1, 1);
+    state.dispatch::<false>(&list, 1, 1, 1);
     assert!(
         crate::draw::dispatched() > dispatched,
         "dispatch did not record"
