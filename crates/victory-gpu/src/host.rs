@@ -192,6 +192,38 @@ fn wait_for_submission(
     }
 }
 
+/// The view heap size the device takes ([`probe_view_heap`]).
+static VIEW_HEAP: OnceLock<u32> = OnceLock::new();
+
+/// The slots of every host view heap:
+/// [`victory_shader::emit::HEAP_VIEWS`] where the device makes a
+/// shader-visible heap that large, else
+/// [`victory_shader::emit::PORTABLE_VIEWS`] (NVIDIA).
+pub(crate) fn heap_views() -> u32 {
+    host();
+    VIEW_HEAP.get().copied().unwrap_or(victory_shader::emit::HEAP_VIEWS)
+}
+
+/// Chooses the view heap size ([`heap_views`]) and tells the translator.
+fn probe_view_heap(device: &ID3D12Device) {
+    use victory_shader::emit::{HEAP_VIEWS, PORTABLE_VIEWS};
+    let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        NumDescriptors: HEAP_VIEWS,
+        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+        NodeMask: 0,
+    };
+    // SAFETY: plain heap creation, dropped at once.
+    let large = unsafe { device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&desc) }.is_ok();
+    let takes = *VIEW_HEAP.get_or_init(|| if large { HEAP_VIEWS } else { PORTABLE_VIEWS });
+    let translated = victory_shader::emit::set_heap_views(takes);
+    if translated != takes {
+        tracing::warn!(translated, takes, "shaders translated before the view heap size was known");
+    } else if takes != HEAP_VIEWS {
+        tracing::info!(views = takes, "the host caps view heaps: shader heap indices clamped below it");
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -260,6 +292,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        probe_view_heap(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(

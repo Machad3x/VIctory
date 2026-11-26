@@ -1395,6 +1395,16 @@ pub(crate) fn take_reads() -> Vec<u32> {
             fresh &= fresh - 1;
         }
     }
+    // The null views at the heap's end: where indices past the heap, or past
+    // the title's slots of a capped one, are sent.
+    #[cfg(feature = "diagnostics")]
+    if !new.is_empty() {
+        let first_null = victory_shader::emit::null_buffer_view() - 1;
+        let past = new.iter().filter(|&&slot| slot >= first_null).count();
+        if past > 0 {
+            tracing::warn!(past, first_null, "texture reads past the host view heap read null views");
+        }
+    }
     new
 }
 

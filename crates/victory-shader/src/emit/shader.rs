@@ -41,16 +41,50 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Where the title-memory page table is bound: `t0` (a raw root SRV) in
 /// this space (see `emit` "Title memory").
 pub const MEMORY_SPACE: u32 = 2;
-/// Heap indices are clamped below these (views, samplers): the host's heaps
-/// are at least this large, the slots past their own null (`emit`, "Heap
-/// indices").
+/// The largest view heap translations index: [`heap_views`] where the host
+/// makes a shader-visible view heap this large.
 pub const HEAP_VIEWS: u32 = 1 << 21;
+/// The shader-visible view heap size every host takes (NVIDIA refuses more).
+pub const PORTABLE_VIEWS: u32 = 1_000_000;
+/// The title's slots in a heap of [`PORTABLE_VIEWS`]: the host's dynamic
+/// slots (2^18), view pairs (2^14) and three null views follow them.
+pub const PORTABLE_TITLE_VIEWS: u32 = PORTABLE_VIEWS - 3 - (1 << 18) - (1 << 14);
+/// Sampler heap indices are clamped below this: the host's sampler heaps
+/// are at least this large, the slots past their own null.
 pub const HEAP_SAMPLERS: u32 = 2048;
+
+static HOST_VIEWS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// View heap indices are clamped below this (`emit`, "Heap indices"): the
+/// size of the host's view heaps. The host says what it takes before any
+/// translation ([`set_heap_views`]), else [`HEAP_VIEWS`]; the translator's
+/// own tests ask the default adapter. Fixed for the process at first use,
+/// and part of every translation: caches must key on it.
+pub fn heap_views() -> u32 {
+    *HOST_VIEWS.get_or_init(|| {
+        #[cfg(all(windows, test))]
+        if !super::host::takes_view_heap(HEAP_VIEWS) {
+            return PORTABLE_VIEWS;
+        }
+        HEAP_VIEWS
+    })
+}
+
+/// The host's view heaps have `views` slots ([`PORTABLE_VIEWS`] or
+/// [`HEAP_VIEWS`]). Returns the size in effect: another one if
+/// [`heap_views`] was fixed before this call.
+pub fn set_heap_views(views: u32) -> u32 {
+    *HOST_VIEWS.get_or_init(|| views)
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
-/// (`emit`, "Buffer views at computed heap indices").
-pub const NULL_BUFFER_VIEW: u32 = HEAP_VIEWS - 2;
+/// (`emit`, "Buffer views at computed heap indices"). The slot above it, the
+/// heap's last, holds a null view too.
+pub fn null_buffer_view() -> u32 {
+    heap_views() - 2
+}
 /// The view-mark table's register: `t2` (a raw root SRV) in
 /// [`MEMORY_SPACE`] (`emit`, "Write marks").
 pub const VIEW_MARKS: u32 = 2;
@@ -64,7 +98,8 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
 pub const VIEW_WRITE_BITS: u32 = 1 << 22;
 /// The first bit of the read marks of texture views (`emit`, "Read
 /// marks"), after the written pages in the same bitmap: one bit per
-/// resource-heap index, [`HEAP_VIEWS`] of them.
+/// resource-heap index, [`HEAP_VIEWS`] of them (every index
+/// [`heap_views`] lets through).
 pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
@@ -154,7 +189,7 @@ pub(crate) struct Shader {
     /// The heap index of each handle of a raw buffer view, shader resource
     /// or unordered access (its view-stride entry gives the bytes the
     /// host's view starts early, [`VIEW_SKIP_SHIFT`]): as asked for, and
-    /// clamped below [`HEAP_VIEWS`].
+    /// clamped below [`heap_views`].
     pub buffer_index: std::collections::HashMap<V, (V, V)>,
     /// The heap index of each handle of a texture shader view (its reads
     /// are marked, `emit` "Read marks"), and those the instruction being
@@ -595,6 +630,19 @@ impl Shader {
         )
     }
 
+    /// On a heap of [`PORTABLE_VIEWS`], an index the title made (`title`)
+    /// past its own slots reads the heap's last, null view: the host's
+    /// dynamic slots and view pairs follow them.
+    pub fn title_heap_index(&mut self, block: usize, index: V, title: bool) -> V {
+        if !title || heap_views() != PORTABLE_VIEWS {
+            return index;
+        }
+        let last = self.m.i32(PORTABLE_TITLE_VIEWS - 1);
+        let over = self.m.cmp(block, pred::IUGT, index, last);
+        let null = self.m.i32(PORTABLE_VIEWS - 1);
+        self.m.select(block, over, null, index)
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
@@ -614,7 +662,7 @@ impl Shader {
         let asked = index;
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
-        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
+        let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { heap_views() } - 1);
         let over = self.m.cmp(block, pred::IUGT, index, last);
         let index = self.m.select(block, over, last, index);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));

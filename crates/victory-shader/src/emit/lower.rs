@@ -84,7 +84,7 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
-    /// Live unsigned-greater-than clamps to `HEAP_VIEWS - 1`.
+    /// Live unsigned-greater-than clamps to `heap_views() - 1`.
     #[cfg(test)]
     pub view_clamps: u32,
     #[cfg(test)]
@@ -2021,7 +2021,7 @@ impl<'a> Lower<'a> {
             view_clamps: self
                 .s
                 .m
-                .live_cmps_with_const(pred::IUGT, i64::from(super::HEAP_VIEWS - 1)),
+                .live_cmps_with_const(pred::IUGT, i64::from(super::heap_views() - 1)),
             #[cfg(test)]
             legacy_half_conversion: self.s.m.has_function("dx.op.legacyF32ToF16"),
             #[cfg(test)]
@@ -5202,12 +5202,12 @@ impl<'a> Lower<'a> {
         self.end_guarded(outer, &[]);
     }
 
-    /// `index` clamped to the last slot of [`super::HEAP_VIEWS`], for root
+    /// `index` clamped to the last slot of [`super::heap_views`], for root
     /// buffer views (`VIEW_STRIDES`, view addresses) that have no bounds of
     /// their own.
     fn clamp_view_index(&mut self, index: V) -> V {
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::heap_views() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         self.s.m.select(c, over, last, index)
     }
@@ -5441,12 +5441,11 @@ impl<'a> Lower<'a> {
             "a descriptor's dword 7 read as data",
         ];
         let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
-        if !matches!(
-            self.x.native.layout.get(a.param).map(|p| p.root),
-            Some(RootType::Table | RootType::ResourceHeap)
-        ) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        if !matches!(root, Some(RootType::Table | RootType::ResourceHeap)) {
             return Err("a descriptor read only as data");
         }
+        let title = root == Some(RootType::ResourceHeap);
         // The compiler loads image descriptors whole, buffer ones as four
         // dwords; the host's table holds the first four of both.
         let views = self.s.view_addresses_handle();
@@ -5454,6 +5453,7 @@ impl<'a> Lower<'a> {
             let word = (a.offset / 4 + k) % 8;
             let val = if word < 4 {
                 let index = self.heap_index(site, k as u8, false)?;
+                let index = self.s.title_heap_index(self.cur, index, title);
                 let index = self.clamp_view_index(index);
                 let c = self.cur;
                 let four = self.s.m.i32(4);
@@ -5898,12 +5898,14 @@ impl<'a> Lower<'a> {
         {
             return Err(WHY);
         }
+        let title = leaves.iter().all(|l| self.is_heap_direct(l));
         let index = match src {
             Source::Loaded { .. } | Source::Phi { .. } | Source::Select { .. } => {
                 self.uniform_heap_index(src, false, WHY)?
             }
             _ => self.lane_heap_index(src, false)?,
         };
+        let index = self.s.title_heap_index(self.cur, index, title);
         let index = self.clamp_view_index(index);
         Ok(self.stride_at(index))
     }
@@ -6252,6 +6254,8 @@ impl<'a> Lower<'a> {
     /// buffer one (a wild address: the texture's address shifted 8 bits
     /// down) and faulted the device.
     fn buffer_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> V {
+        let title = !sampler && src.leaves().iter().all(|l| self.is_heap_direct(l));
+        let index = self.s.title_heap_index(self.cur, index, title);
         // Typed, raw and structured buffers (DXIL resource kinds 10-12).
         if sampler || !(10..=12).contains(&(props.0 & 0xFF)) || !self.is_heap_direct(src) {
             return index;
@@ -6262,7 +6266,7 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         let guarded = self.s.m.select(c, none, null, index);
         self.guarded.insert(guarded, index);
