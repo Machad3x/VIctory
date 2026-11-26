@@ -372,6 +372,23 @@ rectangular blocks on the character's hair; they were not seen again in the
 has one hard-edged lit rectangle. Whether either comes from this change is not
 established.
 
+## Root UAVs only read
+
+From upstream pull request #2948: the translator records which root UAVs a
+shader may write, and the host declares writes for those only. The snapshots
+and the batch copies of GPU-written memory they caused are gone.
+
+| | Before (2 runs) | Run 1 | Run 2 |
+|---|---|---|---|
+| Frame | 488, 519 ms | 496 ms | 453 ms |
+| Preparing | 205, 224 ms | 186 ms | 181 ms |
+| Snapshots | 24, 30 ms | 0 | 0 |
+| Marked pages | 101, 100 ms | 128 ms | 92 ms |
+
+The frame times overlap the noise between runs; preparing is lower in both.
+The higher marked-pages time of run 1 did not repeat. No draws dropped and no
+device removal.
+
 ## Tried and left out
 
 | Change | Result here |
