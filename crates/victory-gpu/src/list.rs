@@ -783,6 +783,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 // Every subresource (mips by array slices), whole.
                 // SAFETY: a live texture.
                 let d = unsafe { to.GetDesc() };
+                // A 3D texture's DepthOrArraySize is depth, not slices.
+                if d.Dimension != windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                    crate::texture::incompatible_copy(Some(67), None);
+                    return;
+                }
                 let count = u32::from(d.MipLevels.max(1)) * u32::from(d.DepthOrArraySize.max(1));
                 for i in 0..count {
                     if !crate::texture::copy_stand_in_to_67(list, &to, i, [0; 3], &from, i, None) {

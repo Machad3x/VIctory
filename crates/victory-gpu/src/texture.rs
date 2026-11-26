@@ -100,8 +100,11 @@ pub(crate) fn copy_stand_in_to_67(
     else {
         return false;
     };
-    // SAFETY: a live texture.
+    // SAFETY: live textures.
     let d = unsafe { from.GetDesc() };
+    if !stand_in_copy_fits(&d, &unsafe { to.GetDesc() }, b) {
+        return false;
+    }
     let mip = from_sub % u32::from(d.MipLevels.max(1));
     let (width, height) = match b {
         Some(b) => (b.right.saturating_sub(b.left), b.bottom.saturating_sub(b.top)),
@@ -159,6 +162,13 @@ pub(crate) fn copy_stand_in_to_67(
     }
     list.need_rebind();
     true
+}
+
+/// Whether [`copy_stand_in_to_67`] handles a copy between textures of
+/// these descriptions: both 2D, the box (if any) one slice deep.
+fn stand_in_copy_fits(from: &D3D12_RESOURCE_DESC, to: &D3D12_RESOURCE_DESC, b: Option<&D3D12_BOX>) -> bool {
+    let two_d = |d: &D3D12_RESOURCE_DESC| d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    two_d(from) && two_d(to) && b.is_none_or(|b| b.back.saturating_sub(b.front) <= 1)
 }
 
 /// A float packed in `bits` with a 5-bit exponent and `man` mantissa bits
@@ -1497,6 +1507,19 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stand-in conversion takes 2D one-slice copies only.
+    #[test]
+    fn stand_in_copy_fits_2d_one_slice() {
+        let tex = |dim| D3D12_RESOURCE_DESC { Dimension: dim, ..Default::default() };
+        let (two, three) = (tex(D3D12_RESOURCE_DIMENSION_TEXTURE2D), tex(D3D12_RESOURCE_DIMENSION_TEXTURE3D));
+        let deep = |front, back| D3D12_BOX { front, back, right: 4, bottom: 4, ..Default::default() };
+        assert!(stand_in_copy_fits(&two, &two, None));
+        assert!(stand_in_copy_fits(&two, &two, Some(&deep(0, 1))));
+        assert!(!stand_in_copy_fits(&two, &two, Some(&deep(0, 2))));
+        assert!(!stand_in_copy_fits(&three, &two, None));
+        assert!(!stand_in_copy_fits(&two, &three, None));
+    }
 
     /// A title-written texture in a render-target XOR layout (256x256
     /// RGBA8, `SW_64KB_R_X`) is staged: the bytes read back from the upload

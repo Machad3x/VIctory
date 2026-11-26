@@ -307,14 +307,16 @@ fn stand_in_format(guest: u32, host: u32) -> bool {
 /// The format a target view of `this` (null: no texture) in `format` is
 /// made in: the stand-in, but a 67 view keeps 67 unless its host texture
 /// is a stand-in (a read-only 67 texture may share one, or be native or
-/// an alias of other texels); before the host texture is made, unless the
-/// title texture is writable ([`writable_67`]).
+/// an alias of other texels). The host texture is made first (the view
+/// needs it anyway): a read-only one may get a stand-in (`shared_texture`);
+/// if it cannot be made, unless the title texture is writable ([`writable_67`]).
 #[cfg(windows)]
 pub(crate) fn target_view_format(this: This, format: u32) -> u32 {
     if format != 67 || this.is_null() {
         return target_format(format);
     }
-    let stand_in = made_copy(this)
+    let stand_in = resource(this)
+        .host()
         .map_or(resource(this).desc.flags & (TARGET | UNORDERED) != 0, |c| c.packed() == Some(67));
     if stand_in { target_format(format) } else { format }
 }
