@@ -1197,7 +1197,7 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
-        let Some(view) = crate::descriptor::view(cpu) else {
+        let Some((view, _pin)) = crate::descriptor::view_pinned(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
         };
@@ -1353,7 +1353,7 @@ impl State {
                             let w: Vec<u32> =
                                 words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                             let _ = write!(text, " (title words {w:x?}");
-                            if let Some(view) = crate::descriptor::view(at) {
+                            if let Some((view, _pin)) = crate::descriptor::view_pinned(at) {
                                 let _ = write!(text, ": {}", describe(Some(&view)));
                             }
                             let _ = write!(text, ")");
@@ -1430,7 +1430,7 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
+        if let Some((view, _pin)) = host.mirror(index, handle, true) {
             readable(list, u, &view, true);
         }
     }
@@ -1513,7 +1513,7 @@ impl State {
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
+                    if let Some((view, _pin)) = crate::descriptor::view_pinned(handle) {
                         readable(list, u, &view, true);
                     }
                 }
@@ -1535,8 +1535,8 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(view) => {
+                match crate::descriptor::view_pinned(table + u64::from(k) * 32) {
+                    Some((view, _pin)) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
                             readable(list, u, &view, true);
@@ -1610,7 +1610,7 @@ impl State {
                 else {
                     continue;
                 };
-                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some((view, _pin)) = crate::descriptor::view_pinned(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
                 let range = match view {
@@ -1645,7 +1645,7 @@ impl State {
                 let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
                     continue;
                 };
-                let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some((View::Unordered(r, ..), _pin)) = crate::descriptor::view_pinned(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
                 let Some(t) = crate::resource::host_resource(r as This) else { continue };
@@ -1711,7 +1711,7 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        let view = crate::descriptor::view(handle);
+                        let (view, _pin) = crate::descriptor::view_pinned(handle).unzip();
                         let mut text = describe(view.as_ref());
                         // The title's view words, and whether the host slot
                         // the shader reads was made from a view.
@@ -4528,7 +4528,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             unsafe { std::ptr::write_bytes(data, 0, 4 * 16) };
 
             let list = host.new_list().unwrap();
-            let uav_view = heap_host.mirror(uav_slot as u32, uav_handle, true).unwrap();
+            let uav_view = heap_host.mirror(uav_slot as u32, uav_handle, true).unwrap().0;
             readable(&list, &used(ResourceType::Uav), &uav_view, false);
             // SAFETY: an open list and live objects.
             unsafe {
@@ -4541,7 +4541,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 list.list.Dispatch(1, 1, 1);
             }
 
-            let srv_view = heap_host.mirror(srv_slot as u32, srv_handle, true).unwrap();
+            let srv_view = heap_host.mirror(srv_slot as u32, srv_handle, true).unwrap().0;
             readable(&list, &used(ResourceType::Srv), &srv_view, false);
             // SAFETY: an open list and live objects.
             unsafe {

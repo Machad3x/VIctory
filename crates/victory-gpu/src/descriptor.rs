@@ -536,12 +536,23 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
+/// The view of entry `i` if `generation` is still its own, with a pin on the
+/// resource it names: hold it while reading that resource. (The counter is
+/// never read.)
 #[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
+pub(crate) fn view_at(i: u32, generation: u32) -> Option<(View, Option<crate::resource::Pin>)> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    (*current == generation).then(|| {
+        let pin = match *view {
+            View::Shader(r, _) | View::Unordered(r, ..) if r != 0 => {
+                // SAFETY: a current view's resource, under the views' lock.
+                Some(unsafe { crate::resource::pin(r as This) })
+            }
+            _ => None,
+        };
+        (view.clone(), pin)
+    })
 }
 
 /// For each record (tag, index, generation): whether it names a view that
@@ -556,7 +567,19 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
+/// [`view_at`] of the record at `handle`.
+#[cfg(windows)]
+pub(crate) fn view_pinned(handle: u64) -> Option<(View, Option<crate::resource::Pin>)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
+#[cfg(test)]
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
         return None;

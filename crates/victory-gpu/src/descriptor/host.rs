@@ -627,7 +627,7 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for (i, &key) in made.iter().enumerate() {
                 let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-                write_address(data, i, view.as_ref());
+                write_address(data, i, view.as_ref().map(|v| &v.0));
             }
             // Dynamic slots are entered as they are made ([`Self::make_at`],
             // [`Self::make_null`], raw views).
@@ -766,10 +766,11 @@ impl HostHeap {
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
-    /// if it changed since, and returns the view recorded there. Buffer
+    /// if it changed since, and returns the view recorded there, with the pin
+    /// on its resource: hold it while reading that resource. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
-    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+    pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<(View, Option<crate::resource::Pin>)> {
         #[cfg(feature = "diagnostics")]
         slot_use::note(index);
         if index >= self.count {
@@ -795,8 +796,8 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
+        let found = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        let Some((view, pin)) = found else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
@@ -860,7 +861,7 @@ impl HostHeap {
             !shown
         };
         if made[index as usize] == key && !needs_remake() && !owner_moved() {
-            return Some(view);
+            return Some((view, pin));
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
         // are made when written.
@@ -883,10 +884,12 @@ impl HostHeap {
             // SAFETY: as above.
             if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
                 drop(made);
+                // The old view's release need not wait for the new one.
+                drop(pin);
                 return self.mirror(index, handle, for_draw);
             }
             if made[index as usize] == key && !needs_remake() && !owner_moved() {
-                return Some(view);
+                return Some((view, pin));
             }
         }
         {
@@ -912,7 +915,7 @@ impl HostHeap {
             self.keep(index, kept.flatten());
             self.owners_seen.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = owners;
         }
-        Some(view)
+        Some((view, pin))
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -927,7 +930,7 @@ impl HostHeap {
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
-        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let (view, _pin) = view_at(key as u32, (key >> 32) as u32)?;
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
@@ -971,14 +974,15 @@ impl HostHeap {
         };
         for index in slots {
             let key = made.get(index as usize).copied().unwrap_or(0);
-            let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
-            match &view {
+            let found = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+            let view = found.as_ref().map(|f| &f.0);
+            match view {
                 Some(v) => null_for(v, self.cpu(index)),
                 None => null_view(self.cpu(index)),
             }
             self.keep(index, None);
             if index < self.count {
-                self.viewed.set(index, view.as_ref(), false);
+                self.viewed.set(index, view, false);
                 crate::shadow::forget_read(index);
             }
         }
@@ -998,7 +1002,8 @@ impl HostHeap {
     /// host view (made when read).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
-        let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+        // Returned unpinned: a placed view names no resource.
+        let (view, _pin) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
         (is_placed_texture(&view) && !kept).then_some(view)
     }
@@ -1007,7 +1012,7 @@ impl HostHeap {
     /// was used now.
     pub(crate) fn stamp_read(&self, index: u32) {
         let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
-        let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+        let Some((view, _pin)) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
             return;
         };
         let view = placed_texture(&view).unwrap_or(view);
@@ -2504,7 +2509,8 @@ mod tests {
             for slot in 0..3 {
                 let view = heap
                     .mirror(slot, handle + 32 * u64::from(slot), true)
-                    .unwrap();
+                    .unwrap()
+                    .0;
                 let held = heap.kept.lock().unwrap()[slot as usize]
                     .as_ref()
                     .map(|(res, _)| windows::core::Interface::as_raw(res));
@@ -3394,7 +3400,7 @@ mod tests {
                 placed_texture(&view),
                 Some(View::Unordered(_, 0, Some(_)))
             ));
-            let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap();
+            let mirrored = heap.mirror(idx as u32, slot_addr, true).unwrap().0;
             let dyn_slot = heap.count + idx as u32;
             heap.make_at(dyn_slot, &mirrored);
             let kept = heap.kept.lock().unwrap();

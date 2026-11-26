@@ -850,6 +850,9 @@ struct Resource {
     /// The creation's initial state and clear value, for the host texture.
     #[cfg(windows)]
     made_with: (u32, Option<[u32; 5]>),
+    /// Live [`Pin`]s.
+    #[cfg(windows)]
+    pins: std::sync::atomic::AtomicU32,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1912,6 +1915,8 @@ fn hand_out_resource(
         #[cfg(windows)]
         // SAFETY: the title passes a whole clear value (or null).
         made_with: (state, (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() })),
+        #[cfg(windows)]
+        pins: Default::default(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1938,6 +1943,31 @@ fn hand_out_resource(
 #[cfg(windows)]
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Keeps a resource allocated: its `Drop` waits for every pin.
+#[cfg(windows)]
+pub(crate) struct Pin(*const std::sync::atomic::AtomicU32);
+
+#[cfg(windows)]
+impl Drop for Pin {
+    fn drop(&mut self) {
+        // SAFETY: the resource is not freed while this pin counts.
+        unsafe { &*self.0 }.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// # Safety
+/// `this` is the resource of a current view, and the caller holds the views'
+/// lock (`descriptor::forget` takes it before `Drop` waits).
+#[cfg(windows)]
+pub(crate) unsafe fn pin(this: This) -> Pin {
+    // shortcut: the counter lives inside `Resource`, so a `&Resource` here
+    // coexists with `Drop`'s `&mut` (only atomics are touched through it);
+    // move the counter out if tooling flags it.
+    let pins = &resource(this).pins;
+    pins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Pin(pins)
+}
 
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
@@ -2006,7 +2036,6 @@ impl Drop for Resource {
             use windows::core::Interface;
             life::note(h.texture.as_raw() as usize, life::RELEASED, 0, life::holders(&h.texture));
         }
-        crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
@@ -2018,6 +2047,15 @@ impl Drop for Resource {
             }
         }
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        // No view of it is current now, so no new pins: those taken before
+        // finish, and what they entered in the heaps is dropped below. No
+        // lock is held here.
+        // shortcut: spins (a pin can span making a host texture, ms); park
+        // if releases show in a profile.
+        while self.pins.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            std::thread::yield_now();
+        }
+        crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             let (at, data) = (std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
             crate::shadow::unregister(at, data);
@@ -2697,6 +2735,36 @@ mod tests {
             assert!(made.iter().all(|m| m[k] == made[0][k]), "one resource for memory {k}");
             assert!(made_copy(made[0][k] as This).is_some(), "with a host texture");
         }
+    }
+
+    /// A release while a view's resource is pinned ([`pin`]): the view goes
+    /// stale at once, the resource only once the pin is dropped.
+    #[cfg(windows)]
+    #[test]
+    fn a_release_waits_for_pins() {
+        let memory = vec![0u8; 2 << 16];
+        let address = (memory.as_ptr() as u64).next_multiple_of(1 << 16);
+        let null = std::ptr::null();
+        let mut r = null;
+        let desc = texture(4, 4, 28, 1);
+        assert_eq!(create_at_address(null, address, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut r), S_OK);
+        let mut record = [0u32; 4];
+        crate::descriptor::create_srv(null, r, std::ptr::null(), record.as_mut_ptr() as u64);
+        let [_, i, generation, _] = record;
+        let at = r as usize;
+        std::thread::scope(|s| {
+            // Dropped by a failed assertion too, so the release can end.
+            let pinned = crate::descriptor::view_at(i, generation).expect("current");
+            let release = s.spawn(move || slot::<Release>(at as This, 0x10)(at as This));
+            while crate::descriptor::view_at(i, generation).is_some() {
+                std::thread::yield_now();
+            }
+            // Time for a release that does not wait to end.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!release.is_finished(), "waits for the pin");
+            drop(pinned);
+            assert_eq!(release.join().unwrap(), 0);
+        });
     }
 
     /// Textures idle for the idle time and frames are given up; past the
