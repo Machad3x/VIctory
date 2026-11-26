@@ -2338,7 +2338,11 @@ mod tests {
         if !dxc.exists() {
             return None;
         }
-        let file = std::env::temp_dir().join(format!("victory-interp-{}.dxil", std::process::id()));
+        let file = std::env::temp_dir().join(format!(
+            "victory-interp-{}-{:p}.dxil",
+            std::process::id(),
+            container.as_ptr()
+        ));
         std::fs::write(&file, container).ok()?;
         let out = std::process::Command::new(dxc)
             .arg("-dumpbin")
@@ -2352,6 +2356,36 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Interpolation obeys EXEC: a lane outside it keeps the destination.
+    #[cfg(windows)]
+    #[test]
+    fn a_masked_off_lane_keeps_its_register_over_an_interpolation() {
+        let words = [
+            0x7E06_02FFu32,
+            0x1234_5678, // v_mov_b32 v3, 0x12345678
+            0xBE80_037E, // s_mov_b32 s0, exec_lo
+            0x7C22_0080, // v_cmpx_lt_f32 exec, 0, v0
+            0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+            0xC80D_0001, // v_interp_p2_f32 v3, v1, attr0.x
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xF800_180F,
+            0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+            0xBF81_0000,
+        ];
+        let isg1 = rows(&[("TEXCOORD", 0, false)], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let out = emit_pixel(&words, vec![texcoord(false)], 1 << 1, &isg1, &osg1).unwrap();
+        let Some(text) = dump_dxil(&out.dxil) else {
+            eprintln!("no dxc.exe; DXIL check skipped");
+            return;
+        };
+        assert!(
+            text.lines()
+                .any(|l| l.contains("select i1") && l.ends_with("i32 305419896")),
+            "{text}"
+        );
     }
 
     #[cfg(windows)]

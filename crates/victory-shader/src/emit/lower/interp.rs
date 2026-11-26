@@ -68,6 +68,22 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let f16 = inst.name().ends_with("_f16");
+        // VINTRP/VINTERP obey EXEC: inactive lanes keep the destination.
+        // shortcut: p1 writes the whole interpolation, so a lane whose EXEC
+        // differs between p1 and p2 does not get the console's partial value.
+        let mut guard = self.guard(site.0, site.1)?;
+        // A packed first half has no host value, so a destination holding one
+        // has nothing correct to keep.
+        // shortcut: inactive lanes take the result there; guard it once first
+        // halves pass the old value through (lower.rs).
+        if let Interp::Interpolated { first, .. } = interp
+            && f16
+            && first.iter().any(|&(b, i)| {
+                self.x.p.blocks[b].insts[i].write(Reg::V(reg)).is_some()
+            })
+        {
+            guard = None;
+        }
         let x = match packing {
             None if f16 || attribute.high => return Err("a 16-bit read of a 32-bit input"),
             None => channel(self, attribute.row, attribute.channel)?,
@@ -95,7 +111,7 @@ impl<'a> Lower<'a> {
                     // omod and clamp are part of the f16 instruction; op_sel[3]
                     // picks the destination half.
                     let lo = self.half_modifiers(inst, lo);
-                    return self.write_half(inst, lo, None);
+                    return self.write_half(inst, lo, guard);
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let z = self.s.m.i32(0);
@@ -109,8 +125,7 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        self.write(inst, Reg::V(reg), x, guard);
         Ok(())
     }
 }
