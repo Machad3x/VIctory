@@ -1581,7 +1581,7 @@ fn readfirstlane_uses_the_exec_guard_to_select_a_lane() {
 #[test]
 fn d16_scaled_buffer_load_uses_portable_rounding() {
     // tbuffer_load_format_d16_x v0, off, s[8:11], 0 format:16_USCALED
-    let shader = lowers_valu(&[0xE848_0000, 0x8022_0000]).unwrap();
+    let shader = lower_valu(&[0xE848_0000, 0x8022_0000]).unwrap();
     assert!(
         !shader.legacy_half_conversion,
         "D16 load uses host-dependent f32tof16"

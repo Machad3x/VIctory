@@ -1931,7 +1931,7 @@ impl<'a> Lower<'a> {
                 "dx.op.waveReadLaneAt.i32",
                 "dx.op.waveReadLaneFirst.i32",
             ]
-            .map(|name| self.s.m.written_calls(name)),
+            .map(|name| self.s.m.written_calls(name).count()),
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]

@@ -393,7 +393,7 @@ fn global_store_barrier_shader(wave32: bool) -> HostShader {
         version: (1, 0),
         parts: vec![],
     };
-    let mut shader = super::emit(&container, &native, &p, &st, &io, &res).expect("emit");
+    let mut shader = super::emit(&container, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil)
             .expect("DXIL validation failed");
