@@ -732,18 +732,42 @@ impl HostHeap {
         let records: Vec<[u32; 3]> =
             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
         let current = views_current(&records);
+        // Stale slots by reason: first, recycled, rewritten, released.
+        #[cfg(feature = "diagnostics")]
+        let mut reasons = [0u64; 4];
         let stale: Vec<u32> = {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                .filter(|&(i, (&[_, view, generation], current))| {
+                    let stale = match made.get(i as usize) {
+                        Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                        Some(&m) => m != 0,
+                        None => true,
+                    };
+                    // Keys are generation << 32 | view index (see `mirror`).
+                    #[cfg(feature = "diagnostics")]
+                    if stale && let Some(&m) = made.get(i as usize) {
+                        reasons[match (current, m) {
+                            (true, 0) => 0,
+                            (true, m) if m as u32 == view => 1,
+                            (true, _) => 2,
+                            (false, _) => 3,
+                        }] += 1;
+                    }
+                    stale
                 })
                 .map(|(i, _)| i)
                 .collect()
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::SyncStaleFirst, reasons[0]);
+            add(C::SyncStaleRecycled, reasons[1]);
+            add(C::SyncStaleRewritten, reasons[2]);
+            add(C::SyncStaleReleased, reasons[3]);
+        }
         for i in stale {
             self.mirror(i, at(i), false);
         }

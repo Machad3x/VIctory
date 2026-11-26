@@ -168,6 +168,18 @@ pub(crate) enum C {
     HandlerOpenNs,
     HandlerSaves,
     HandlerTrackerWaitNs,
+    /// Heap sync slots found stale: made never (first), from the same view
+    /// entry of an older generation (recycled), from another view entry
+    /// (rewritten), and made while the record is no longer current
+    /// (released).
+    SyncStaleFirst,
+    SyncStaleRecycled,
+    SyncStaleRewritten,
+    SyncStaleReleased,
+    /// Descriptors written through the API (view creation, copies), and
+    /// `descriptor::forget` calls (generation bumps on release).
+    ApiViewWrites,
+    ForgetCalls,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -390,6 +402,15 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "  heap sync stale by reason per frame: first {:.0}, recycled {:.0}, rewritten {:.0}, released {:.0}; api view writes {:.0}, forgets {:.0}",
+        c[C::SyncStaleFirst as usize],
+        c[C::SyncStaleRecycled as usize],
+        c[C::SyncStaleRewritten as usize],
+        c[C::SyncStaleReleased as usize],
+        c[C::ApiViewWrites as usize],
+        c[C::ForgetCalls as usize],
     );
     tracing::info!(
         "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans",
