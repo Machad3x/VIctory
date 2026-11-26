@@ -10323,24 +10323,29 @@ impl<'a> Lower<'a> {
         }
         if let (true, Some((width, _))) = (store, sub) {
             // The field of the dword holding it, by two atomics on that dword
-            // (clear, then set): other lanes' fields in it are left alone.
-            // shortcut: the field is taken not to cross a dword.
+            // (clear, then set): other lanes' fields in it are left alone. A
+            // short at byte 3 puts its high byte in the next dword's low
+            // byte the same way.
             if index.is_some() {
                 return Err("a byte or half buffer store by index");
             }
             let d = data.as_ref().ok_or("buffer store data")?;
             let x = self.vgprs(inst, d, 1)?[0];
+            // The field's bytes, so a short crossing into the next 64 KiB
+            // page looks up and marks that page too.
+            let bytes = width / 8;
+            let (h, off) = self.raw_view(site, src, off, bytes, (11 | 0x1000, 0), true, guard)?;
+            let c = self.cur;
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let field = self.s.m.i32(if width == 8 { 0xFF } else { 0xFFFF });
-            let x = self.s.m.bin(c, Bin::And, x, field);
-            let x = self.s.m.bin(c, Bin::Shl, x, sh);
+            let xf = self.s.m.bin(c, Bin::And, x, field);
+            let x = self.s.m.bin(c, Bin::Shl, xf, sh);
             let mask = self.s.m.bin(c, Bin::Shl, field, sh);
             let all = self.s.m.i32(u32::MAX);
             let keep = self.s.m.bin(c, Bin::Xor, mask, all);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | 0x1000, 0), true, guard)?;
             let begin = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             for (op, v) in [(1, keep), (2, x)] {
@@ -10348,7 +10353,23 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
-            self.mark_view_write(h, at, 4, None);
+            if width > 8 {
+                let c = self.cur;
+                let last = self.s.m.cmp(c, pred::EQ, byte, three);
+                let (four, eight, low) = (self.s.m.i32(4), self.s.m.i32(8), self.s.m.i32(0xFFFF_FF00));
+                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let high = self.s.m.bin(c, Bin::LShr, xf, eight);
+                let crossing = self.begin_guarded(Some(last));
+                for (op, v) in [(1, low), (2, high)] {
+                    let args = [h, self.s.m.i32(op), next, iu, iu, v];
+                    self.s
+                        .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                }
+                self.end_guarded(crossing, &[]);
+            }
+            // The field's first and last byte: the next dword's page too
+            // where a short crosses into it.
+            self.mark_view_write(h, off, bytes, None);
             self.end_guarded(begin, &[]);
             return Ok(());
         }

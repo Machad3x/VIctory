@@ -141,6 +141,27 @@ const HALF_STORE_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// User data: s2 a table with a raw UAV. One lane fills dwords 0 and 1 with
+/// ones, then stores the half 0xBEEF at byte 3: its high byte lands in
+/// dword 1.
+const HALF_STORE_AT_BYTE_3_WAVE32: &[u32] = &[
+    0xBE8C_0302, // s_mov_b32 s12, s2
+    0xBE8D_0380, // s_mov_b32 s13, 0
+    0xF408_0406,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+    0x7E02_02C1, // v_mov_b32 v1, -1
+    0x7E04_02FF,
+    0x0000_BEEF, // v_mov_b32 v2, 0xBEEF
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_0000,
+    0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0
+    0xE070_0004,
+    0x8004_0100, // buffer_store_dword v1, off, s[16:19], 0 offset:4
+    0xE068_0003,
+    0x8004_0200, // buffer_store_short v2, off, s[16:19], 0 offset:3
+    0xBF81_0000, // s_endpgm
+];
+
 /// User data: s0 a table with a structured SRV (12-byte elements), s2 a
 /// table with a structured UAV (8-byte elements). Each lane loads dword 1
 /// of SRV element `lane` and adds it atomically to dword 1 of UAV element
@@ -881,6 +902,48 @@ fn half_buffer_stores_leave_the_other_half_alone() {
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         let want: Vec<u32> = (0..16).map(|k| (2 * k) | ((2 * k + 1) << 16)).collect();
         assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// `buffer_store_short` at byte 3 of a dword: the low byte ends that dword,
+/// the high byte starts the next; the other bytes of both stay.
+#[test]
+fn a_half_buffer_store_at_byte_3_crosses_into_the_next_dword() {
+    let shader = build(
+        HALF_STORE_AT_BYTE_3_WAVE32,
+        vec![param(RootType::Table, 2)],
+        vec![entry(ResourceType::Uav, 4, 2)],
+        1,
+    );
+    let views = [View::RawUav(4)];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0][..2], [0xEFFF_FFFF, 0xFFFF_FFBE], "{label}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
