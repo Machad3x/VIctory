@@ -98,7 +98,7 @@ impl Default for GraphicsState {
 fn integer_target(format: u32) -> bool {
     matches!(
         format,
-        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 37 | 39 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64
     )
 }
 
@@ -192,14 +192,28 @@ impl GraphicsState {
     /// not support blending", `E_INVALIDARG`), which drops every draw of
     /// that pipeline.
     pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
-        let mut blend = self.blend;
-        let slots = (self.targets.NumRenderTargets as usize).min(blend.RenderTarget.len());
-        for (i, target) in blend.RenderTarget.iter_mut().enumerate().take(slots) {
-            if integer_target(self.targets.RTFormats[i].0 as u32) {
-                target.BlendEnable = false.into();
-            }
+        let blend = self.blend;
+        let count = (self.targets.NumRenderTargets as usize).min(blend.RenderTarget.len());
+        let integer = |i: usize| integer_target(self.targets.RTFormats[i].0 as u32);
+        // Without independent blending only the first description counts.
+        let per_target = blend.IndependentBlendEnable.as_bool();
+        let blends = |i: usize| {
+            blend.RenderTarget[if per_target { i } else { 0 }]
+                .BlendEnable
+                .as_bool()
+        };
+        if !(0..count).any(|i| integer(i) && blends(i)) {
+            return blend;
         }
-        blend
+        let mut host = blend;
+        if !per_target {
+            host.IndependentBlendEnable = true.into();
+            host.RenderTarget = [blend.RenderTarget[0]; 8];
+        }
+        for i in (0..count).filter(|&i| integer(i)) {
+            host.RenderTarget[i].BlendEnable = false.into();
+        }
+        host
     }
 
     /// Whether this draws over the screen: no vertex input, no depth or
@@ -1255,6 +1269,64 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             ColorStream::Constant => [[1.0, 0.0, 0.0, 1.0]; 2],
         };
         assert_eq!(actual, expected, "{layout:?}");
+    }
+
+    fn blending(independent: bool, formats: &[DXGI_FORMAT]) -> GraphicsState {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = independent.into();
+        for t in &mut g.blend.RenderTarget {
+            t.BlendEnable = true.into();
+            t.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        }
+        g.targets.NumRenderTargets = formats.len() as u32;
+        g.targets.RTFormats[..formats.len()].copy_from_slice(formats);
+        g
+    }
+
+    #[test]
+    fn integer_formats_are_told_apart() {
+        assert!(integer_target(36) && integer_target(38));
+        assert!(!integer_target(37) && !integer_target(39));
+    }
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let formats = [
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R8_UINT,
+        ];
+        for independent in [false, true] {
+            let mut g = blending(independent, &formats);
+            if !independent {
+                // Ignored by D3D12, so it must not reach the host.
+                g.blend.RenderTarget[1] = Default::default();
+            }
+            let host = g.host_blend();
+            assert!(host.IndependentBlendEnable.as_bool());
+            assert!(host.RenderTarget[0].BlendEnable.as_bool());
+            assert!(host.RenderTarget[1].BlendEnable.as_bool());
+            assert!(!host.RenderTarget[2].BlendEnable.as_bool());
+            // The rest of the target's state is the title's.
+            assert_eq!(host.RenderTarget[2].SrcBlend, D3D12_BLEND_SRC_ALPHA);
+            assert_eq!(host.RenderTarget[0].DestBlend, D3D12_BLEND_INV_SRC_ALPHA);
+        }
+    }
+
+    #[test]
+    fn blend_states_without_integer_blending_are_kept() {
+        // No integer target.
+        let g = blending(false, &[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R11G11B10_FLOAT]);
+        assert_eq!(g.host_blend(), g.blend);
+        // An integer target that does not blend.
+        let mut g = blending(true, &[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_UINT]);
+        g.blend.RenderTarget[1].BlendEnable = false.into();
+        assert_eq!(g.host_blend(), g.blend);
+        // Integer formats past the targets in use.
+        let mut g = blending(false, &[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        assert_eq!(g.host_blend(), g.blend);
     }
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
