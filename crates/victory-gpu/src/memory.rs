@@ -865,7 +865,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
-                    Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
+                    // A page no copy holds is a miss, byte for byte or not.
+                    Some(Some(_)) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) => writes.push((*k, at)),
                     _ => {
                         pages += 1;
