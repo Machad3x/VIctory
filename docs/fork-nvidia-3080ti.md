@@ -555,7 +555,8 @@ memory step is the change's own. Image unchanged, no draws dropped.
 A run before these changes (`gpu193`, the build of the section above plus CPU
 timers) ended in a device removal while the world loaded. The two runs after it
 completed. Its cause is not established; the PC has also logged processor
-machine checks.
+machine checks. Reported upstream as
+[#3137](https://github.com/Marvisak/VIctory/issues/3137).
 
 ## CPU clock and core parking
 
