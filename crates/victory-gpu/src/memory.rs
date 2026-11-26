@@ -465,12 +465,15 @@ impl Shared {
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
         tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
-        self.layout = Arc::new(Layout {
+        let layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
             blocks,
             owner,
         });
+        // The old one may hold copies' last references: releasing those here
+        // would be on the submitting thread, with the heaps locked.
+        crate::host::release_later(Box::new(std::mem::replace(&mut self.layout, layout)));
         self.generation = now;
         stats(|s| s.tables += 1);
     }
