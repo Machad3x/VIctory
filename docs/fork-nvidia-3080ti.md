@@ -558,6 +558,20 @@ completed. Its cause is not established; the PC has also logged processor
 machine checks. Reported upstream as
 [#3137](https://github.com/Marvisak/VIctory/issues/3137).
 
+## Held pages drop after the marked copy-backs
+
+Pages held back for shaders using title memory left the copies before the
+marked copy-backs, so after a miss another copy of the same memory skipped the
+page and its ordinary write was lost. Review found it, and a test reproduced
+it; they leave after the copy-backs now. Three end-to-end tests of withheld
+ranges from [#3099](https://github.com/Marvisak/VIctory/pull/3099) (its
+author's) came with it.
+
+One run (`gpu196`): frame 385 ms, preparing 125 ms, marked pages 84 ms, within
+what runs of one binary have given here (marked pages 63 to 86 ms over the last
+runs without changes to them). The yard people rendered dark, as in some runs
+since `gpu189`, before these changes.
+
 ## CPU clock and core parking
 
 On a Ryzen 7 5700X the busy logical processors ran at 4.59 GHz in the cell
