@@ -1238,6 +1238,85 @@ fn a_bounded_dispatch_numbers_console_lanes_in_the_guard() {
     super::emit_variant::<true>(&c, &native, &p, &st, &io, &res, options).expect("translates");
 }
 
+/// Runs `body` (v0 = t in, v2 out) in a bounded dispatch
+/// (`DISPATCH_THREADS`) of two 64-thread groups on every hardware adapter:
+/// group 0 is full, group 1 holds `count - 64` threads for each of `counts`.
+/// Thread t of a group of `n` launched threads stores `want(n, t)`; a thread
+/// past the count stores nothing (0).
+fn bounded_case(label: &str, body: &[u32], counts: &[u32], want: impl Fn(u32, u32) -> u32) {
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    let c = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: vec![],
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let target = host.target();
+        let native = program(body, 64);
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let options = super::Options {
+            view_marks: false,
+            target,
+        };
+        let cs = super::emit_variant::<true>(&c, &native, &p, &st, &io, &res, options)
+            .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut cs.dxil.clone())
+                .unwrap_or_else(|e| panic!("{name}: {label}: validation: {e}"));
+        }
+        let split = !target.runs(64);
+        assert_eq!(
+            wave_size(&cs.dxil),
+            Some(if split { 32 } else { 64 }),
+            "{name}: {label}: the declared wave size"
+        );
+        let limit = cs
+            .user_data
+            .iter()
+            .find(|u| u.root == super::DISPATCH_THREADS && u.dword == 0)
+            .expect("the thread count's user data")
+            .index;
+        let (root, pso) = host
+            .compute_pipeline(&cs)
+            .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        for &count in counts {
+            let mut data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+            data[limit as usize] = count;
+            let views = [View::RawUav(128)];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [2, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{name}: {label}, count {count}: {e}"));
+            let launched = count - 64;
+            let expect: Vec<u32> = (0..64)
+                .map(|t| want(64, t))
+                .chain((0..64).map(|t| if t < launched { want(launched, t) } else { 0 }))
+                .collect();
+            assert_eq!(out[0], expect, "{name}: {label}, count {count} (split {split})");
+        }
+        eprintln!("{name}: {label}: bounded dispatches exact (split {split})");
+    }
+}
+
 /// A bounded dispatch (`DISPATCH_THREADS`) of a 64-thread console wave split
 /// in two host waves: the threads past the count stay for the halves'
 /// exchange barriers (a whole upper half past the count must still give its
@@ -1256,79 +1335,54 @@ fn a_bounded_dispatch_keeps_split_halves_for_their_exchange() {
         0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
-    let Ok(names) = adapters() else {
-        eprintln!("no DXGI; skipped");
-        return;
-    };
-    let c = crate::Container {
-        digest: [0; 16],
-        version: (1, 0),
-        parts: vec![],
-    };
-    for name in names {
-        let Ok(host) = Host::on(&name) else {
-            continue;
-        };
-        let target = host.target();
-        for (label, body, below) in [("EXEC", &exec[..], 64), ("VCC below 40", &vcc[..], 40)] {
-            let native = program(body, 64);
-            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-            let st = crate::structure::structure(&p).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
-            let options = super::Options {
-                view_marks: false,
-                target,
-            };
-            let cs = super::emit_variant::<true>(&c, &native, &p, &st, &io, &res, options)
-                .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
-            if let Ok(mut v) = super::validator::Validator::load(
-                super::validator::Validator::default_path().as_deref(),
-            ) {
-                v.validate(&mut cs.dxil.clone())
-                    .unwrap_or_else(|e| panic!("{name}: {label}: validation: {e}"));
-            }
-            let split = !target.runs(64);
-            assert_eq!(
-                wave_size(&cs.dxil),
-                Some(if split { 32 } else { 64 }),
-                "{name}: {label}: the declared wave size"
-            );
-            let limit = cs
-                .user_data
-                .iter()
-                .find(|u| u.root == super::DISPATCH_THREADS && u.dword == 0)
-                .expect("the thread count's user data")
-                .index;
-            let (root, pso) = host
-                .compute_pipeline(&cs)
-                .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
-            // Group 1 with: no upper half launched (1), a partial upper half
-            // (45), one upper lane (33), every thread (64).
-            for count in [64 + 1, 64 + 45, 64 + 33, 64 + 64] {
-                let mut data = vec![0; (cs.user_data_dwords() as usize).max(1)];
-                data[limit as usize] = count;
-                let views = [View::RawUav(128)];
-                let out = host
-                    .dispatch(
-                        &root,
-                        &pso,
-                        &Dispatch {
-                            roots: vec![(0, Root::Constants(data))],
-                            views: &views,
-                            samplers: &[],
-                            groups: [2, 1, 1],
-                        },
-                    )
-                    .unwrap_or_else(|e| panic!("{name}: {label}, count {count}: {e}"));
-                let launched = count - 64;
-                let want: Vec<u32> = (0..64)
-                    .map(|_| below)
-                    .chain((0..64).map(|t| if t < launched { below.min(launched) } else { 0 }))
-                    .collect();
-                assert_eq!(out[0], want, "{name}: {label}, count {count} (split {split})");
-            }
-            eprintln!("{name}: {label}: bounded dispatches exact (split {split})");
+    // Group 1 with: no upper half launched (1), a partial upper half
+    // (45), one upper lane (33), every thread (64).
+    let counts = [64 + 1, 64 + 45, 64 + 33, 64 + 64];
+    for (label, body, below) in [("EXEC", &exec[..], 64), ("VCC below 40", &vcc[..], 40)] {
+        bounded_case(label, body, &counts, |n, _| below.min(n));
+    }
+}
+
+/// Lane shuffles in a bounded dispatch: a source lane past the count was
+/// never launched on the console (its EXEC bit is 0), so `ds_bpermute_b32`
+/// reads 0 from it, and DPP gives 0 with bound_ctrl or keeps the old value
+/// without, as for a row boundary.
+#[test]
+fn a_bounded_dispatch_shuffles_read_unlaunched_lanes_as_inactive() {
+    // Each alone, and beside a lane read across the halves, which takes the
+    // console flow on a host without 64-lane waves (the threads past the
+    // count stay there): v2 += v0 of lane 10.
+    const READ_10: &[u32] = &[
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    for (form, read, plus) in [("", &[][..], 0), (", console flow", READ_10, 10)] {
+        // Lane t reads v0 of lane t + 8 of its half: in group 1 (40
+        // threads) lanes 32..39 read lanes 40..47, past the count.
+        let mut permute = vec![
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0xDACC_0020,
+            0x0200_0003, // ds_bpermute_b32 v2, v3, v0 offset:32
+        ];
+        permute.extend_from_slice(read);
+        let label = format!("backward permute past the count{form}");
+        bounded_case(&label, &permute, &[64 + 40], |n, t| {
+            let src = (t & !31) | ((t + 8) & 31);
+            plus + if src < n { src } else { 0 }
+        });
+        // Lane t reads lane t + 1 of its row: lane 39 reads lane 40.
+        for (bound_ctrl, invalid) in [(0, 7), (1, 0)] {
+            let mut shl = vec![
+                0x7E04_0287, // v_mov_b32 v2, 7
+                0x7E04_02FA,
+                0xFF01_0100 | bound_ctrl << 19, // v_mov_b32_dpp v2, v0 row_shl:1 [bound_ctrl:0]
+            ];
+            shl.extend_from_slice(read);
+            let label = format!("DPP row_shl past the count, bound_ctrl {bound_ctrl}{form}");
+            bounded_case(&label, &shl, &[64 + 40], |n, t| {
+                plus + if t % 16 == 15 || t + 1 >= n { invalid } else { t + 1 }
+            });
         }
     }
 }
