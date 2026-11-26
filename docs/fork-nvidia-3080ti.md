@@ -526,6 +526,37 @@ pages 74 ms (80), no draws dropped and no device removal. The people in the
 yard rendered as dark silhouettes in it, as in a run before these changes
 (`gpu189`): the cause is not established.
 
+## Title memory page table rewrites
+
+The step costs about 19 ms a frame, nearly all of it rewriting the page table
+(about 9 ms a rewrite, two a frame). Timed by phase, about 4.8 ms went in
+replacing the old layout, dropped in place with some 15,000 copy references,
+and 3.5 ms in building the table. The old layout now goes to the release
+thread. Review found that `copy_back_marks` could then drop a copy while
+holding the marks lock that dropping it takes; copies are now looked at after
+the lock. [#3096](https://github.com/Marvisak/VIctory/pull/3096)'s one-pass
+split of changed and unmapped pages is in too (its author's; its change to
+the step timer does not apply here).
+
+Cell window, one run each, with temporary timers, medians:
+
+| | Before (`gpu194`) | After (`gpu195`) |
+|---|---|---|
+| Rewrite, layout phase | about 4.8 ms | 0.15 ms |
+| Title memory step | 19 ms | 7 ms |
+| Preparing | 140 ms | 114 ms |
+| Copy-back | 89 ms | 66 ms |
+| Frame | 398 ms | 359 ms |
+
+Part of the difference is run to run variation (the earlier run was uneven, and
+marked pages have varied this much between runs of one binary); the title
+memory step is the change's own. Image unchanged, no draws dropped.
+
+A run before these changes (`gpu193`, the build of the section above plus CPU
+timers) ended in a device removal while the world loaded. The two runs after it
+completed. Its cause is not established; the PC has also logged processor
+machine checks.
+
 ## CPU clock and core parking
 
 On a Ryzen 7 5700X the busy logical processors ran at 4.59 GHz in the cell
