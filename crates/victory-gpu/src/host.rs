@@ -4901,9 +4901,9 @@ mod withholding {
             return; // no host GPU here
         };
         let _alone = crate::memory::without_a_miss();
-        let p = crate::watch::tests::pool(3);
-        let len = 3 * PAGE;
-        for (page, byte) in [(0, 0x11u8), (1, 0x22), (2, 0x33)] {
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        for (page, byte) in [(0, 0x11u8), (1, 0x22), (2, 0x33), (3, 0x44)] {
             // SAFETY: our pool, not guarded yet.
             unsafe { ((p + page * PAGE + 16) as *mut u8).write_volatile(byte) };
         }
@@ -4917,8 +4917,8 @@ mod withholding {
         }
         {
             let _writer = list.writer_uses_memory(false);
-            copy.refresh(&list, (p + PAGE) as u64, (2 * PAGE) as u64);
-            copy.gpu_writes(&list, (p + PAGE) as u64, (2 * PAGE) as u64, true);
+            copy.refresh(&list, (p + PAGE) as u64, (3 * PAGE) as u64);
+            copy.gpu_writes(&list, (p + PAGE) as u64, (3 * PAGE) as u64, true);
         }
         let c = copy.clone();
         list.defer(move || {
@@ -4926,6 +4926,9 @@ mod withholding {
             c.mark_page_for_test(p, true);
             c.write_host((p + PAGE + 16) as u64, &[0xbb]);
             c.mark_page_for_test(p + PAGE, false);
+            // A page the ordinary range alone covers: out only by the overlap.
+            c.write_host((p + 2 * PAGE + 16) as u64, &[0xcc]);
+            c.mark_page_for_test(p + 2 * PAGE, false);
         });
         list.defer_missed(|| true);
         list.close();
@@ -4938,9 +4941,14 @@ mod withholding {
             "both withheld writes stay out of title memory"
         );
         assert_eq!(
-            copy.update(p + 2 * PAGE, PAGE),
+            copy.update(p + 3 * PAGE, PAGE),
             0,
-            "unmarked page 2 stays clean"
+            "unmarked page 3 stays clean"
+        );
+        assert_eq!(
+            copy.update(p + 2 * PAGE, PAGE),
+            PAGE,
+            "page 2, the ordinary range's own, dropped"
         );
         assert_eq!(
             copy.update(p, PAGE),
@@ -5022,6 +5030,17 @@ mod withholding {
     /// does not mark another copy's page changed before its own copy-back.
     #[test]
     fn withheld_marked_drop_runs_after_other_copy_marked_copy_back() {
+        drop_after_other_copy(false);
+    }
+
+    /// The same where the withheld copy's mark is in the bitmap of shaders
+    /// using title memory.
+    #[test]
+    fn held_title_memory_mark_drops_after_other_copy_marked_copy_back() {
+        drop_after_other_copy(true);
+    }
+
+    fn drop_after_other_copy(memory: bool) {
         use crate::watch::PAGE;
         let Some(host) = super::host() else {
             return; // no host GPU here
@@ -5055,7 +5074,7 @@ mod withholding {
         let (o, i) = (outer.clone(), inner.clone());
         list.defer(move || {
             o.write_host((p + 16) as u64, &[0xaa]);
-            o.mark_page_for_test(p, false);
+            o.mark_page_for_test(p, memory);
             i.write_host((p + 32) as u64, &[0xbb]);
             i.mark_page_for_test(p, false);
         });

@@ -1502,15 +1502,11 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             })
             .collect()
     };
-    // Held back: dropped from the copies (`crate::memory::drop_withheld`).
-    if !held.is_empty() {
-        for (_, page) in pages_of(held) {
-            crate::memory::drop_withheld(page, PAGE);
-        }
-    }
-    if marked.is_empty() {
-        return;
-    }
+    // Held back: dropped from the copies (`crate::memory::drop_withheld`),
+    // after the copy-backs below.
+    let held = pages_of(held);
+    let held_by: std::collections::HashSet<(usize, usize)> =
+        held.iter().map(|(copy, page)| (Arc::as_ptr(copy) as usize, *page)).collect();
     let pages: Vec<(Arc<Shadow>, usize)> = pages_of(marked);
     pull(
         &pages
@@ -1518,13 +1514,19 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
     );
+    // What does not go back: a copy's page held back, or in a range of the
+    // copy withheld.
     let kept = |copy: &Arc<Shadow>, page: usize| {
-        withheld
-            .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
+        held_by.contains(&(Arc::as_ptr(copy) as usize, page))
+            || withheld
+                .iter()
+                .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
     };
-    let mut dropped: Vec<usize> =
-        pages.iter().filter(|(copy, page)| kept(copy, *page)).map(|&(_, page)| page).collect();
+    let mut dropped: Vec<usize> = held
+        .iter()
+        .chain(pages.iter().filter(|(copy, page)| kept(copy, *page)))
+        .map(|&(_, page)| page)
+        .collect();
     dropped.sort_unstable();
     dropped.dedup();
     for_each_by_page(pages, |copy, run| {
@@ -3393,6 +3395,30 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!((byte(0), byte(1)), (0, 0xaa), "the marked page from title memory, the other kept");
         // SAFETY: a byte of our pool.
         assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0, "title memory untouched");
+        unregister(p, p as u64);
+    }
+
+    /// A page of one copy marked by both kinds of shader, the title memory
+    /// ones held back: none of it goes into title memory.
+    #[test]
+    fn a_held_page_stays_out_though_other_shaders_marked_it_too() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 16) as u64, &[0xaa]);
+        copy.mark_page_for_test(p, true);
+        copy.mark_page_for_test(p, false);
+        copy_back_marks(&[], true);
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0);
+        copy.keep_writes(p, PAGE);
         unregister(p, p as u64);
     }
 
