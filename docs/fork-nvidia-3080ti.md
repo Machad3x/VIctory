@@ -902,6 +902,14 @@ differed, none cut. The GPU time fell by about 40 ms a frame; the frame
 did not, as preparing (125-144 ms) and copy-back (60-67 ms) on the CPU now
 bound it.
 
+### Cheaper write faults (`gpu242`)
+
+Upstream PR #3343 (danielibabet): a fault on a page with no other mapping
+skips the alias scan and its allocations, and contiguous guarded pages
+open with one `VirtualProtect`. Against `gpu240`: frame 296-298 ms
+against 309-321, time in the fault handler 93 ms of thread time a frame
+against 120, the interior lit.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
