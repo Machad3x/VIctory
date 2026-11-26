@@ -1392,7 +1392,7 @@ impl Host {
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
-        let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
+        let mut heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
             .iter()
             .flat_map(|l| {
                 l.deferred()
@@ -1405,6 +1405,10 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // Each once: most lists use the same few heaps, and a walk covers
+        // every texture a heap views.
+        heaps.sort_unstable_by_key(std::sync::Arc::as_ptr);
+        heaps.dedup_by(|a, b| std::sync::Arc::ptr_eq(a, b));
         // And textures read through tables, uploaded by the same list.
         let textures: Vec<_> = runs
             .iter()

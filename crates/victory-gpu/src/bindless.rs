@@ -221,7 +221,7 @@ pub(crate) fn uploads(
     // thread in a new shot, and title threads setting views waited on the
     // lock meanwhile (run evict5).
     let mut work: Vec<(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)> = Vec::new();
-    let mut staged = std::collections::HashSet::new();
+    let mut staged = crate::fx::Set::default();
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
@@ -232,7 +232,7 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
-    let mut done = std::collections::HashSet::new();
+    let mut done = crate::fx::Set::default();
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &r in inner.textures.keys() {
