@@ -15,9 +15,20 @@ pub(crate) fn on(name: &str) -> bool {
     value_is_on(std::env::var_os(name).as_deref())
 }
 
+/// Whether a switch that is on by default stays on: unset, or set to
+/// anything but `0`.
+fn value_keeps_on(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether the environment variable `name`, on unless set to `0`, is on.
+pub(crate) fn on_by_default(name: &str) -> bool {
+    value_keeps_on(std::env::var_os(name).as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::value_is_on;
+    use super::{value_is_on, value_keeps_on};
     use std::ffi::OsStr;
 
     #[test]
@@ -41,5 +52,12 @@ mod tests {
         for value in ["", "true", "yes", "2", "00", " 0", "0 "] {
             assert!(value_is_on(Some(OsStr::new(value))), "{value:?}");
         }
+    }
+
+    #[test]
+    fn a_default_on_switch_is_off_only_at_0() {
+        assert!(value_keeps_on(None));
+        assert!(value_keeps_on(Some(OsStr::new("1"))));
+        assert!(!value_keeps_on(Some(OsStr::new("0"))));
     }
 }

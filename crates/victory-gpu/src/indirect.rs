@@ -334,7 +334,7 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 thread_local!(pub(crate) static FORCE_WINDOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
 
 /// Whether consecutive indirect draws are clamped a window at a time
-/// (`VICTORY_CLAMP_WINDOW=1`; off by default).
+/// (on unless `VICTORY_CLAMP_WINDOW=0`).
 ///
 /// An indirect draw opens a window: one pass is recorded where its single
 /// clamp would be, and the indirect draws after it that may join add their
@@ -345,7 +345,8 @@ thread_local!(pub(crate) static FORCE_WINDOWS: std::cell::Cell<bool> = const { s
 ///
 /// Clamping a record ahead of the window's earlier draws changes nothing
 /// while nothing in between writes buffers. So [`end_window`] runs before
-/// any pipeline that may store (`crate::draw`), unordered-access clears,
+/// any pipeline that may store (`crate::draw`), except an indirect draw
+/// that joins as the window's last member and ends it, unordered-access clears,
 /// host library recordings, single clamps (indirect dispatches among them)
 /// and the list's close; a reset forgets the window. Draws and dispatches
 /// that store nothing write no buffer, and title barriers only order or
@@ -357,7 +358,7 @@ pub(crate) fn windows_on() -> bool {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_WINDOW"))
+    *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_CLAMP_WINDOW"))
 }
 
 // Adapted from fxceless's window check (fxceless's fork, commit f85101b6).

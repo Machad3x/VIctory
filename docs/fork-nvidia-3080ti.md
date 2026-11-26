@@ -847,6 +847,27 @@ GPU busy 172.7 ms per frame in timestamps around 31 submissions (177.9 ms of
 wall time), preparing 111 to 214 ms, copy-back 47 to 71 ms; no regression
 against `gpu225`.
 
+The windowed clamp is now on by default (`VICTORY_CLAMP_WINDOW=0` turns it
+off), and an indirect draw whose shaders may store no longer ends the window
+and gets a clamp of its own: it joins as the window's last member, since the
+pass reads every record before any member runs. Steady frames (about 5000
+draws), median of the last reports:
+
+| Run | Clamp | Frame ms | GPU ms | GPU busy ms |
+|---|---|---|---|---|
+| `gpu228` | single clamps | 378 | 184 | 175 |
+| `gpu230` | windows, storing draws alone (63 windows, 1916 draws alone) | 335 | 153 | 150 |
+| `gpu231` | windows, storing draws closing them (1974 windows, none alone) | 304 | 144 | 138 |
+
+In timing runs (`gpu227` against `gpu229`, windows without the storing
+change) the commands' GPU time fell from about 177 to 135 ms per frame:
+`host-clamp` 27.9 to 14.9 ms, `host-setup` 10.2 to 5.5 ms. Pictures did not
+change and no draw was dropped. `VICTORY_CLAMP_WINDOW_CHECK=1` (diagnostics,
+adapted from fxceless's window check) clamps each windowed draw's records
+again and compares them on the GPU: `gpu232` checked 1.24 million records,
+none differed. The timing report now also sums GPU time by command kind,
+since its 25 costliest entries left about 45% of the time unlisted.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
