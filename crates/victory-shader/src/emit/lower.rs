@@ -34,6 +34,10 @@ mod half_round;
 mod mul24;
 
 mod spill;
+mod packed;
+mod round_mode;
+use packed::{half_outputs, packed_half};
+use round_mode::{round16, round16_after};
 use spill::{is_named_lane, is_sgpr_spill, reads_mask_as_data, restored_lane_read, spill_writes};
 
 type Why = &'static str;
@@ -408,65 +412,6 @@ struct Lower<'a> {
     mode16: Option<u8>,
 }
 
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-fn round16_after(lower: &Lower<'_>, inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
-            },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            if off > 2 || off + size < 4 {
-                return None;
-            }
-            let input = lower.konst_operand(&HashMap::new(), inst, src.first()?)?;
-            Some((input >> (2 - off) & 3) as u8)
-        }
-        _ => mode,
-    }
-}
-
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(lower: &Lower<'_>) -> Vec<Option<u8>> {
-    let p = lower.x.p;
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
-    let order = crate::ir::reverse_postorder(&p.blocks);
-    loop {
-        let mut changed = false;
-        for &b in &order {
-            let Some(mut m) = entry[b] else { continue };
-            for inst in &p.blocks[b].insts {
-                m = round16_after(lower, inst, m);
-            }
-            for s in p.blocks[b].exit.successors() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
-                if entry[s] != new {
-                    entry[s] = new;
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
-        }
-    }
-}
-
 /// Iterations after which a loop is left (per entry into it), unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
@@ -520,58 +465,6 @@ const LANE_MASK: Why = "a lane mask read as data";
 /// implicit derivatives (`image_sample`, `image_sample_b`).
 pub(crate) const IMPLICIT_SAMPLE_IN_HALVES: Why =
     "an implicit-derivative sample in the console flow on a host without 64-lane waves";
-
-/// Where half `h` (dword h / 2, the high half when odd) of the parameter
-/// whose first element is in row `a` comes from, when the console packs
-/// 16-bit values two per dword: a row and channel of `elements`, none for
-/// padding. The console fills its parameters with the 16-bit elements taken
-/// by first channel, then row: each takes whole dwords of the first
-/// parameter with room for it (four dwords each), its channels in order.
-fn packed_half(elements: &[SigElement], a: u8, h: u8) -> Option<(u8, u8)> {
-    let mut halves: Vec<&SigElement> = elements
-        .iter()
-        .filter(|e| e.half && e.kind == 0 && e.row.is_some())
-        .collect();
-    halves.sort_by_key(|e| (e.col, e.row));
-    // (first element's row, (row, channel) per half)
-    type Param = (Option<u32>, Vec<Option<(u8, u8)>>);
-    let mut params: Vec<Param> = Vec::new();
-    for e in halves {
-        let need = usize::from(e.cols.div_ceil(2) * 2);
-        let i = match params.iter().position(|p| p.1.len() + need <= 8) {
-            Some(i) => i,
-            None => {
-                params.push((e.row, Vec::new()));
-                params.len() - 1
-            }
-        };
-        let row = u8::try_from(e.row?).ok()?;
-        let slots = &mut params[i].1;
-        slots.extend((0..e.cols).map(|c| Some((row, e.col + c))));
-        slots.resize(slots.len().next_multiple_of(2), None);
-    }
-    // Two parameters starting in one row would leave the half ambiguous.
-    let mut found = params.iter().filter(|p| p.0 == Some(u32::from(a)));
-    match (found.next(), found.next()) {
-        (Some(p), None) => p.1.get(usize::from(h)).copied().flatten(),
-        _ => None,
-    }
-}
-
-/// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]),
-/// by row: whether two per dword.
-fn half_outputs(io: &StageIo) -> HashMap<u8, bool> {
-    let entries = match io {
-        StageIo::Vs { outputs, .. } => outputs,
-        StageIo::Ms(ms) => &ms.outputs,
-        _ => return HashMap::new(),
-    };
-    entries
-        .iter()
-        .filter(|o| o.param & 0x80 == 0 && o.fp16)
-        .map(|o| (o.row, o.pack2))
-        .collect()
-}
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
