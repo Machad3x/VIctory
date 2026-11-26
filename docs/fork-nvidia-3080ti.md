@@ -812,7 +812,17 @@ default. With the first rule, a copy for a page missed 8 frames running
 (`gpu222`, lit): 49 MiB of copies were made, steady frames still missed a
 median of 3 pages, and copy-back ran in 5 of 582 frames, at the same frame
 time as `gpu221`. The remaining pages recur every 8 frames, so a page now
-counts as persistent when missed in 2 of 16 frames. Not yet run with it.
+counts as persistent when missed in 2 of 16 frames. With that rule
+(`gpu223`, lit) the 256 MiB budget ran out, 53 to 59 pages were still missed
+in every steady frame, no frame copied back, copy-back rose to about 107 to
+119 ms (62 in `gpu222`) and the frame to about 415 to 455 ms. 256 KiB copies
+per page do not scale to what the title misses; the switch stays off.
+
+`gpu223` also gave the first copy-back and barrier counters (with demand
+copies on, so its totals are inflated): of 95 ms of marked-page wall time the
+threads spent about 306 ms comparing, 145 ms writing and 20 ms reading;
+5118 indirect argument clamps per frame, 2236 with no shader write since the
+one before; no null UAV barriers for title buffer barriers.
 
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
