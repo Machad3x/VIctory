@@ -116,6 +116,37 @@ struct Saved {
     bytes: std::collections::HashMap<usize, Box<[u8]>>,
 }
 
+/// Page buffers [`Changed::save`] reuses: the guard handler saving a page
+/// neither zeroes 64 KiB nor calls the heap (where the faulting thread may
+/// hold its lock) while the pool has one. A leaf lock, held for a push or a
+/// pop. Bytes handed out by [`Tracked::saved`] are freed by their taker.
+static SAVE_POOL: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
+
+/// Buffers kept at most: 16 MiB, so a burst of saves is not held forever.
+const SAVE_POOL_MAX: usize = 256;
+
+/// A PAGE buffer holding any bytes: the caller overwrites them all.
+fn page_buffer() -> Box<[u8]> {
+    let pooled = SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    pooled.unwrap_or_else(|| vec![0u8; PAGE].into_boxed_slice())
+}
+
+/// Gives a saved page's buffer back to [`SAVE_POOL`] (freed when full).
+fn recycle(bytes: Box<[u8]>) {
+    debug_assert_eq!(bytes.len(), PAGE);
+    let mut pool = SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.capacity() == 0 {
+        // Once, so later pushes never allocate.
+        pool.reserve_exact(SAVE_POOL_MAX);
+    }
+    if pool.len() < SAVE_POOL_MAX {
+        pool.push(bytes);
+        return;
+    }
+    drop(pool);
+    drop(bytes);
+}
+
 impl Saved {
     /// Whether page `page` is armed.
     fn armed(&self, page: usize) -> bool {
@@ -184,7 +215,10 @@ impl Changed {
 
     /// Page `page` was taken: what it saved of it is stale.
     fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+        let stale = self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+        if let Some(bytes) = stale {
+            recycle(bytes);
+        }
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -198,8 +232,13 @@ impl Changed {
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
-        let mut bytes = vec![0u8; PAGE].into_boxed_slice();
-        if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
+        // A pooled buffer keeps old bytes: a successful read overwrites all
+        // PAGE of them (the kernel fails a partial copy), a failed one is
+        // not kept.
+        let mut bytes = page_buffer();
+        if !crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
+            recycle(bytes);
+        } else {
             saved.bytes.insert(page, bytes);
             #[cfg(feature = "diagnostics")]
             {
@@ -780,7 +819,7 @@ impl Tracked {
         let bytes = std::mem::take(&mut saved.bytes);
         // Freed after the lock: the guard handler may be waiting on it.
         drop(saved);
-        drop(bytes);
+        bytes.into_values().for_each(recycle);
     }
 
     /// The bytes page `page` (a page number) held when it was first written
@@ -1740,6 +1779,31 @@ pub(crate) mod tests {
         all();
         write(2, 5);
         assert_eq!(saved(2), None, "disarmed");
+        drop(t);
+        free(p);
+    }
+
+    /// A save into a pooled buffer holding another page's bytes keeps the
+    /// whole page as it was, none of the old buffer's bytes.
+    #[test]
+    fn a_pooled_save_buffer_holds_only_the_saved_page() {
+        let p = pool(1);
+        // SAFETY: (every write below) bytes of our pool; a guarded page
+        // faults into the handler, which saves it first.
+        let fill = |i: usize| ((i * 7 + 3) % 251) as u8;
+        for i in 0..PAGE {
+            unsafe { ((p + i) as *mut u8).write_volatile(fill(i)) };
+        }
+        let t = track(p, PAGE, true).expect("pool memory is tracked");
+        t.take(p, p + PAGE);
+        t.arm(p, p + PAGE);
+        for _ in 0..4 {
+            recycle(vec![0xAA; PAGE].into_boxed_slice());
+        }
+        unsafe { ((p + 8) as *mut u8).write_volatile(0xEE) };
+        let saved = t.saved(p / PAGE).expect("armed page is saved");
+        assert!(saved.iter().enumerate().all(|(i, &b)| b == fill(i)), "saved bytes are the page's");
+        t.disarm();
         drop(t);
         free(p);
     }
