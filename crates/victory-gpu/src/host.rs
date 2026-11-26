@@ -1069,6 +1069,9 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
+    /// A pipeline sync's barrier is the last thing the title recorded
+    /// (`crate::list`).
+    pub(crate) synced: std::sync::atomic::AtomicBool,
     /// The lists that run those transitions just before this one, one per
     /// place the list has in a submission: each must keep its barriers until
     /// the submission runs.
@@ -1431,6 +1434,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
+                synced: false.into(),
                 preludes: Mutex::default(),
                 pipelines: Mutex::default(),
                 id,
@@ -2184,6 +2188,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.synced.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3746,6 +3751,10 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                tracing::info!(
+                    "pipeline syncs per frame, flags/control calls (barriers): {}",
+                    crate::list::take_syncs(report_frames)
+                );
                 tracing::info!(
                     "host copies kept over changed title memory {:.1}/frame, host-written marks cleared {} in all",
                     crate::texture::HOST_KEPT_STALE.swap(0, Ordering::Relaxed) as f64 / report_frames,

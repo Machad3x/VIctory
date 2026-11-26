@@ -185,10 +185,18 @@ pub(crate) fn start(this: This) -> Submission {
     }
 }
 
+/// [`current_list`], to record into: a later [`sync`] has to wait again.
+#[cfg(windows)]
+pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    let list = current_list(this)?;
+    list.synced.store(false, std::sync::atomic::Ordering::Relaxed);
+    Some(list)
+}
+
 /// The host list a title list's calls record into (its current segment),
 /// if there is a host GPU.
 #[cfg(windows)]
-pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
+fn current_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
@@ -1541,10 +1549,65 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. The host does not
+/// order dispatches of one list by itself, so a sync records a barrier on
+/// every shader write; one that follows a sync with no call recorded in
+/// between adds nothing and records none.
+/// shortcut: the meaning of `flags` and `control` is not known from public
+/// sources, so every sync waits; skip a kind once it is shown not to wait
+/// for shader writes (diagnostics builds count by kind).
+extern "system" fn sync(this: This, flags: u32, control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if let Some(list) = current_list(this) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        let redundant = list.synced.swap(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        count_sync(flags, control, !redundant);
+        if !redundant {
+            #[cfg(test)]
+            SYNC_BARRIERS.with(|n| n.set(n.get() + 1));
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+    let _ = (this, flags, control);
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    /// Barriers [`sync`] recorded on this thread.
+    static SYNC_BARRIERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Syncs by `(flags, control)`: calls, and the barriers they recorded.
+#[cfg(all(windows, feature = "diagnostics"))]
+static SYNCS: std::sync::Mutex<std::collections::BTreeMap<(u32, u32), [u64; 2]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn count_sync(flags: u32, control: u32, barrier: bool) {
+    let mut syncs = SYNCS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = syncs.entry((flags, control)).or_default();
+    n[0] += 1;
+    n[1] += u64::from(barrier);
+}
+
+/// The syncs since the last call, per frame of `frames`, as
+/// `flags/control calls (barriers)`.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn take_syncs(frames: f64) -> String {
+    let syncs = std::mem::take(&mut *SYNCS.lock().unwrap_or_else(|e| e.into_inner()));
+    let kinds: Vec<String> = syncs
+        .iter()
+        .map(|((flags, control), [calls, barriers])| {
+            let (calls, barriers) = (*calls as f64 / frames, *barriers as f64 / frames);
+            format!("{flags:#x}/{control:#x} {calls:.1} ({barriers:.1})")
+        })
+        .collect();
+    kinds.join(", ")
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.

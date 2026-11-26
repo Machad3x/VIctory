@@ -28,6 +28,40 @@ fn thread_dimensions_cover_partial_groups_on_each_axis() {
 
 #[cfg(windows)]
 #[test]
+fn syncs_record_one_barrier_until_something_else_is_recorded() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let null = std::ptr::null();
+    let (mut allocator, mut list) = (null, null);
+    assert_eq!(
+        create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+        S_OK
+    );
+    assert_eq!(
+        create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+        S_OK
+    );
+    let barriers = || SYNC_BARRIERS.with(std::cell::Cell::get);
+    let start = barriers();
+    sync(list, 1, 0, 0, 0);
+    sync(list, 2, 0, 0, 0);
+    assert_eq!(barriers() - start, 1, "consecutive syncs");
+    state::dispatch(list, 1, 1, 1);
+    sync(list, 1, 0, 0, 0);
+    assert_eq!(barriers() - start, 2, "a sync after a dispatch");
+    assert_eq!(close(list), S_OK);
+    assert_eq!(reset(list, allocator, null), S_OK);
+    sync(list, 1, 0, 0, 0);
+    assert_eq!(barriers() - start, 3, "the first sync of a reset list");
+    assert_eq!(close(list), S_OK);
+    for o in [list, allocator] {
+        crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+    }
+}
+
+#[cfg(windows)]
+#[test]
 #[ignore = "requires a D3D12 device with SM 6.6 support"]
 fn dispatch_x_writes_only_requested_threads() {
     #[repr(C)]
