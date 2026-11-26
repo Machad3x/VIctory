@@ -3447,6 +3447,7 @@ impl<'a> Lower<'a> {
     /// `on` (the lanes of mask `mask`, at `at`) without the threads a partial
     /// final group keeps for its barriers, when the mask holds only EXEC's
     /// lanes (`Structured::active`): the console never launched them.
+    // shortcut: a loop that flips EXEC (e.g. s_not_b64 exec) gets no verdict and takes the AND, so unlaunched lanes stay off where the console turns them on; give phis a fixed-point verdict if a title needs it.
     fn launched(&mut self, at: usize, on: V, mask: Value) -> V {
         let Some(a) = self.partial_active else {
             return on;
