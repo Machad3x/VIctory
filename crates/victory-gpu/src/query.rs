@@ -183,6 +183,8 @@ pub(crate) mod counts {
         cross_list: u64,
         early_resolves: u64,
         destinations: Vec<usize>,
+        /// End-of-pipe clock writes: GPU timestamp, raw system clock.
+        clocks: [u64; 2],
     }
 
     #[derive(Default)]
@@ -210,6 +212,10 @@ pub(crate) mod counts {
 
     pub(crate) fn draw_dropped() {
         DRAWS_DROPPED.set(DRAWS_DROPPED.get() + 1);
+    }
+
+    pub(crate) fn clock_write(system: bool) {
+        all().counts.clocks[usize::from(system)] += 1;
     }
 
     pub(crate) fn begin(list: usize, heap: usize, kind: u32, index: u32) {
@@ -269,6 +275,11 @@ pub(crate) mod counts {
             tracing::info!(
                 "{name} queries/frame: {begins:.1} begins, {ends:.1} ends, {resolves:.1} resolves of {queries:.1} queries"
             );
+        }
+        for (name, n) in ["GPU timestamp", "raw clock"].iter().zip(c.clocks) {
+            if n != 0 {
+                tracing::info!("end-of-pipe {name} writes/frame: {:.1}", n as f64 / frames);
+            }
         }
         if c.kinds != [[0; 4]; 5] {
             tracing::info!(

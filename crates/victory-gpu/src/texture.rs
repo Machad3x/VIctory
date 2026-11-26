@@ -958,6 +958,11 @@ impl Staging {
             if !retry && ranges.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
+            #[cfg(feature = "diagnostics")]
+            if !untracked.is_empty() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(memory = ?self.memory, size, "a partly tracked texture is sampled"));
+            }
             // Only the subresources in the pages that changed (streamed
             // textures change page by page; a whole re-read and detile of
             // each cost up to 430 MB a frame, run integ2), and those on

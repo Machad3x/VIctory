@@ -2096,6 +2096,10 @@ pub(crate) extern "system" fn write64(this: This, address: u64, value: u64, _flu
         SYSTEM_TIMESTAMP => Written::SystemTimestamp,
         _ => Written::Value(value),
     };
+    #[cfg(feature = "diagnostics")]
+    if address != 0 && matches!(flags, GPU_TIMESTAMP | SYSTEM_TIMESTAMP) {
+        crate::query::counts::clock_write(flags == SYSTEM_TIMESTAMP);
+    }
     defer_write(this, address, what, 8);
 }
 

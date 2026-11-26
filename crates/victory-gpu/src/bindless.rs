@@ -27,8 +27,8 @@ enum Seen {
     Texture(usize),
     /// A view left without a host view (textures the title placed itself),
     /// by kind (diagnostics: `KINDS`), with a placed texture's address and
-    /// console bytes.
-    Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64)),
+    /// console bytes, and whether it is an unordered view of a 3D one.
+    Left(#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))] (usize, u64, u64, bool)),
 }
 
 /// Kinds of views left without a host view, for the census.
@@ -175,15 +175,16 @@ fn seen(view: &View) -> Option<Seen> {
     Some(Seen::Buffer(shadow, address, len, uav))
 }
 
-fn left_kind(view: &View) -> (usize, u64, u64) {
+fn left_kind(view: &View) -> (usize, u64, u64, bool) {
     match view {
-        View::Placed(_, resource, desc) if resource[0] != 1 => {
+        View::Placed(unordered, resource, desc) if resource[0] != 1 => {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-            (2, address, crate::resource::placed_size(resource).unwrap_or(0))
+            let bytes = crate::resource::placed_size(resource).unwrap_or(0);
+            (2, address, bytes, *unordered && resource[0] == 4)
         }
-        View::Unordered(..) | View::Placed(true, ..) => (1, 0, 0),
-        View::Shader(..) | View::Placed(false, ..) | View::Constant(..) => (0, 0, 0),
-        _ => (3, 0, 0),
+        View::Unordered(..) | View::Placed(true, ..) => (1, 0, 0, false),
+        View::Shader(..) | View::Placed(false, ..) | View::Constant(..) => (0, 0, 0, false),
+        _ => (3, 0, 0, false),
     }
 }
 
@@ -377,12 +378,14 @@ pub(crate) fn log(frames: f64) {
         let (mut buffers, mut textures) = (0u32, 0u32);
         // Placed textures left null: the largest at each address.
         let mut placed = HashMap::new();
+        let mut unordered_3d = 0u32;
         for seen in inner.slots.values() {
             match seen {
                 Seen::Buffer(..) => buffers += 1,
                 Seen::Texture(_) => textures += 1,
-                Seen::Left((k, address, bytes)) => {
+                Seen::Left((k, address, bytes, is_unordered_3d)) => {
                     left[*k] += 1;
+                    unordered_3d += u32::from(*is_unordered_3d);
                     if *k == 2 {
                         let b = placed.entry(*address).or_insert(0u64);
                         *b = (*b).max(*bytes);
@@ -409,7 +412,8 @@ pub(crate) fn log(frames: f64) {
             "heap views: {draws:.0} draws/frame index the heap ({writes:.0} writing through it), \
              {uploaded:.0} textures uploaded/frame; slots: {buffers} buffer views ({} ranges, \
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
-             left null: {} (placed textures at {} addresses, {placed_mb:.0} MB); \
+             left null: {} (placed textures at {} addresses, {placed_mb:.0} MB, \
+             {unordered_3d} unordered 3D slots); \
              host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,

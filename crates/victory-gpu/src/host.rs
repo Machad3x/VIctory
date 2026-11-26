@@ -4176,7 +4176,13 @@ fn title_window() -> Option<HWND> {
 /// a depth target, whose host copy cannot have both).
 pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     // SAFETY: a plain query.
-    legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
+    let legal = legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state);
+    #[cfg(feature = "diagnostics")]
+    if legal & 0x141c != 0 && state & !legal & 0xc0 != 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(state, legal, "shader read states dropped beside a write state"));
+    }
+    legal
 }
 
 /// [`legal_state`] for a texture with resource flags `flags`.
