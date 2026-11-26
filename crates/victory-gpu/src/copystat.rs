@@ -161,6 +161,13 @@ pub(crate) enum C {
     /// holding it.
     HandlerWaitNs,
     HandlerHoldNs,
+    /// In the guard handler: nanoseconds in `Changed::save`, nanoseconds
+    /// in `VirtualProtect` opening pages, pages saved, and nanoseconds
+    /// waiting for trackers' own locks while marking.
+    HandlerSaveNs,
+    HandlerOpenNs,
+    HandlerSaves,
+    HandlerTrackerWaitNs,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -170,6 +177,10 @@ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 /// The guard handler's longest single wait for the guard lock since the
 /// last line, nanoseconds.
 pub(crate) static HANDLER_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
+/// The guard handler's longest single save, and longest single open
+/// (`VirtualProtect`), since the last line, nanoseconds.
+pub(crate) static HANDLER_SAVE_MAX: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HANDLER_OPEN_MAX: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -441,10 +452,16 @@ pub(crate) fn log(frames: f64) {
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.2} ms (longest {longest:.3})", total / frames))
         .collect();
     tracing::info!(
-        "  guard lock per frame: handler waiting {:.2} ms (longest wait {:.3} ms), holding {:.2} ms; others holding {:.2} ms; held by line: {}",
+        "  guard lock per frame: handler waiting {:.2} ms (longest wait {:.3} ms), holding {:.2} ms (saving {:.0} pages {:.2} ms, longest {:.3}; waiting for trackers {:.2} ms; opening {:.2} ms, longest {:.3}); others holding {:.2} ms; held by line: {}",
         c[C::HandlerWaitNs as usize] / 1e6,
         HANDLER_WAIT_MAX.swap(0, Relaxed) as f64 / 1e6,
         handler_hold,
+        c[C::HandlerSaves as usize],
+        c[C::HandlerSaveNs as usize] / 1e6,
+        HANDLER_SAVE_MAX.swap(0, Relaxed) as f64 / 1e6,
+        c[C::HandlerTrackerWaitNs as usize] / 1e6,
+        c[C::HandlerOpenNs as usize] / 1e6,
+        HANDLER_OPEN_MAX.swap(0, Relaxed) as f64 / 1e6,
         (all_held - handler_hold).max(0.0),
         held.join(", ")
     );

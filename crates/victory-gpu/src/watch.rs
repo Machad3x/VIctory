@@ -150,6 +150,32 @@ impl Saved {
     }
 }
 
+/// Set while this thread runs the guard handler (diagnostics): its saves,
+/// tracker lock waits and opens are timed.
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static IN_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The time now, if this thread runs the guard handler (diagnostics).
+#[cfg(feature = "diagnostics")]
+fn handler_clock() -> Option<std::time::Instant> {
+    IN_HANDLER.with(|h| h.get()).then(std::time::Instant::now)
+}
+
+/// Adds the nanoseconds since `t` (from [`handler_clock`]) to `c`, and to
+/// the longest in `max`.
+#[cfg(feature = "diagnostics")]
+fn handler_took(t: Option<std::time::Instant>, c: crate::copystat::C, max: Option<&AtomicU64>) {
+    if let Some(t) = t {
+        let ns = t.elapsed().as_nanos() as u64;
+        crate::copystat::add(c, ns);
+        if let Some(max) = max {
+            max.fetch_max(ns, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Changed {
     /// The changed pages, locked.
     fn pages(&self) -> std::sync::MutexGuard<'_, BTreeSet<usize>> {
@@ -164,7 +190,11 @@ impl Changed {
     /// Page `page` is about to change for the first time since it was
     /// taken: its bytes now, if armed for it.
     fn save(&self, page: usize) {
+        #[cfg(feature = "diagnostics")]
+        let t = handler_clock();
         let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        handler_took(t, crate::copystat::C::HandlerTrackerWaitNs, None);
         if !saved.armed(page) || saved.bytes.contains_key(&page) {
             return;
         }
@@ -172,7 +202,12 @@ impl Changed {
         if crate::host::read_into((page * PAGE) as *const u8, &mut bytes) {
             saved.bytes.insert(page, bytes);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SavedPages, 1);
+            {
+                crate::copystat::add(crate::copystat::C::SavedPages, 1);
+                if t.is_some() {
+                    crate::copystat::add(crate::copystat::C::HandlerSaves, 1);
+                }
+            }
         }
     }
 }
@@ -487,8 +522,12 @@ fn open(g: &mut Guards, page: usize) -> bool {
         return false;
     }
     let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let t = handler_clock();
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
     unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    #[cfg(feature = "diagnostics")]
+    handler_took(t, crate::copystat::C::HandlerOpenNs, Some(&crate::copystat::HANDLER_OPEN_MAX));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, 1);
     true
@@ -685,7 +724,10 @@ impl Tracked {
         let mut saved = self.changed.1.lock().unwrap_or_else(|e| e.into_inner());
         saved.armed.clear();
         saved.unarmed.clear();
-        saved.bytes.clear();
+        let bytes = std::mem::take(&mut saved.bytes);
+        // Freed after the lock: the guard handler may be waiting on it.
+        drop(saved);
+        drop(bytes);
     }
 
     /// The bytes page `page` (a page number) held when it was first written
@@ -871,6 +913,8 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
         let end = guarded[i] + 1;
         i += 1;
         let mut old = 0;
+        #[cfg(feature = "diagnostics")]
+        let t = handler_clock();
         // SAFETY: blocks we made read-only (failing harmlessly if gone).
         let ok = unsafe {
             VirtualProtect(
@@ -880,6 +924,8 @@ fn open_guarded(g: &mut Guards, first: usize, last: usize) {
                 &mut old,
             ) != 0
         };
+        #[cfg(feature = "diagnostics")]
+        handler_took(t, crate::copystat::C::HandlerOpenNs, Some(&crate::copystat::HANDLER_OPEN_MAX));
         if ok {
             for page in start..end {
                 g.protected.remove(&page);
@@ -914,12 +960,20 @@ fn mark(g: &mut Guards, first: usize, last: usize, save: bool, skip: Option<&Arc
     for (&page, holders) in g.holders.range(first..last) {
         for c in holders.iter().filter(|c| skip.is_none_or(|s| !Arc::ptr_eq(c, s))) {
             let first_write = {
+                #[cfg(feature = "diagnostics")]
+                let t = handler_clock();
                 let mut set = c.pages();
+                #[cfg(feature = "diagnostics")]
+                handler_took(t, crate::copystat::C::HandlerTrackerWaitNs, None);
                 set_dirty(c.2, true);
                 set.insert(page)
             };
             if first_write && save {
+                #[cfg(feature = "diagnostics")]
+                let t = handler_clock();
                 c.save(page);
+                #[cfg(feature = "diagnostics")]
+                handler_took(t, crate::copystat::C::HandlerSaveNs, Some(&crate::copystat::HANDLER_SAVE_MAX));
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -1186,6 +1240,19 @@ fn install() {
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+        #[cfg(feature = "diagnostics")]
+        struct InHandler;
+        #[cfg(feature = "diagnostics")]
+        impl Drop for InHandler {
+            fn drop(&mut self) {
+                IN_HANDLER.with(|h| h.set(false));
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let _in_handler = {
+            IN_HANDLER.with(|h| h.set(true));
+            InHandler
+        };
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
