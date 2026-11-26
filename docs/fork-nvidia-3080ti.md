@@ -868,6 +868,18 @@ again and compares them on the GPU: `gpu232` checked 1.24 million records,
 none differed. The timing report now also sums GPU time by command kind,
 since its 25 costliest entries left about 45% of the time unlisted.
 
+### Upper bound of dirty tracking (`gpu233`, `gpu234`)
+
+`VICTORY_MARKS_OFF=15` (diagnostics, measurement only: picture and
+copy-backs are wrong) translates shaders without view write and read
+marks and without title memory write and miss marks. After a compile run
+(`gpu233`), `gpu234` ran at 289 to 300 ms per frame with 88 to 101 ms on
+the GPU, against 304 and 144 ms in `gpu231`. The marks cost about 45 to
+55 ms of GPU time per frame, roughly a third; the frame barely moves
+because about 110 ms of preparation on the CPU then bounds it. Cutting
+marks pays only together with cheaper preparation. The switch is kept as
+a patch, not committed.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
