@@ -4302,16 +4302,18 @@ impl Host {
                 c.fence.SetEventOnCompletion(value, c.event)?;
                 Ok(wait_for_submission(
                     || {
+                        // A removed device signals the event and completes
+                        // every fence at u64::MAX: not a copy that ran.
                         WaitForSingleObject(c.event, WAIT_SLICE_MS) != WAIT_TIMEOUT
-                            && c.fence.GetCompletedValue() >= value
+                            && (value..u64::MAX).contains(&c.fence.GetCompletedValue())
                     },
                     || self.device.GetDeviceRemovedReason().is_err(),
                     |secs| tracing::warn!(secs, "host copy still on the GPU"),
                 ))
             })
         };
-        // The failure report must not find the copier locked.
-        drop(c);
+        // The copier stays locked through a failure report, which takes none
+        // of it: its allocator may still be in use on the GPU.
         match ran {
             Ok(Waited::Done) => {}
             Ok(Waited::Removed) => fail(format_args!("host GPU device removed during a host copy")),
