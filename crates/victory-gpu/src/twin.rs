@@ -112,7 +112,7 @@ fn plane_formats(console: u32) -> Option<&'static [u32]> {
 
 /// The twin of the depth texture `depth`, whose title resource has format
 /// `console`; `None` if the host makes none.
-fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
+pub(crate) fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     let host = host()?;
     let Some(formats) = plane_formats(console) else {
         once(console, 0, 0, "a depth texture of this format gets no writable twin: its unordered writes are dropped");

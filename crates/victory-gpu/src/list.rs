@@ -615,10 +615,38 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("barrier kinds {:?}", barriers.iter().map(|b| b.kind).collect::<Vec<_>>()));
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
+        let emit = |host: &mut Vec<Barrier>| {
+            if host.is_empty() {
+                return;
+            }
+            #[cfg(test)]
+            crate::host::tests::ISSUED.with(|l| {
+                l.borrow_mut().extend(host.iter().filter(|b| b.kind == 0).map(|b| (b.first as usize, (b.second >> 32) as u32, b.last as u32)));
+            });
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+            // SAFETY: the same layout; borrowed resource pointers, never
+            // released through this slice.
+            let view = unsafe {
+                std::slice::from_raw_parts(
+                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
+                    host.len(),
+                )
+            };
+            // SAFETY: an open list and live resources.
+            unsafe { list.list.ResourceBarrier(view) };
+            host.clear();
+        };
+        let mut host: Vec<Barrier> = Vec::new();
+        for b in barriers {
+            // A twin's copy records at once (`crate::twin::route`): the
+            // buffered transitions must come before it.
+            // A split barrier's begin half records nothing: no lookup.
+            if b.kind == 0 && b.flags & 1 == 0 && crate::resource::host_copy(b.first).is_some_and(|c| c.twin.get().is_some_and(Option::is_some)) {
+                emit(&mut host);
+            }
+            host.extend(host_barrier(list, b));
+        }
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
         if barriers.iter().any(|b| {
@@ -626,20 +654,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }) {
             host.push(UAV_BARRIER);
         }
-        if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
-        }
+        emit(&mut host);
     }
     0
 }
@@ -2648,6 +2663,75 @@ mod tests {
         assert_eq!(texel(32, 32), 0x4040_4040, "outside the box: title memory's");
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         for object in [dst, src, title, allocator] {
+            release(object);
+        }
+    }
+
+    /// One batch naming a twin depth twice: the twin's copy comes after the
+    /// transition the batch's first barrier makes (upstream #3129).
+    #[cfg(windows)]
+    #[test]
+    fn a_twin_copy_comes_after_the_batchs_earlier_transitions() {
+        use crate::host::tests::{issued, replay};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::Interface;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut title = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut title),
+            S_OK
+        );
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R16_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let mut depth = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                0x10,
+                null.cast(),
+                &PAGEABLE_IIDS[0],
+                &mut depth,
+            ),
+            S_OK
+        );
+        let copy = crate::resource::host_copy(depth).unwrap();
+        assert!(copy.twin.get_or_init(|| crate::twin::make(53, &copy.texture)).is_some());
+        let list = host_list(title).expect("host command list");
+        issued();
+        // The list's first use records nothing.
+        ensure_state(list, depth, 0x10);
+        let to = |state: u64| Barrier { kind: 0, flags: 0, first: depth, second: 0, last: state };
+        let batch = [to(0x80), to(0x8)];
+        barrier(title, 2, batch.as_ptr());
+        let key = copy.texture.as_raw() as usize;
+        let mut states = std::collections::HashMap::from([(key, 0x10)]);
+        replay(&issued(), &mut states).unwrap();
+        assert_eq!(states[&key], 0x800, "left as the twin copy's source");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        for object in [depth, title, allocator] {
             release(object);
         }
     }
