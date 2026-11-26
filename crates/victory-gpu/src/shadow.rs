@@ -1911,20 +1911,29 @@ pub(crate) fn freed(start: u64, len: u64) -> Freeing {
             gone(copy);
         }
     }
+    // Demand windows touching it go: one is made again once the page persists anew.
+    // Recorded under the lock windows are made under, so none is missed.
+    let mut windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let found: Vec<_> = retired.1.range((start, 0)..(end, 0)).map(|(&key, _)| key).collect();
+        // A replaced demand window may start before the range and reach into it.
+        let lowest = start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        let found: Vec<_> = retired
+            .1
+            .range((lowest, 0)..(end, 0))
+            .filter(|&(&(s, _), w)| {
+                s >= start || w.upgrade().is_some_and(|c| c.demanded() && start < s.saturating_add(c.len))
+            })
+            .map(|(&key, _)| key)
+            .collect();
         for key in found {
             if let Some(copy) = retired.1.remove(&key).and_then(|w| w.upgrade()) {
                 gone(&copy);
             }
         }
     }
-    // Demand windows touching it go: one is made again once the page persists anew.
-    // Recorded under the lock windows are made under, so none is missed.
-    let mut windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     FREEING.lock().unwrap_or_else(|e| e.into_inner()).push((start, end));
-    if DEMANDED.load(Ordering::Relaxed) {
+    if DEMANDED.load(Ordering::Relaxed) != 0 {
         let lowest = start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
         let found: Vec<_> = windows
             .range((lowest, 0)..(end, 0))
@@ -1934,6 +1943,8 @@ pub(crate) fn freed(start: u64, len: u64) -> Freeing {
         for key in &found {
             if let Some(copy) = windows.remove(key) {
                 gone(&copy);
+                DEMANDED.fetch_sub(1, Ordering::Relaxed);
+                crate::memory::DEMAND_FREED.fetch_add(copy.len, Ordering::Relaxed);
             }
         }
         if !found.is_empty() {
@@ -2135,51 +2146,141 @@ fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u6
 /// later ranges in it share), else a new one. None for memory that is not
 /// committed (a stale or null address): 4 MiB of zeros would not help.
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    loose_as(address, end, None)
+    loose_as(address, end, None).map(|(copy, _)| copy)
 }
 
-/// Whether any [`demand`] window was made.
-static DEMANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The longest a plain window grows over demand windows (a longer range of its
+/// own is not limited).
+// shortcut: a range needing more gets no window; split it if that shows.
+const GROWN: u64 = 32 * WINDOW;
 
-/// Shaders keep missing the 64 KiB page at `at` (`frame`): a window copy
-/// for it, also inside a title buffer (whose own copy is not made), if
-/// `room` bytes allow one. Returns whether the page has a demand window
-/// made in this frame, and the bytes made now. None where the page is not
-/// tracked: a copy-back there could undo the title's writes.
-pub(crate) fn demand(at: u64, frame: u64, room: u64) -> (bool, u64) {
-    let end = at.saturating_add(PAGE as u64);
+/// [`demand`] windows in `LOOSE`. Changed under its lock.
+static DEMANDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most [`demand`] windows at once. Each takes a view pair: a capped view
+/// heap keeps 8192 for all copies (the world's others take ~4,700), and pairs
+/// past those come out of the slots draws need.
+const DEMAND_WINDOWS: usize = 2048;
+
+/// Why [`demand`] made no window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Refused {
+    /// A window made earlier holds the page.
+    Covered,
+    /// No room left for a page.
+    Budget,
+    /// [`DEMAND_WINDOWS`] exist.
+    Windows,
+    /// Not tracked: a copy-back there could undo the title's writes.
+    Untracked,
+    /// The memory is being freed.
+    Freeing,
+    /// Not readable, or no host buffer.
+    Failed,
+}
+
+/// Shaders keep missing the `pages` 64 KiB pages from `at` (`frame`): one
+/// window copy for as many of them from `at` as `room` bytes allow, up to the
+/// first page a window holds, being freed or not tracked; also inside a title
+/// buffer (whose own copy is not made). Returns how many pages the answer is
+/// for (at least 1): they have a demand window made in this frame, with the
+/// bytes made now, or none for the reason given.
+pub(crate) fn demand(at: u64, pages: u64, frame: u64, room: u64) -> (u64, Result<u64, Refused>) {
+    let page = PAGE as u64;
     let this = frame.wrapping_add(1);
-    {
+    let n = {
         let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(copy) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), at, end) {
-            return (copy.demand.load(Ordering::Relaxed) == this, 0);
+        let span = LOOSE_SPAN.load(Ordering::Relaxed);
+        let held = |a: u64| enclosing_window(&map, span, a, a.saturating_add(page));
+        if let Some(copy) = held(at) {
+            let ours = copy.demand.load(Ordering::Relaxed) == this;
+            return (1, if ours { Ok(0) } else { Err(Refused::Covered) });
         }
+        if room < page {
+            return (1, Err(Refused::Budget));
+        }
+        if DEMANDED.load(Ordering::Relaxed) >= DEMAND_WINDOWS {
+            return (1, Err(Refused::Windows));
+        }
+        let freeing = FREEING.lock().unwrap_or_else(|e| e.into_inner());
+        (0..pages.min(room / page))
+            .take_while(|i| {
+                let a = at.saturating_add(i * page);
+                held(a).is_none() && !freeing.iter().any(|&(s, e)| a < e && s < a.saturating_add(page))
+            })
+            .count() as u64
+    };
+    if n == 0 {
+        return (1, Err(Refused::Freeing));
     }
-    if room < WINDOW {
-        return (false, 0);
+    // `loose_as` asks this of the first page only, and fails the whole run.
+    if !crate::texture::committed(at as *const u8, 1) {
+        return (1, Err(Refused::Failed));
     }
-    match loose_as(at, end, Some(this)) {
-        // Another thread may have made it meanwhile: not ours then.
-        Some(copy) if copy.demand.load(Ordering::Relaxed) == this => (true, copy.len),
-        _ => (false, 0),
+    let tracked = crate::watch::runtime_pages(at as usize, at.saturating_add(n * page) as usize, true);
+    let n = (0..n).take_while(|i| tracked.contains(&((at / page + i) as usize))).count() as u64;
+    if n == 0 {
+        return (1, Err(Refused::Untracked));
+    }
+    match loose_as(at, at.saturating_add(n * page), Some(this)) {
+        Some((copy, true)) => (n, Ok(copy.len)),
+        // Another thread made one meanwhile: no new bytes, only the pages it holds.
+        Some((copy, false)) => {
+            let held = if copy.start <= at { (copy.start + copy.len).saturating_sub(at) / page } else { 0 };
+            if copy.demand.load(Ordering::Relaxed) == this && held > 0 {
+                (held.min(n), Ok(0))
+            } else {
+                (1, Err(Refused::Covered))
+            }
+        }
+        None => (n, Err(Refused::Failed)),
     }
 }
 
-/// [`loose`], a window made now marked with `demand` ([`Shadow::demand`]).
-fn loose_as(address: u64, end: u64, demand: Option<u64>) -> Option<Arc<Shadow>> {
+/// [`loose`], a window made now marked with `demand` ([`Shadow::demand`]);
+/// `true` with a window made now. A demand window is not made over another
+/// window: that one is returned. A plain window grows over the demand windows
+/// it touches and replaces them, so that no page has copies of both kinds to
+/// go back from; none is made if that takes more than [`GROWN`].
+fn loose_as(address: u64, end: u64, demand: Option<u64>) -> Option<(Arc<Shadow>, bool)> {
     if address < LOWEST_MAPPED {
         return None;
     }
-    let start = address & !(WINDOW - 1);
-    let len = end.checked_next_multiple_of(WINDOW)? - start;
+    let align = if demand.is_some() { PAGE as u64 } else { WINDOW };
+    let mut start = address & !(align - 1);
+    let mut stop = end.checked_next_multiple_of(align)?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
-        return Some(shadow.clone());
+        return Some((shadow.clone(), false));
     }
-    let overlaps = |&(s, e): &(u64, u64)| start < e && s < start + len;
-    if demand.is_some() && FREEING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(overlaps) {
-        return None;
+    let mut replaced = Vec::new();
+    if demand.is_some() {
+        if FREEING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(s, e)| start < e && s < stop) {
+            return None;
+        }
+        // A window may have been made in the range since `demand` clipped it.
+        let lowest = start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        if let Some((_, other)) = map.range((lowest, 0)..(stop, 0)).find(|&(&(s, l), _)| start < s.saturating_add(l)) {
+            return Some((other.clone(), false));
+        }
+    } else if DEMANDED.load(Ordering::Relaxed) != 0 {
+        let most = GROWN.max(stop - start);
+        // Growing may reach further demand windows.
+        loop {
+            let lowest = start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+            let next = map.range((lowest, 0)..(stop, 0)).find(|&(&(s, l), copy)| {
+                copy.demanded() && start < s.saturating_add(l) && !replaced.contains(&(s, l))
+            });
+            let Some((&(s, l), _)) = next else { break };
+            replaced.push((s, l));
+            start = start.min(s & !(WINDOW - 1));
+            stop = stop.max(s.saturating_add(l).checked_next_multiple_of(WINDOW)?);
+            if stop - start > most {
+                return None;
+            }
+        }
     }
+    let len = stop - start;
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
@@ -2198,12 +2299,20 @@ fn loose_as(address: u64, end: u64, demand: Option<u64>) -> Option<Arc<Shadow>> 
             return None;
         }
         shadow.demand.store(made, Ordering::Relaxed);
-        DEMANDED.store(true, Ordering::Relaxed);
+        DEMANDED.fetch_add(1, Ordering::Relaxed);
+    }
+    // Not gone: what lists holding one wrote still goes back, until [`freed`].
+    for key in replaced {
+        if let Some(old) = map.remove(&key) {
+            retire(&old);
+            DEMANDED.fetch_sub(1, Ordering::Relaxed);
+            crate::memory::DEMAND_FREED.fetch_add(old.len, Ordering::Relaxed);
+        }
     }
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
-    Some(shadow)
+    Some((shadow, true))
 }
 
 /// The copy a buffer view of `len` bytes at `address`, whose elements are
@@ -4348,23 +4457,46 @@ void main(uint3 id : SV_DispatchThreadID) {
         let p = crate::watch::tests::pool(pages);
         let at = (p as u64).next_multiple_of(WINDOW);
         register(p, p as u64, (pages * PAGE) as u64);
-        assert_eq!(demand(at, 7, WINDOW - 1), (false, 0), "no room");
-        assert_eq!(demand(at, 7, WINDOW), (true, WINDOW));
-        assert_eq!(demand(at + PAGE as u64, 7, 0), (true, 0), "the same window");
-        assert_eq!(demand(at, 8, WINDOW), (false, 0), "made earlier, still missed");
+        let page = PAGE as u64;
+        assert_eq!(demand(at, 2, 7, page - 1), (1, Err(Refused::Budget)));
+        assert_eq!(demand(at + 2 * page, 1, 7, page), (1, Ok(page)), "a page, not 256 KiB");
+        assert_eq!(demand(at, 4, 7, 4 * page), (2, Ok(2 * page)), "up to the next window");
+        assert_eq!(demand(at + page, 1, 7, 0), (1, Ok(0)), "the same window");
+        assert_eq!(demand(at, 1, 8, page), (1, Err(Refused::Covered)), "made earlier, still missed");
+        assert_eq!(demand(at + 3 * page, 3, 7, 2 * page), (2, Ok(2 * page)), "what the room allows");
         assert!(buffers().get(&(p as u64, p)).unwrap().shadow.is_none());
         let copy = loose(at, at + 4).unwrap();
         assert!(copy.demanded());
+        let (other, made) = loose_as(at + page, at + 3 * page, Some(10)).unwrap();
+        assert!(!made);
+        assert_ne!(other.demand.load(Ordering::Relaxed), 10, "overlaps windows: none made");
         unregister(p, p as u64);
-        drop(freed(at + PAGE as u64, PAGE as u64));
+        let returned = crate::memory::DEMAND_FREED.load(Ordering::Relaxed);
+        drop(freed(at + page, page));
+        assert_eq!(crate::memory::DEMAND_FREED.load(Ordering::Relaxed), returned + 2 * page);
         assert!(copy.gone.load(Ordering::Relaxed));
-        assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(at, WINDOW)));
-        let freeing = freed(at, PAGE as u64);
-        assert_eq!(demand(at, 9, WINDOW), (false, 0), "being freed");
+        assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(at, 2 * page)));
+        let freeing = freed(at + page, page);
+        assert_eq!(demand(at + page, 1, 9, page), (1, Err(Refused::Freeing)));
+        assert_eq!(demand(at, 2, 9, 2 * page), (1, Ok(page)), "up to the memory being freed");
         drop(freeing);
-        assert_eq!(demand(at, 9, WINDOW), (true, WINDOW));
-        drop(freed(at, PAGE as u64));
+        assert_eq!(demand(at + page, 1, 9, page), (1, Ok(page)));
+        drop(freed(at, 2 * WINDOW));
+        assert_eq!(demand(at + 3 * page, 2, 11, 2 * page), (2, Ok(2 * page)));
+        let returned = crate::memory::DEMAND_FREED.load(Ordering::Relaxed);
+        let old = loose(at + 3 * page, at + 3 * page + 4).unwrap();
+        let plain = loose(at + 5 * page - 4, at + 5 * page + 4).unwrap();
+        assert!(!plain.demanded());
+        assert_eq!(plain.range(), (at, 2 * WINDOW), "grown over the demand window");
+        assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(at + 3 * page, 2 * page)));
+        assert_eq!(crate::memory::DEMAND_FREED.load(Ordering::Relaxed), returned + 2 * page);
+        // The replaced window starts before the freed page and reaches into it.
+        assert!(!old.gone.load(Ordering::Relaxed));
+        drop(freed(at + 4 * page, page));
+        assert!(old.gone.load(Ordering::Relaxed));
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).remove(&(at, 2 * WINDOW));
         crate::watch::tests::free(p);
+        a_plain_window_grows_over_demand_windows_only_so_far();
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         // SAFETY: a fresh reservation, released below.
         let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as usize;
@@ -4372,9 +4504,28 @@ void main(uint3 id : SV_DispatchThreadID) {
         let at = r.next_multiple_of(WINDOW as usize);
         // SAFETY: a page of our reservation: plain memory, beside reserved (tracked) pages.
         assert!(!unsafe { VirtualAlloc(at as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
-        assert_eq!(demand(at as u64, 7, WINDOW), (false, 0), "the missed page is not tracked");
+        assert_eq!(demand(at as u64, 1, 7, WINDOW), (1, Err(Refused::Untracked)));
         // SAFETY: our reservation.
         unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Run by the test above: both count [`crate::memory::DEMAND_FREED`].
+    fn a_plain_window_grows_over_demand_windows_only_so_far() {
+        let run = 16 * WINDOW;
+        let p = crate::watch::tests::pool(4 * run as usize / PAGE);
+        let at = (p as u64).next_multiple_of(WINDOW);
+        let page = PAGE as u64;
+        let pages = run / page;
+        for i in 0..3 {
+            assert_eq!(demand(at + i * run, pages, 7, run), (pages, Ok(run)));
+        }
+        assert!(loose(at + run - 4, at + 2 * run + 4).is_none(), "three runs: past GROWN");
+        assert!(loose(at, at + 4).unwrap().demanded(), "left in place");
+        let two = loose(at + run - 4, at + run + 4).unwrap();
+        assert_eq!(two.range(), (at, 2 * run));
+        drop(freed(at, 3 * run));
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).remove(&(at, 2 * run));
+        crate::watch::tests::free(p);
     }
 
     /// A 64 KiB page whose leading 4 KiB OS page is reserved while the rest is

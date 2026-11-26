@@ -409,7 +409,7 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
 /// shortcut: memory reserved when the range is tracked counts as the
 /// runtime's; another allocator committing it before the first take would
 /// have it guarded.
-fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
+pub(crate) fn runtime_pages(start: usize, end: usize, views: bool) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };

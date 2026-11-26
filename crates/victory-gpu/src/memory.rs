@@ -37,9 +37,10 @@
 //! marked region gets a block of null entries, so that later submissions mark
 //! its pages, and [`log_frame`] reports which pages stay missed. With
 //! `VICTORY_DEMAND_COPIES=1` (an experiment, any build) the same is counted,
-//! and committed pages missed in [`PERSISTENT`] of 16 frames get small
-//! copies of their own ([`crate::shadow::demand`]), up to
-//! `VICTORY_DEMAND_COPIES_MB` MiB (256) made in all.
+//! and committed pages missed in [`PERSISTENT`] of 16 frames get copies of
+//! their own at the frame's end, one for each contiguous run up to
+//! [`DEMAND_RUN`] pages ([`crate::shadow::demand`]), up to
+//! `VICTORY_DEMAND_COPIES_MB` MiB (512) made in all.
 //! shortcut: a page two copies share without either holding all of it is
 //! the larger one's.
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
@@ -54,7 +55,7 @@ use windows::Win32::Graphics::Direct3D12::{
 use crate::descriptor::host::HostHeap;
 use crate::fx;
 use crate::host::HostList;
-use crate::shadow::Shadow;
+use crate::shadow::{Refused, Shadow};
 
 /// Pages per level-2 block: 4096 pages of 64 KiB, 256 MiB.
 const BLOCK: usize = 4096;
@@ -303,6 +304,26 @@ fn retake_dropped() {
 /// Logs what title memory did since the last call, if anything: a line per
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
+    if let Some(budget) = demand_budget() {
+        let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        // The lock is not held while copies are made: list completions take it.
+        let started = std::time::Instant::now();
+        let due = MISSES_SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(|m| {
+                m.bytes = m.bytes.saturating_sub(DEMAND_FREED.swap(0, std::sync::atomic::Ordering::Relaxed));
+                (m.due(committed), budget.saturating_sub(m.bytes))
+            });
+        if let Some((due, room)) = due {
+            let answers = ask(&due, room, |at, pages, room| crate::shadow::demand(at, pages, frame, room));
+            if let Some(m) = MISSES_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                m.record(&due, answers);
+                m.took_now += started.elapsed();
+            }
+        }
+    }
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
     let s = stats(std::mem::take);
@@ -339,13 +360,21 @@ pub(crate) fn log_frame() {
         );
         if demand_budget().is_some() {
             tracing::info!(
-                "demand copies this frame: {} bytes made ({} in all), {} persistent pages healed, still missed \
-                 {} committed and {} empty",
+                "demand copies this frame: {} bytes made ({} in all) in {} us, {} persistent pages healed, still missed \
+                 {} committed and {} empty; pages refused: {} in an earlier window, {} no budget, {} window limit, \
+                 {} untracked, {} being freed, {} creation failed",
                 std::mem::take(&mut m.bytes_now),
                 m.bytes,
+                std::mem::take(&mut m.took_now).as_micros(),
                 std::mem::take(&mut m.healed),
                 std::mem::take(&mut m.left_committed),
-                std::mem::take(&mut m.left_empty)
+                std::mem::take(&mut m.left_empty),
+                std::mem::take(&mut m.refused[Refused::Covered as usize]),
+                std::mem::take(&mut m.refused[Refused::Budget as usize]),
+                std::mem::take(&mut m.refused[Refused::Windows as usize]),
+                std::mem::take(&mut m.refused[Refused::Untracked as usize]),
+                std::mem::take(&mut m.refused[Refused::Freeing as usize]),
+                std::mem::take(&mut m.refused[Refused::Failed as usize])
             );
         }
     }
@@ -554,7 +583,7 @@ fn demand_budget() -> Option<u64> {
     static BUDGET: std::sync::LazyLock<Option<u64>> = std::sync::LazyLock::new(|| {
         std::env::var_os("VICTORY_DEMAND_COPIES").filter(|v| v == "1")?;
         let mib = std::env::var("VICTORY_DEMAND_COPIES_MB").ok().and_then(|v| v.parse::<u64>().ok());
-        Some(mib.unwrap_or(256).saturating_mul(1 << 20))
+        Some(mib.unwrap_or(512).saturating_mul(1 << 20))
     });
     *BUDGET
 }
@@ -575,6 +604,12 @@ fn wanted() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>>
 /// the title's rings come back to a page every few frames, never twice in a
 /// row.
 const PERSISTENT: u32 = 2;
+
+/// The most 64 KiB pages one demand copy is asked for (4 MiB).
+const DEMAND_RUN: usize = 64;
+
+/// The most demand copies made or attempted at one frame's end: the present waits.
+const DEMAND_PER_FRAME: usize = 64;
 
 /// A missed page: the last frame it was, and which of the 16 frames up to it
 /// it was missed in (bit 0 the last).
@@ -598,14 +633,21 @@ struct Misses {
     committed: u64,
     persistent: u64,
     persistent_now: u64,
-    /// Bytes of demand copies, since the start and since the last report.
+    /// Bytes of demand copies, since the start (less those of copies
+    /// removed) and since the last report.
     bytes: u64,
     bytes_now: u64,
+    /// Time the frame ends spent on copies since the last report.
+    took_now: std::time::Duration,
     /// Persistent pages since the last report: given a copy, or still
     /// missed with memory there or with none.
     healed: u64,
     left_committed: u64,
     left_empty: u64,
+    /// Pages refused a copy since the last report, by [`Refused`].
+    refused: [u64; 6],
+    /// Persistent pages waiting for the frame's end.
+    eligible: Vec<u64>,
 }
 
 impl Misses {
@@ -640,39 +682,105 @@ impl Misses {
         persistent
     }
 
-    /// The persistent page at `at` was missed in `frame`: asks `copy` (the
-    /// bytes it may still make; whether the page has a copy as of this frame,
-    /// and the bytes it made) until one succeeds while the page stays
-    /// persistent, if it is committed: after a failure, again 16 frames on.
+    /// [`due`](Misses::due), [`ask`] and [`record`](Misses::record) in one.
+    #[cfg(test)]
     fn heal(
         &mut self,
-        at: u64,
         budget: u64,
-        committed: impl FnOnce() -> bool,
-        copy: impl FnOnce(u64) -> (bool, u64),
+        committed: impl Fn(u64) -> bool,
+        copy: impl FnMut(u64, u64, u64) -> (u64, Result<u64, Refused>),
     ) {
-        let Some(page) = self.pages.get_mut(&at) else { return };
-        // A tried page has its copy: not queried again.
-        if !page.tried && page.failed.is_none_or(|f| page.last - f >= 16) {
-            if !committed() {
+        let due = self.due(committed);
+        let answers = ask(&due, budget.saturating_sub(self.bytes), copy);
+        self.record(&due, answers);
+    }
+
+    /// Takes the [`eligible`](Misses::eligible) pages to ask copies for, the
+    /// committed ones, sorted: each page until it succeeds while it stays
+    /// persistent, after a failure again 16 frames on.
+    fn due(&mut self, committed: impl Fn(u64) -> bool) -> Vec<u64> {
+        let mut due = std::mem::take(&mut self.eligible);
+        due.sort_unstable();
+        due.dedup();
+        due.retain(|&at| {
+            let Some(page) = self.pages.get(&at) else { return false };
+            // A tried page has its copy: not queried again.
+            if page.tried || page.failed.is_some_and(|f| page.last - f < 16) {
+                self.left_committed += 1;
+                false
+            } else if !committed(at) {
                 self.left_empty += 1;
-                return;
+                false
+            } else {
+                true
             }
-            let (healed, made) = copy(budget.saturating_sub(self.bytes));
-            page.tried = healed;
-            page.failed = (!healed).then_some(page.last);
-            self.bytes += made;
-            self.bytes_now += made;
-            if healed {
-                self.healed += 1;
-                return;
+        });
+        due
+    }
+
+    /// What [`ask`] answered for the pages of `due`, in order.
+    fn record(&mut self, due: &[u64], answers: Vec<(u64, Result<u64, Refused>)>) {
+        let mut rest = due;
+        for (n, made) in answers {
+            let (answered, left) = rest.split_at(n as usize);
+            rest = left;
+            for at in answered {
+                if let Some(page) = self.pages.get_mut(at) {
+                    page.tried = made.is_ok();
+                    page.failed = made.is_err().then_some(page.last);
+                }
+            }
+            match made {
+                Ok(bytes) => {
+                    self.bytes += bytes;
+                    self.bytes_now += bytes;
+                    self.healed += n;
+                }
+                Err(why) => {
+                    self.refused[why as usize] += n;
+                    self.left_committed += n;
+                }
             }
         }
-        self.left_committed += 1;
+        self.left_committed += rest.len() as u64;
     }
 }
 
+/// Asks `copy` for the pages of `due` in contiguous runs (first page, pages,
+/// the bytes it may still make of `room`; how many pages it answers for, and
+/// the bytes it made for them to have a copy as of this frame, or why they
+/// have none), until [`DEMAND_PER_FRAME`] copies were made or attempted: the
+/// pages left wait for their next miss.
+fn ask(
+    due: &[u64],
+    mut room: u64,
+    mut copy: impl FnMut(u64, u64, u64) -> (u64, Result<u64, Refused>),
+) -> Vec<(u64, Result<u64, Refused>)> {
+    let (mut rest, mut answers, mut tries) = (due, Vec::new(), 0);
+    while tries < DEMAND_PER_FRAME
+        && let Some(&first) = rest.first()
+    {
+        let run = rest
+            .iter()
+            .take(DEMAND_RUN)
+            .zip(0u64..)
+            .take_while(|&(&at, i)| at == first + (i << 16))
+            .count();
+        let (n, made) = copy(first, run as u64, room);
+        rest = &rest[n as usize..];
+        room = room.saturating_sub(made.unwrap_or(0));
+        // Answers that made nothing and cost nothing are not counted.
+        tries += usize::from(!matches!(made, Ok(0) | Err(Refused::Covered | Refused::Budget | Refused::Windows)));
+        answers.push((n, made));
+    }
+    answers
+}
+
 static MISSES_SEEN: Mutex<Option<Misses>> = Mutex::new(None);
+
+/// Bytes of demand copies removed since the last frame's end: back in the
+/// budget.
+pub(crate) static DEMAND_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether any of the 64 KiB at `at` is committed (private or mapped).
 fn committed(at: u64) -> bool {
@@ -695,7 +803,7 @@ fn committed(at: u64) -> bool {
 
 /// A list run missed `pages` and `regions` (256 MiB, no block yet): counts
 /// the pages and asks for blocks for the regions. With a demand budget,
-/// persistent pages get copies.
+/// persistent pages wait for copies ([`Misses::heal`]).
 fn measure_misses(pages: &[u64], regions: &[usize]) {
     wanted().extend(regions);
     if !pages.is_empty() {
@@ -703,10 +811,8 @@ fn measure_misses(pages: &[u64], regions: &[usize]) {
         let mut misses = MISSES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let misses = misses.get_or_insert_default();
         for &at in pages {
-            if misses.note(at, frame, || committed(at))
-                && let Some(budget) = demand_budget()
-            {
-                misses.heal(at, budget, || committed(at), |room| crate::shadow::demand(at, frame, room));
+            if misses.note(at, frame, || committed(at)) && demand_budget().is_some() {
+                misses.eligible.push(at);
             }
         }
     }
@@ -991,27 +1097,63 @@ mod tests {
     #[test]
     fn persistent_committed_pages_ask_for_a_copy_once() {
         let mut m = Misses::default();
+        let miss = |m: &mut Misses, frame| {
+            assert!(m.note(0x10000, frame, || true));
+            m.eligible.push(0x10000);
+        };
         assert!(!m.note(0x10000, 0, || true));
-        assert!(m.note(0x10000, 8, || true));
-        m.heal(0x10000, 100, || false, |_| panic!("nothing there"));
-        m.heal(0x10000, 100, || true, |room| (true, room - 40));
-        assert!(m.note(0x10000, 16, || true));
-        m.heal(0x10000, 100, || panic!("not queried"), |_| panic!("asked already"));
+        miss(&mut m, 8);
+        m.heal(100, |_| false, |_, _, _| panic!("nothing there"));
+        m.eligible.push(0x10000);
+        m.heal(100, |_| true, |_, _, room| (1, Ok(room - 40)));
+        miss(&mut m, 16);
+        m.heal(100, |_| panic!("not queried"), |_, _, _| panic!("asked already"));
         assert_eq!((m.bytes, m.healed, m.left_committed, m.left_empty), (60, 1, 1, 1));
         // After sixteen frames unmissed it asks again, with the rest.
         m.note(0x10000, 40, || true);
-        assert!(m.note(0x10000, 48, || true));
-        m.heal(0x10000, 100, || true, |room| {
+        miss(&mut m, 48);
+        m.heal(100, |_| true, |_, _, room| {
             assert_eq!(room, 40);
-            (false, 0)
+            (1, Err(Refused::Budget))
         });
-        assert_eq!((m.bytes, m.left_committed), (60, 2));
+        assert_eq!((m.bytes, m.left_committed, m.refused[Refused::Budget as usize]), (60, 2, 1));
         // A failed copy is asked for again, sixteen frames on.
-        assert!(m.note(0x10000, 49, || true));
-        m.heal(0x10000, 100, || panic!("too soon"), |_| panic!("too soon"));
-        assert!(m.note(0x10000, 64, || true));
-        m.heal(0x10000, 100, || true, |room| (true, room));
+        miss(&mut m, 49);
+        m.heal(100, |_| panic!("too soon"), |_, _, _| panic!("too soon"));
+        miss(&mut m, 64);
+        m.heal(100, |_| true, |_, _, room| (1, Ok(room)));
         assert_eq!((m.bytes, m.healed, m.left_committed), (100, 2, 3));
+    }
+
+    /// Contiguous pages are asked for together, sorted, at most 4 MiB at a
+    /// time; what an answer leaves out is asked for again.
+    #[test]
+    fn contiguous_pages_are_asked_for_together() {
+        let mut m = Misses::default();
+        let pages: Vec<u64> = (1..=70u64).chain([80, 82, 83]).map(|p| p << 16).collect();
+        for &at in pages.iter().rev() {
+            m.note(at, 0, || true);
+            assert!(m.note(at, 1, || true));
+            m.eligible.push(at);
+        }
+        let mut asked = Vec::new();
+        m.heal(1 << 30, |_| true, |at, n, _| {
+            asked.push((at >> 16, n));
+            if at >> 16 == 82 { (1, Err(Refused::Untracked)) } else { (n, Ok(n << 16)) }
+        });
+        assert_eq!(asked, [(1, 64), (65, 6), (80, 1), (82, 2), (83, 1)]);
+        assert_eq!((m.healed, m.refused[Refused::Untracked as usize]), (72, 1));
+    }
+
+    #[test]
+    fn one_frame_makes_a_bounded_number_of_copies() {
+        let due: Vec<u64> = (0..2 * DEMAND_PER_FRAME as u64).map(|p| p << 17).collect();
+        assert_eq!(ask(&due, 1 << 30, |_, n, _| (n, Ok(n << 16))).len(), DEMAND_PER_FRAME);
+        assert_eq!(ask(&due, 0, |_, _, _| (1, Err(Refused::Budget))).len(), due.len());
+        let mut m = Misses::default();
+        m.heal(1 << 30, |_| true, |_, _, _| panic!("nothing eligible"));
+        m.record(&due, ask(&due, 1 << 30, |_, n, _| (n, Ok(n << 16))));
+        assert_eq!(m.healed + m.left_committed, due.len() as u64);
     }
 
     /// A demand copy gives a whole page to any other copy, even a larger one.
