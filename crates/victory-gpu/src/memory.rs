@@ -568,10 +568,15 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // SAFETY: the read-back bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
         marks.iter().enumerate().any(|(w, &mark)| {
-            (0..32).filter(|b| mark >> b & 1 != 0).any(|b| {
-                let entry = w * 32 + b;
-                entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none())
-            })
+            let mut bits = mark;
+            while bits != 0 {
+                let entry = w * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none()) {
+                    return true;
+                }
+            }
+            false
         })
     });
     list.defer_after(move || {
