@@ -198,6 +198,8 @@ pub(crate) enum C {
     DrainSyncExec,
     DrainPresent,
     DrainFree,
+    /// Title fence polls (`GetCompletedValue`), waiting or not.
+    FlightFencePolls,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -585,7 +587,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}",
+        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}",
         c[C::FlightPrepNs as usize] / 1e6,
         c[C::FlightSyncHeapsNs as usize] / 1e6,
         c[C::FlightGpuWaitNs as usize] / 1e6,
@@ -595,6 +597,7 @@ pub(crate) fn log(frames: f64) {
         c[C::DrainSyncExec as usize],
         c[C::DrainPresent as usize],
         c[C::DrainFree as usize],
+        c[C::FlightFencePolls as usize],
     );
     let times = crate::watch::held_times();
     let handler_hold = c[C::HandlerHoldNs as usize] / 1e6;

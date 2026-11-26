@@ -85,18 +85,21 @@ extern "system" fn release(this: This) -> u32 {
 }
 extern "system" fn completed(this: This) -> u64 {
     #[cfg(all(windows, feature = "diagnostics"))]
-    crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::copystat::add(crate::copystat::C::FlightFencePolls, 1);
     // A title polling for a value: held work that may run now does first.
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
-    #[cfg(all(windows, feature = "diagnostics"))]
-    crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    if fence.value.load(Ordering::Acquire) >= value {
+    let completed = fence.value.load(Ordering::Acquire);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if value > completed && !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if completed >= value {
         if !event.is_null() {
             set_event(event as usize);
         }

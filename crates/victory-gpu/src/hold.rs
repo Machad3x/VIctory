@@ -148,7 +148,7 @@ impl<S> Held<S> {
                             }
                             // Flight study: reads what earlier submissions wrote.
                             #[cfg(all(windows, feature = "diagnostics"))]
-                            if !waits.is_empty() {
+                            if !waits.is_empty() && !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             let mut ok = true;
@@ -177,7 +177,9 @@ impl<S> Held<S> {
                         }
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
                             #[cfg(all(windows, feature = "diagnostics"))]
-                            crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let ok = (w.fence)(*fence) >= *value;
                             if !ok {
                                 *fresh = false;
