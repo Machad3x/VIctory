@@ -230,7 +230,7 @@ fn take_others(host: &mut [u8], title: &[u8], runs: &[(usize, usize)]) {
 /// later copy-back of the page put the copy's older bytes over them.)
 fn take_and_read(t: &crate::watch::Tracked, page: usize, from: usize, host: &mut [u8]) {
     t.taken(&[page / PAGE]);
-    crate::host::read_into(from as *const u8, host);
+    crate::host::read_back(from as *const u8, host);
 }
 
 thread_local! {
@@ -451,7 +451,7 @@ impl Shadow {
         let host =
             unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
         let title = &mut title[..n];
-        let read = crate::host::read_into(from as *const u8, title);
+        let read = crate::host::read_back(from as *const u8, title);
         #[cfg(test)]
         tests::after_read();
         // Our own write below must not save the page for this copy again.
@@ -712,7 +712,7 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                if host != old && crate::host::read_back((start + at) as *const u8, title) {
                     // The GPU's bytes go into title memory, and no others:
                     // the title writes the piece meanwhile.
                     let runs = differing(host, title, Some(&*old));
@@ -867,7 +867,7 @@ impl Shadow {
                 // SAFETY: inside the mapping (a page the copy holds whole);
                 // only the submitting thread writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), PAGE) };
-                crate::host::read_into((page * PAGE) as *const u8, host);
+                crate::host::read_back((page * PAGE) as *const u8, host);
                 self.push(at, PAGE);
             }
         }

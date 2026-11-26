@@ -2936,6 +2936,22 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// [`read_into`] for the copy-back, which reads thousands of mapped pages a
+/// frame: in user mode ([`crate::title_copy`]), where a fault costs an
+/// exception and reaches handlers the title added later. So not for reads
+/// that often fail, nor under the guard lock or in the fault handler.
+/// `VICTORY_USER_READS=0`: through the kernel.
+pub(crate) fn read_back(src: *const u8, dst: &mut [u8]) -> bool {
+    static USER: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_USER_READS").is_none_or(|v| v != "0"));
+    if *USER {
+        // SAFETY: `dst` is the caller's host memory of that length.
+        unsafe { crate::title_copy::copy(dst.as_mut_ptr(), src, dst.len()) }
+    } else {
+        read_into(src, dst)
+    }
+}
+
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
@@ -2985,7 +3001,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 
 #[cfg(test)]
 mod title_copies {
-    use super::{copy_mapped, write_mapped};
+    use super::{copy_mapped, read_back, write_mapped};
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
         VirtualAlloc, VirtualFree, VirtualProtect,
@@ -3046,6 +3062,17 @@ mod title_copies {
         assert!(to[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
         assert!(to[2 * BLOCK..].iter().all(|&b| b == 7));
         release(holes);
+    }
+
+    #[test]
+    fn copy_back_reads_fail_at_unmapped_pages() {
+        let from = holed(7);
+        let mut to = vec![0xeeu8; 3 * BLOCK];
+        assert!(!read_back(from, &mut to));
+        assert!(to[BLOCK..].iter().all(|&b| b == 0xee));
+        assert!(read_back(from, &mut to[..BLOCK]));
+        assert!(to[..BLOCK].iter().all(|&b| b == 7));
+        release(from);
     }
 
     #[test]
