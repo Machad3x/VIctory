@@ -3334,6 +3334,34 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
     }
 
+    /// A host write's mark goes once the title writes every page of the
+    /// texture's memory after it, not before.
+    #[test]
+    fn a_host_mark_goes_when_the_title_overwrites_all_its_memory() {
+        use crate::watch::PAGE;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // RGBA8 256x256, linear: four pages.
+        let address = crate::watch::tests::pool(4);
+        let object = texture_at_address(address as u64, &texture_words(256, 256, 28, 0x100, 0));
+        // SAFETY: inside the texture's four pages.
+        let write = |page: usize| unsafe { std::ptr::write_bytes((address + page * PAGE) as *mut u8, 0x40, 16) };
+        (0..4).for_each(write);
+        let list = host.new_list().unwrap();
+        crate::texture::host_writes(&list, object);
+        list.close();
+        host.execute(&[&list]);
+        let copy = crate::resource::host_copy(object).unwrap();
+        assert!(crate::texture::still_host(&copy), "writes from before the mark");
+        (0..3).for_each(write);
+        assert!(crate::texture::still_host(&copy), "a page left");
+        write(3);
+        assert!(!crate::texture::still_host(&copy), "all of it written");
+        let pending = copy.pending_host_writes.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(pending & crate::resource::HOST_WRITTEN, 0);
+    }
+
     /// A texture fed from title memory given up (`resource::evict`) while a
     /// recorded list names it: the list still reads it, and the next use
     /// makes it again with its bytes from title memory.

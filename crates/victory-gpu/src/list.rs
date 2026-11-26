@@ -1062,7 +1062,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
         let mut row = Vec::new();
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
-            let _writing = crate::watch::writing(title + at, n);
+            let _writing = crate::watch::writing_ours(title + at, n);
             let src = if let Some(format) = packed {
                 // SAFETY: the same region in the expanded footprint has twice the offset and length.
                 let rgba = unsafe { std::slice::from_raw_parts((data + at * 2) as *const u8, n * 2) };

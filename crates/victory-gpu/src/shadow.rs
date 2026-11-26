@@ -197,13 +197,13 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
     if runs.is_empty() {
         return false;
     }
-    let _writing = crate::watch::writing(at, merged.len());
+    let _writing = crate::watch::writing_ours(at, merged.len());
     write_spans(at, merged, runs);
     true
 }
 
 /// [`write_runs`] with title memory held open by the caller
-/// ([`crate::watch::writing`]).
+/// ([`crate::watch::writing_ours`]).
 fn write_spans(at: usize, merged: &[u8], runs: &[(usize, usize)]) {
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
     for &(start, end) in runs {
@@ -844,7 +844,7 @@ impl Shadow {
             // Through views of our own where the pages have them: the
             // title's stay guarded, with nothing to take again.
             let own = t.write_unseen(from, to);
-            let opened = own.is_none().then(|| crate::watch::writing(from, to - from));
+            let opened = own.is_none().then(|| crate::watch::writing_ours(from, to - from));
             for c in stretch {
                 if let Some((host, runs, _)) = &c.back {
                     write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);

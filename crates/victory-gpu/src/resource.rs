@@ -1704,8 +1704,9 @@ fn evictable(t: &HostTexture) -> bool {
     use std::sync::atomic::Ordering::Acquire;
     t.key.is_some()
         && crate::texture::title_written(&t.texture)
+        // First: it drops the sticky bit of a mark it clears.
+        && !crate::texture::still_host(t)
         && t.pending_host_writes.load(Acquire) == 0
-        && !t.host_written.load(Acquire)
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
@@ -1819,7 +1820,7 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let mut claimed: Vec<&Owned> = Vec::with_capacity(gone.len());
     for entry in gone {
         let t = &entry.0;
-        if !crate::texture::title_written(&t.texture) || t.host_written.load(Acquire) {
+        if !crate::texture::title_written(&t.texture) || crate::texture::still_host(t) {
             continue;
         }
         if t.pending_host_writes

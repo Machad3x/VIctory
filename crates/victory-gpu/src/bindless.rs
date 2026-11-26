@@ -225,7 +225,7 @@ pub(crate) fn uploads(
     for (staging, copy) in textures {
         // A host copy wrote it in a submission made before this one (it
         // was not when the list was recorded).
-        if copy.host_written.load(Relaxed) {
+        if crate::texture::still_host(copy) {
             continue;
         }
         if staged.insert(Arc::as_ptr(staging)) {
@@ -255,7 +255,7 @@ pub(crate) fn uploads(
                 continue;
             }
             // Its contents are the host's since a host copy wrote it.
-            if texture.host_written.load(Relaxed) {
+            if crate::texture::still_host(&texture) {
                 continue;
             }
             if let Some(staging) = crate::texture::staging(r as This, &texture.texture)

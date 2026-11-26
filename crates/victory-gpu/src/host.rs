@@ -3594,6 +3594,10 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                tracing::info!(
+                    "host copies kept over changed title memory {:.1}/frame",
+                    crate::texture::HOST_KEPT_STALE.swap(0, Ordering::Relaxed) as f64 / report_frames
+                );
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
                     let (commit, working_set) = process_memory();
                     tracing::info!(

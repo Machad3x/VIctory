@@ -268,6 +268,11 @@ impl PendingHostWrite {
         use std::sync::atomic::Ordering::Release;
         let guard = self;
         list.defer_host(move || {
+            // Held as in `still_host`, so it cannot clear a mark being made.
+            let staging = guard.0.staging.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(s) = staging.as_ref() {
+                s.drain();
+            }
             guard
                 .0
                 .pending_host_writes
@@ -300,6 +305,10 @@ pub(crate) fn prepare_host_write(resource: This) -> Option<PendingHostWrite> {
             })
             .is_ok()
         {
+            // Made before the mark: one made after it would see every page changed.
+            if title_written(&copy.texture) {
+                staging(resource, &copy.texture);
+            }
             return Some(PendingHostWrite(copy));
         }
         crate::resource::detach_if_same(resource, &copy);
@@ -323,8 +332,33 @@ pub(crate) fn host_writes(list: &HostList, resource: This) {
 }
 
 fn is_host_written(resource: This) -> bool {
-    crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Acquire))
+    crate::resource::host_copy(resource).is_some_and(|c| still_host(&c))
+}
+
+/// Whether `copy`'s contents are still the host's: a host write marked it and
+/// the title has not overwritten all of its memory since (the mark then goes).
+pub(crate) fn still_host(copy: &crate::resource::HostTexture) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    if !copy.host_written.load(Acquire) {
+        return false;
+    }
+    let staging = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(t) = staging.as_ref().and_then(|s| s.tracked.as_ref()) else {
+        return true;
+    };
+    // Lock free: nothing changed at all.
+    if t.clean() {
+        return true;
+    }
+    // A render target is never uploaded from title memory.
+    if !t.overwritten() || !title_written(&copy.texture) {
+        #[cfg(feature = "diagnostics")]
+        HOST_KEPT_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    copy.host_written.store(false, Release);
+    copy.pending_host_writes.fetch_and(!crate::resource::HOST_WRITTEN, Release);
+    false
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -337,6 +371,11 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
 pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads since the last frame-rate line that kept a host copy although pages
+/// of its memory had changed.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HOST_KEPT_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
@@ -448,7 +487,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
 /// submission shows from the next one on.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
     // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
+    // until the title writes every page of its memory.
     // Once per list for each host texture, however many title textures of
     // its memory the list samples.
     if is_host_written(resource) {
@@ -829,6 +868,17 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    /// Forgets what the title changed so far: the host is about to own the contents.
+    fn drain(&self) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = &self.tracked {
+            t.take(self.memory as usize, self.memory as usize + self.layout.size as usize);
+            t.watch_overwrite();
+            // The host texture no longer holds what was hashed.
+            last.hashes.clear();
+        }
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {

@@ -45,8 +45,9 @@ pub(crate) const PAGE: usize = 64 << 10;
 
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
-/// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+/// whether it is a host buffer copy's (the only trackers [`retake`] marks),
+/// and the pages the title wrote since [`Tracked::watch_overwrite`], if asked.
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool, Mutex<Option<BTreeSet<usize>>>);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -378,7 +379,7 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy, Mutex::default()));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -579,6 +580,24 @@ impl Tracked {
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed.pages().contains(&page)
+    }
+
+    /// Starts collecting the pages the title writes from now on ([`title_wrote`]).
+    pub(crate) fn watch_overwrite(&self) {
+        *self.changed.4.lock().unwrap_or_else(|e| e.into_inner()) = Some(BTreeSet::new());
+    }
+
+    /// Whether the title wrote every page since [`Tracked::watch_overwrite`].
+    /// Never for memory sharing a page (a neighbor's write would count), nor
+    /// for a single page (one byte would count).
+    // shortcut: one byte written in each page counts as all of it.
+    pub(crate) fn overwritten(&self) -> bool {
+        let pages = self.end.div_ceil(PAGE) - self.start / PAGE;
+        self.untracked.is_empty()
+            && self.start.is_multiple_of(PAGE)
+            && self.end.is_multiple_of(PAGE)
+            && pages > 1
+            && self.changed.4.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|w| w.len() == pages)
     }
 
     /// The caller made pages (page numbers) of its copy equal to title
@@ -814,6 +833,19 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     !guarded.is_empty()
 }
 
+/// The title (not our copies back, nor a mapping) writes pages `[first,
+/// last)`: noted in the trackers collecting that, at every address showing them.
+fn title_wrote(g: &Guards, first: usize, last: usize) {
+    let others = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter());
+    for (&page, holders) in g.holders.range(first..last).chain(others.filter_map(|p| g.holders.get_key_value(p))) {
+        for c in holders {
+            if let Some(written) = c.4.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                written.insert(page);
+            }
+        }
+    }
+}
+
 /// Marks `[first, last)` changed in every tracker holding it. With `save`,
 /// before the write lands: trackers armed for a page they had taken keep
 /// its bytes. `skip` is left alone.
@@ -866,13 +898,21 @@ impl Drop for Writing {
     }
 }
 
-/// Before our own write into title memory `[at, at + len)` through the
+/// Before the title's write into its memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler) or another write the
 /// guards do not see: opens its guarded blocks, marks them changed and
 /// keeps them open while the result lives. The runtime calls it (as
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    let writing = writing_ours(at, len);
+    title_wrote(&guards(), writing.first, writing.last);
+    writing
+}
+
+/// [`writing`] for the GPU crate's own writes (copies back, read backs): they
+/// do not count as the title overwriting the memory.
+pub(crate) fn writing_ours(at: usize, len: usize) -> Writing {
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -1070,6 +1110,7 @@ fn install() {
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
+        title_wrote(&g, at / PAGE, at / PAGE + 1);
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -1155,6 +1196,41 @@ pub(crate) mod tests {
     pub(crate) fn free(p: usize) {
         // SAFETY: an allocation of ours, decommitted whole; still reserved.
         unsafe { VirtualFree(p as *mut _, 0, MEM_DECOMMIT) };
+    }
+
+    /// Our own writes and mappings change pages but are not the title's
+    /// overwrite.
+    #[test]
+    fn our_writes_and_mappings_are_not_an_overwrite() {
+        let p = pool(2);
+        let t = track(p, 2 * PAGE, true).unwrap();
+        t.take(p, p + 2 * PAGE);
+        t.watch_overwrite();
+        drop(writing_ours(p, 2 * PAGE));
+        title_memory_remapped(p, 2 * PAGE);
+        assert!(!t.clean() && !t.overwritten());
+        t.take(p, p + 2 * PAGE);
+        drop(writing(p, 2 * PAGE));
+        assert!(t.overwritten());
+        drop(t);
+        free(p);
+    }
+
+    /// A page the take could not guard stays changed, but is no overwrite.
+    #[test]
+    fn a_page_not_taken_is_not_an_overwrite() {
+        let p = pool(2);
+        let t = track(p, 2 * PAGE, true).unwrap();
+        let busy = writing(p + PAGE, 1);
+        t.take(p, p + 2 * PAGE);
+        t.watch_overwrite();
+        drop(busy);
+        // SAFETY: inside the pool; faults on the guarded first page.
+        unsafe { (p as *mut u8).write_volatile(1) };
+        assert!(t.changed(p / PAGE) && t.changed(p / PAGE + 1));
+        assert!(!t.overwritten());
+        drop(t);
+        free(p);
     }
 
     /// Everything is changed at first; after taking, only what is written
