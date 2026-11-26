@@ -1211,7 +1211,8 @@ fn marks() -> std::sync::MutexGuard<'static, Marks> {
 
 impl Marks {
     /// A run of `n` bits: its first. None when the bitmap is full (the last
-    /// bit takes the marks of offsets past it, so it is never handed out).
+    /// bit takes the marks of offsets past it and its word is cleared
+    /// unread, so none of that word is handed out).
     fn take(&mut self, n: u32) -> Option<u32> {
         if let Some((&at, &len)) = self.free.iter().find(|&(_, &len)| len >= n) {
             self.free.remove(&at);
@@ -1220,7 +1221,7 @@ impl Marks {
             }
             return Some(at);
         }
-        if self.end + n < victory_shader::emit::VIEW_WRITE_BITS {
+        if self.end + n <= victory_shader::emit::VIEW_WRITE_BITS - 32 {
             self.end += n;
             return Some(self.end - n);
         }
@@ -3820,6 +3821,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+        // The last word is cleared unread: none of its bits is handed out.
+        let bits = victory_shader::emit::VIEW_WRITE_BITS;
+        let mut full = Marks::default();
+        assert_eq!(full.take(bits - 33), Some(0));
+        assert_eq!((full.take(2), full.take(1), full.take(1)), (None, Some(bits - 33), None));
     }
 
     const MIB: u64 = 1 << 20;
