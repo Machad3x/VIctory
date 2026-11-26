@@ -644,32 +644,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     0
 }
 
-/// Moves a title texture's host copy to `state` in the list, if needed, for
-/// a use that follows: a state that writes marks the copy as newer. Barriers
-/// (`HostList::transition`) alone write nothing.
-// shortcut: textures shaders write through directly indexed heaps are never
-// marked, and a bound target or unordered view counts as written even if the
-// work only reads it; mark from what shaders do if a title needs it.
+/// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
-    // Render target, unordered access, depth write, copy and resolve destination.
-    const WRITES: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
-    if state & WRITES != 0 {
-        note_written(resource);
-    }
-    move_state(list, resource, state);
-}
-
-#[cfg(windows)]
-fn note_written(resource: This) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        copy.note_written();
-    }
-}
-
-/// [`ensure_state`] without the mark.
-#[cfg(windows)]
-pub(crate) fn move_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(&texture, state);
@@ -723,8 +700,6 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        // Before the source is taken: syncing may replace its host texture.
-        crate::texture::sync_source(list, src);
         if let (Some(dst_write), Some(from)) = (
             crate::texture::prepare_host_write(dst),
             crate::resource::host_resource(src),
@@ -843,7 +818,6 @@ extern "system" fn copy_texture_region(
             }
             _upload = buffer;
         } else {
-            crate::texture::sync_source(list, src.resource);
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
@@ -858,16 +832,11 @@ extern "system" fn copy_texture_region(
         }
         // A box may not cover a texture never uploaded; marked host-written, it never would be.
         // Title writes to this memory earlier in the same submission are not seen by the upload (it runs first).
-        // SAFETY: `from` names the live source (`_upload` or the title's texture).
-        if !(source_box.is_null() && [x, y, z] == [0; 3] && unsafe { replaces_whole(&to, &from) }) {
-            // What the copy leaves may be newer in an aliased texture.
-            if crate::texture::sync_source(list, dst.resource) {
-                // A state round trip: this copy must land after the alias's.
-                move_state(list, dst.resource, COPY_SOURCE);
-            }
-            if crate::texture::title_written(&to) {
-                crate::texture::upload(list, dst.resource, &to);
-            }
+        if crate::texture::title_written(&to)
+            // SAFETY: `from` names the live source (`_upload` or the title's texture).
+            && !(source_box.is_null() && [x, y, z] == [0; 3] && unsafe { replaces_whole(&to, &from) })
+        {
+            crate::texture::upload(list, dst.resource, &to);
         }
         ensure_state(list, dst.resource, COPY_DEST);
         dst_write.record(list);
@@ -1007,7 +976,6 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             return;
         }};
     }
-    crate::texture::sync_source(list, src.resource);
     let (Some(host), Some(texture)) = (crate::host::host(), crate::resource::host_resource(src.resource)) else {
         refused!("no host texture");
     };
@@ -1274,7 +1242,6 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(&texture, record.desc().as_ref());
-        note_written(record.resource);
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -2685,10 +2652,6 @@ mod tests {
         }
     }
 }
-
-#[cfg(all(windows, test))]
-#[path = "list/alias_tests.rs"]
-mod alias_tests;
 
 #[cfg(test)]
 #[path = "list/dispatch_tests.rs"]
