@@ -1101,6 +1101,12 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    /// Flight study: the title memory the texture lies in (start, bytes).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn title_range(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     /// Staging bytes of subresource `i`: its footprint with the driver's
     /// padding up to the next one. Only the texture's last span can end
     /// unaligned, and in an increasing list it comes last, so spans packed

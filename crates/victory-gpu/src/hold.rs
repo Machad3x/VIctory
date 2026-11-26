@@ -146,6 +146,11 @@ impl<S> Held<S> {
                                 (w.run)(*queue, std::mem::take(&mut piece));
                                 done.pieces += 1;
                             }
+                            // Flight study: reads what earlier submissions wrote.
+                            #[cfg(all(windows, feature = "diagnostics"))]
+                            if !waits.is_empty() {
+                                crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -171,6 +176,8 @@ impl<S> Held<S> {
                             true
                         }
                         Some((Item::FenceWait(fence, value), _, fresh)) => {
+                            #[cfg(all(windows, feature = "diagnostics"))]
+                            crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
                             let ok = (w.fence)(*fence) >= *value;
                             if !ok {
                                 *fresh = false;

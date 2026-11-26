@@ -181,6 +181,23 @@ pub(crate) enum C {
     /// `descriptor::forget` calls (generation bumps on release).
     ApiViewWrites,
     ForgetCalls,
+    /// Flight study (title submissions only): nanoseconds from entering the
+    /// submission to sending its lists (of them, syncing heaps), waiting on
+    /// the card's fence, and settling after it (copy-back, deferred copies
+    /// and work, bottom-of-pipe writes).
+    FlightPrepNs,
+    FlightSyncHeapsNs,
+    FlightGpuWaitNs,
+    FlightSettleNs,
+    /// Title submissions that, with the one before still in flight, would
+    /// have to settle it first, by reason (one may have several): touching
+    /// a range it declared written, a title fence or memory value wait,
+    /// our own synchronous submissions, a present; and those with none.
+    DrainRange,
+    DrainFence,
+    DrainSyncExec,
+    DrainPresent,
+    DrainFree,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -208,6 +225,107 @@ impl Drop for TimedNs {
         let c = std::mem::replace(&mut self.1, C::Submissions);
         add(c, self.0.elapsed().as_nanos() as u64);
     }
+}
+
+/// Set around the title's submissions (`crate::queue`): other executes are
+/// ours, synchronous.
+thread_local! {
+    pub(crate) static TITLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// A title fence poll or wait, or a queue's memory value or fence wait,
+/// since the last title submission.
+pub(crate) static FLIGHT_FENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One of our synchronous executes since the last title submission.
+static FLIGHT_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Frames presented at the last title submission.
+static FLIGHT_PRESENTED: AtomicU64 = AtomicU64::new(0);
+/// The last title submission's written title ranges (start, end), sorted
+/// and merged; only taken under the host's submission lock.
+static FLIGHT_WRITES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Why a title submission would drain the one before (fence, sync
+/// executes, present); `None` for our own executes.
+pub(crate) struct Flight(bool, bool, bool);
+
+/// At a submission's start: `None` (and noted) for our own.
+pub(crate) fn flight_begin() -> Option<Flight> {
+    if !TITLE.replace(false) {
+        FLIGHT_SYNC.store(true, Relaxed);
+        return None;
+    }
+    let frames = crate::queue::presented();
+    Some(Flight(
+        FLIGHT_FENCE.swap(false, Relaxed),
+        FLIGHT_SYNC.swap(false, Relaxed),
+        FLIGHT_PRESENTED.swap(frames, Relaxed) != frames,
+    ))
+}
+
+/// As a title submission's lists go to the card: waits and executes during
+/// its preparation came after the one before, so they count for it.
+pub(crate) fn flight_sent(f: &mut Option<Flight>) {
+    if let Some(f) = f {
+        f.0 |= FLIGHT_FENCE.swap(false, Relaxed);
+        f.1 |= FLIGHT_SYNC.swap(false, Relaxed);
+    }
+}
+
+/// The ranges the last title submission wrote (empty for our own).
+pub(crate) fn flight_writes(flight: &Option<Flight>) -> Vec<(usize, usize)> {
+    if flight.is_none() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// At a title submission's end: its counts, and its written ranges for the
+/// next.
+pub(crate) fn flight_end(f: Flight, range: bool, times: [u64; 4], mut writes: Vec<(usize, usize)>) {
+    for (c, t) in [C::FlightPrepNs, C::FlightSyncHeapsNs, C::FlightGpuWaitNs, C::FlightSettleNs].into_iter().zip(times) {
+        add(c, t);
+    }
+    for (c, on) in [(C::DrainRange, range), (C::DrainFence, f.0), (C::DrainSyncExec, f.1), (C::DrainPresent, f.2)] {
+        if on {
+            add(c, 1);
+        }
+    }
+    if !(range || f.0 || f.1 || f.2) {
+        add(C::DrainFree, 1);
+    }
+    merge(&mut writes);
+    *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()) = writes;
+}
+
+/// Sorts and merges ranges (start, end) into disjoint ones.
+fn merge(r: &mut Vec<(usize, usize)>) {
+    r.retain(|&(a, b)| a < b);
+    r.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(r.len());
+    for &(a, b) in r.iter() {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    *r = out;
+}
+
+/// Whether `len` bytes at `at` touch merged ranges.
+pub(crate) fn touches(merged: &[(usize, usize)], at: usize, len: usize) -> bool {
+    let i = merged.partition_point(|&(_, end)| end <= at);
+    merged.get(i).is_some_and(|&(start, _)| start < at + len)
+}
+
+#[cfg(test)]
+#[test]
+fn flight_ranges_merge_and_touch() {
+    let mut r = vec![(30, 40), (0, 10), (5, 20), (50, 50)];
+    merge(&mut r);
+    assert_eq!(r, [(0, 20), (30, 40)]);
+    assert!(touches(&r, 19, 1));
+    assert!(!touches(&r, 20, 10));
+    assert!(touches(&r, 25, 6));
+    assert!(!touches(&r, 40, 100));
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -466,6 +584,18 @@ pub(crate) fn log(frames: f64) {
             c[C::ClosingTable as usize],
         );
     }
+    tracing::info!(
+        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}",
+        c[C::FlightPrepNs as usize] / 1e6,
+        c[C::FlightSyncHeapsNs as usize] / 1e6,
+        c[C::FlightGpuWaitNs as usize] / 1e6,
+        c[C::FlightSettleNs as usize] / 1e6,
+        c[C::DrainRange as usize],
+        c[C::DrainFence as usize],
+        c[C::DrainSyncExec as usize],
+        c[C::DrainPresent as usize],
+        c[C::DrainFree as usize],
+    );
     let times = crate::watch::held_times();
     let handler_hold = c[C::HandlerHoldNs as usize] / 1e6;
     let all_held: f64 = times.iter().map(|(_, total, _)| total / frames).sum();

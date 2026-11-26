@@ -1515,6 +1515,10 @@ impl Host {
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Flight study: whether this is a title submission, and what came
+        // between it and the one before.
+        #[cfg(feature = "diagnostics")]
+        let mut flight = crate::copystat::flight_begin();
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
@@ -1523,6 +1527,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
         crate::descriptor::sync_heaps();
+        #[cfg(feature = "diagnostics")]
+        let sync_heaps_ns = syncing.0.elapsed().as_nanos() as u64;
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
@@ -1613,6 +1619,14 @@ impl Host {
             .collect();
         crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
+        #[cfg(feature = "diagnostics")]
+        {
+            batch.flight_prev = crate::copystat::flight_writes(&flight);
+            for (staging, _) in &textures {
+                let (at, len) = staging.title_range();
+                batch.touch(at, len);
+            }
+        }
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1657,12 +1671,20 @@ impl Host {
         let mut removed_in = None;
         // A wait that failed: query results may not be resolved yet.
         let mut unwaited = false;
+        // Flight study: when the first lists went to the card.
+        #[cfg(feature = "diagnostics")]
+        let mut sent: Option<std::time::Instant> = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let mut ended = Waited::Done;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            #[cfg(feature = "diagnostics")]
+            if sent.is_none() {
+                crate::copystat::flight_sent(&mut flight);
+                sent = Some(std::time::Instant::now());
+            }
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -1743,6 +1765,8 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        #[cfg(feature = "diagnostics")]
+        let waited_at = std::time::Instant::now();
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1903,6 +1927,28 @@ impl Host {
                 };
                 what.write(at as *mut u8, bytes);
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(f) = flight {
+            let sent = sent.unwrap_or(waited_at);
+            let ns = |d: std::time::Duration| d.as_nanos() as u64;
+            // What the next submission would wait for: the shaders' ranges,
+            // late copies' destinations, bottom-of-pipe writes.
+            let writes = batch
+                .gpu_writes
+                .iter()
+                .copied()
+                .chain(batch.late.iter().map(|&(dst, _, len)| (dst, dst + len)))
+                .chain(runs.iter().flat_map(|l| {
+                    l.deferred().writes.iter().map(|&(at, _, bytes)| (at, at + bytes)).collect::<Vec<_>>()
+                }))
+                .collect();
+            crate::copystat::flight_end(
+                f,
+                batch.flight_touched,
+                [ns(sent - started), sync_heaps_ns, ns(waited_at - sent), ns(copying.elapsed())],
+                writes,
+            );
         }
         // The submission has run and the next waits for our lock. Host
         // copies the title gave up meanwhile may have their last holder here.
@@ -2922,6 +2968,8 @@ impl HostList {
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
+                        batch.touch(src, len);
+                        batch.touch(dst, len);
                     }
                     batch.title_written();
                     // The flush counted its own time.
@@ -2954,6 +3002,8 @@ impl HostList {
                         copy_mapped(dst as *mut u8, src as *const u8, len, false);
                         len
                     };
+                    #[cfg(feature = "diagnostics")]
+                    batch.touch(src, len);
                     let mut copied = fill(dst, src, len);
                     // A run of fills (a list's constant buffers, mostly a
                     // few hundred bytes each) is timed as one: reading the
@@ -2961,6 +3011,8 @@ impl HostList {
                     while let Some(&Step::Fill(dst, src, len)) =
                         steps.next_if(|s| matches!(s, Step::Fill(..)))
                     {
+                        #[cfg(feature = "diagnostics")]
+                        batch.touch(src, len);
                         copied += fill(dst, src, len);
                     }
                     copied
@@ -2994,6 +3046,8 @@ impl HostList {
                     if !marked {
                         batch.flush();
                     }
+                    #[cfg(feature = "diagnostics")]
+                    batch.touch(*address, *len);
                     batch.gpu_write(*address, *len);
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -3049,10 +3103,26 @@ struct Batch {
     /// Deferred title copies kept past the lists' run, in record order (they
     /// run after the copy-backs): destination, source, bytes.
     late: Vec<(usize, usize, usize)>,
+    /// Flight study: the last title submission's written ranges (merged),
+    /// and whether this one touches them.
+    #[cfg(feature = "diagnostics")]
+    flight_prev: Vec<(usize, usize)>,
+    #[cfg(feature = "diagnostics")]
+    flight_touched: bool,
 }
 
 impl Batch {
+    /// Flight study: title bytes the submission reads or writes.
+    #[cfg(feature = "diagnostics")]
+    fn touch(&mut self, at: usize, len: usize) {
+        if !self.flight_touched {
+            self.flight_touched = crate::copystat::touches(&self.flight_prev, at, len);
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        self.touch(address, len);
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
