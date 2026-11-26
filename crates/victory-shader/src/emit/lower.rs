@@ -95,6 +95,9 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// Constant arguments of written `wavePrefixOp` calls: `f32`, then `i32`.
+    #[cfg(test)]
+    pub wave_prefix_args: [Vec<Vec<Option<i64>>>; 2],
 }
 
 pub(crate) struct Parts<'a> {
@@ -1653,7 +1656,8 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                // SignedOpKind: 0 signed (required for floats), 1 unsigned.
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -2024,6 +2028,14 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            wave_prefix_args: ["dx.op.wavePrefixOp.f32", "dx.op.wavePrefixOp.i32"].map(|name| {
+                self.s
+                    .m
+                    .written_calls(name)
+                    .map(|args| args.iter().map(|&a| self.s.m.int_value(a)).collect())
+                    .collect()
+            }),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6963,6 +6975,7 @@ impl<'a> Lower<'a> {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                        let m = self.ftz(m);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
                     _ => {
@@ -6977,7 +6990,8 @@ impl<'a> Lower<'a> {
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
+                    let m = self.s.m.bin(c, Bin::Mul, a, bb);
+                    self.ftz(m)
                 };
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
                 float(self, r)

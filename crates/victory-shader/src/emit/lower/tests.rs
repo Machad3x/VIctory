@@ -793,6 +793,48 @@ fn validate_if_installed(l: &Lowered) {
 }
 
 #[test]
+fn wave_prefix_sums_validate_for_floats_and_integers() {
+    // v_add_f32 (VOP2 0x03) and v_add_nc_u32 (0x25): a wave32 inclusive
+    // prefix sum of v0 in v1, stored to LDS.
+    for op in [0x03u32, 0x25] {
+        let step = op << 25 | 0x0002_02FA; // v_add v1, v1_dpp, v1
+        let words = [
+            0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+            step,
+            0xFF01_1101, // row_shr:1
+            step,
+            0xFF01_1201, // row_shr:2
+            step,
+            0xFF01_1401, // row_shr:4
+            step,
+            0xFF01_1801, // row_shr:8
+            0xD760_0002,
+            0x0001_1F01, // v_readlane_b32 s2, v1, 15
+            0xBEFE_03FF,
+            0xFFFF_0000, // s_mov_b32 exec_lo, 0xffff0000
+            op << 25 | 0x0002_0202, // v_add v1, s2, v1
+            0xBEFE_0300, // s_mov_b32 exec_lo, s0
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![], vec![]).unwrap();
+        assert!(l.wave_ops);
+        let float = op == 0x03;
+        let calls = &l.wave_prefix_args[usize::from(!float)];
+        assert!(!calls.is_empty());
+        for a in calls {
+            // Opcode, value, operation kind (sum), signed kind.
+            let want = [Some(121), Some(0), Some(i64::from(!float))];
+            assert_eq!([a[0], a[2], a[3]], want);
+        }
+        validate_if_installed(&l);
+    }
+}
+
+#[test]
 fn scalar_bit_tests_lower() {
     // Each tests one bit of a constant into SCC and branches on it (only
     // code with an effect needs its operands).
