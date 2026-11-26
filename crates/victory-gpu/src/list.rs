@@ -898,10 +898,13 @@ unsafe fn replaces_whole(to: &windows::Win32::Graphics::Direct3D12::ID3D12Resour
     // SAFETY: a live texture.
     let d = unsafe { to.GetDesc() };
     let volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-    // A depth-stencil texture's planes are subresources of their own.
+    // A depth-stencil texture's planes are subresources of their own, and
+    // so are those of the R32G8X24 (19..=22) and R24G8 (44..=47) formats
+    // without the flag.
     if d.MipLevels != 1
         || (!volume && d.DepthOrArraySize != 1)
         || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+        || matches!(d.Format.0, 19..=22 | 44..=47)
     {
         return false;
     }
@@ -2367,6 +2370,57 @@ mod tests {
                 panic!("released list dropped its slots")
             })
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_of_one_plane_does_not_replace_a_planar_texture() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        // R32G8X24 has two planes with or without the depth-stencil flag;
+        // R32 has one.
+        for (format, whole) in [(DXGI_FORMAT_R32G8X24_TYPELESS, false), (DXGI_FORMAT_R32_TYPELESS, true)] {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 8,
+                Height: 8,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let mut made = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    null.cast(),
+                    &PAGEABLE_IIDS[0],
+                    &mut made,
+                ),
+                S_OK
+            );
+            // SAFETY: all integers.
+            let mut from = CopyLocation { resource: null, kind: 1, footprint: unsafe { std::mem::zeroed() } };
+            from.footprint.format = DXGI_FORMAT_R32_TYPELESS.0 as u32;
+            from.footprint.width = 8;
+            from.footprint.height = 8;
+            from.footprint.depth = 1;
+            let to = crate::resource::host_resource(made).unwrap();
+            // SAFETY: a buffer-side source names no texture to read.
+            assert_eq!(unsafe { replaces_whole(&to, &from) }, whole, "{format:?}");
+            slot::<extern "system" fn(This) -> u32>(made, 0x10)(made);
+        }
     }
 
     #[cfg(windows)]
