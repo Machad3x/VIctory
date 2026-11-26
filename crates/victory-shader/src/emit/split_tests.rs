@@ -1387,6 +1387,92 @@ fn a_bounded_dispatch_shuffles_read_unlaunched_lanes_as_inactive() {
     }
 }
 
+/// `v_permlane16_b32` in a bounded dispatch: lane t reads lane t ^ 8 of its
+/// row, so in group 1 (40 threads) lanes 32..39 read lanes 40..47, past the
+/// count. Without fetch-inactive those sources are inactive on the console:
+/// the old value, or 0 with bound_ctrl.
+#[test]
+fn a_bounded_dispatch_permlane_reads_unlaunched_lanes_as_inactive() {
+    const READ_10: &[u32] = &[
+        0xD760_0009,
+        0x0001_1500, // v_readlane_b32 s9, v0, 10
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    for (form, read, plus) in [("", &[][..], 0), (", console flow", READ_10, 10)] {
+        for (bound_ctrl, invalid) in [(0, 7), (1, 0)] {
+            let mut body = vec![
+                0xBE8C_03FF,
+                0xFEDC_BA98, // s_mov_b32 s12, 0xfedcba98 (rows 0..7 read 8..15)
+                0xBE8D_03FF,
+                0x7654_3210, // s_mov_b32 s13, 0x76543210 (rows 8..15 read 0..7)
+                0x7E04_0287, // v_mov_b32 v2, 7
+                0xD777_0002 | bound_ctrl << 12,
+                0x0034_1900, // v_permlane16_b32 v2, v0, s12, s13 [bound_ctrl]
+            ];
+            body.extend_from_slice(read);
+            let label = format!("permlane16 past the count, bound_ctrl {bound_ctrl}{form}");
+            bounded_case(&label, &body, &[64 + 40], |n, t| {
+                let src = t ^ 8;
+                plus + if src < n { src } else { invalid }
+            });
+        }
+    }
+}
+
+/// Masks of EXEC in a bounded dispatch on the console flow (a lane read
+/// across the halves): lanes past the count are 0 in EXEC, inside a loop
+/// too. Lane t runs (t & 3) + 1 iterations; s9 adds `s_bcnt1` of EXEC each
+/// iteration, so it ends as the launched lanes' iterations summed: the
+/// loop's EXEC joins itself (no verdict), and still leaves them out.
+#[test]
+fn a_bounded_dispatch_counts_launched_lanes_in_a_loop() {
+    let body = [
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0xBE8A_047E, // s_mov_b64 s[10:11], exec
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0xBE90_107E, // s_bcnt1_i32_b64 s16, exec
+        0x8009_1009, // s_add_u32 s9, s9, s16
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D82_0280, // v_cmp_lt_u32 vcc, 0, v1
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF85_FFFA, // s_cbranch_scc1 loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    bounded_case(
+        "loop adding s_bcnt1 of EXEC",
+        &body,
+        &[64 + 1, 64 + 40, 64 + 64],
+        |n, _| (0..n).map(|t| (t & 3) + 1).sum(),
+    );
+}
+
+/// A whole-wave section in a bounded dispatch: `s_or_saveexec_b64 s, -1`
+/// sets every lane of the console wave, launched or not, so `s_bcnt1` of
+/// EXEC there is 64.
+#[test]
+fn a_bounded_dispatch_whole_wave_section_counts_every_lane() {
+    const READ_10: &[u32] = &[
+        0xD760_000E,
+        0x0001_1500, // v_readlane_b32 s14, v0, 10 (takes the console flow)
+    ];
+    for (form, read) in [("", &[][..]), (", console flow", READ_10)] {
+        let mut body = read.to_vec();
+        body.extend_from_slice(&[
+            0xBE8A_25C1, // s_or_saveexec_b64 s[10:11], -1
+            0xBE89_107E, // s_bcnt1_i32_b64 s9, exec
+            0xBEFE_040A, // s_mov_b64 exec, s[10:11]
+            0x7E04_0209, // v_mov_b32 v2, s9
+        ]);
+        let label = format!("s_bcnt1 of a whole-wave EXEC{form}");
+        bounded_case(&label, &body, &[64 + 1, 64 + 40, 64 + 64], |_, _| 64);
+    }
+}
+
 /// `s_*_saveexec` writes the old EXEC to its scalar destination and the new
 /// EXEC to EXEC, and sets SCC to whether the *new* EXEC is non-zero. In
 /// console flow, `s_cbranch_scc0` after `s_and_saveexec_b64` must branch on
