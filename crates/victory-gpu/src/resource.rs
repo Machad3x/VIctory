@@ -748,6 +748,10 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        // Copies of buffers in it may still have a submission's bytes to put
+        // back (a heap outlives its placed resources' objects).
+        #[cfg(windows)]
+        crate::shadow::freed(self.address(), self.layout.size() as u64);
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -2012,9 +2016,6 @@ impl Drop for Resource {
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             let (at, data) = (std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
-            if matches!(self.backing, Backing::Committed(_)) {
-                crate::shadow::memory_freed(at, data);
-            }
             crate::shadow::unregister(at, data);
         }
     }

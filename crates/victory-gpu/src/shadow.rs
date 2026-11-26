@@ -60,7 +60,7 @@ pub(crate) struct Shadow {
     /// what the CPU writes goes on into video memory ([`Shadow::push`]), what
     /// the GPU wrote comes back before the CPU reads it ([`pull`]).
     vram: Option<Vram>,
-    /// The title memory it stands for was freed ([`memory_freed`]): nothing
+    /// The title memory it stands for was freed ([`freed`]): nothing
     /// more goes into those addresses, which may hold something else by now.
     gone: std::sync::atomic::AtomicBool,
 }
@@ -1377,8 +1377,9 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
-/// Marked pages worth other threads: fewer go back on the submitting one.
-const PARALLEL_PAGES: usize = 16;
+/// Marked pages worth a thread more: fewer than twice this go back on the
+/// submitting one.
+const PAGES_PER_THREAD: usize = 8;
 
 /// The threads of a copy-back, the submitting one among them (what it had
 /// when it spawned them per submission).
@@ -1411,13 +1412,14 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
             f(copy, run);
         }
     };
-    if pages.len() < PARALLEL_PAGES {
+    let threads = (pages.len() / PAGES_PER_THREAD).min(COPY_BACK_THREADS).min(units.len());
+    if threads < 2 {
         units.iter().for_each(each);
         return;
     }
     static POOL: std::sync::OnceLock<crate::texture::ParallelPool> = std::sync::OnceLock::new();
     let pool = POOL.get_or_init(|| crate::texture::ParallelPool::new(COPY_BACK_THREADS - 1));
-    pool.run(COPY_BACK_THREADS.min(units.len()), units.len(), |i| each(&units[i]));
+    pool.run(threads, units.len(), |i| each(&units[i]));
 }
 
 /// After a submission: every page its shaders marked as written through
@@ -1727,26 +1729,54 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = map.remove(&(start, resource));
     // Counted once the map has changed.
     OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
-    if removed.is_some_and(|e| e.shadow.is_some()) {
+    drop(map);
+    if let Some(copy) = removed.and_then(|e| e.shadow) {
         changed();
+        retire(&copy);
     }
 }
 
-/// The memory of a title buffer goes with it (call before [`unregister`]):
-/// its copy, and those of views of its bytes, write nothing into title
-/// memory any more. Not for placed or title-mapped buffers, whose memory
-/// outlives the object: what shaders write there still goes back.
-// shortcut: a copy-back already under way is not stopped, hold a per-copy
-// lock if it shows.
-pub(crate) fn memory_freed(resource: usize, start: u64) {
-    let Some((end, shadow)) = buffers().get(&(start, resource)).map(|e| (e.end, e.shadow.clone())) else {
-        return;
-    };
-    let gone = |copy: &Shadow| copy.gone.store(true, Ordering::Relaxed);
-    if let Some(copy) = shadow {
-        gone(&copy);
+/// Copies of released buffers still alive, by (start, copy): their memory may
+/// outlive the object (a heap's, or the title's own mapping), and [`freed`]
+/// finds them when it goes. With the size the map is next pruned of dead
+/// entries at.
+#[allow(clippy::type_complexity)]
+static RETIRED: Mutex<(usize, BTreeMap<(u64, usize), std::sync::Weak<Shadow>>)> = Mutex::new((0, BTreeMap::new()));
+
+fn retire(copy: &Arc<Shadow>) {
+    let mut guard = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let (prune_at, map) = &mut *guard;
+    if map.len() >= *prune_at {
+        map.retain(|_, w| w.strong_count() > 0);
+        *prune_at = (2 * map.len()).max(1024);
     }
-    // Forgotten too: the next buffer at these addresses gets copies of its own.
+    map.insert((copy.start, Arc::as_ptr(copy) as usize), Arc::downgrade(copy));
+}
+
+/// The title memory `[start, start + len)` is being freed (a committed
+/// resource's, a heap's, one of our uploads): the copies of buffers in it,
+/// released or not, and those of views of its bytes, write nothing into title
+/// memory any more.
+// shortcut: a copy-back already under way is not stopped (hold a per-copy
+// lock if it shows), and memory the title unmaps itself is not told here.
+pub(crate) fn freed(start: u64, len: u64) {
+    let end = start.saturating_add(len);
+    let gone = |copy: &Shadow| copy.gone.store(true, Ordering::Relaxed);
+    for (_, entry) in buffers().range((start, 0)..(end, 0)) {
+        if let Some(copy) = &entry.shadow {
+            gone(copy);
+        }
+    }
+    {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let found: Vec<_> = retired.1.range((start, 0)..(end, 0)).map(|(&key, _)| key).collect();
+        for key in found {
+            if let Some(copy) = retired.1.remove(&key).and_then(|w| w.upgrade()) {
+                gone(&copy);
+            }
+        }
+    }
+    // Views forgotten too: the next buffer at these addresses gets its own.
     let mut exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let views: Vec<_> = exact.1.range((start, 0, 0)..(end, 0, 0)).map(|(&key, _)| key).collect();
     for key in views {
@@ -3603,8 +3633,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy.writing(p, 64, false);
         copy.write_host(p as u64 + 24, &[0x99]);
         // The title gives the range back before the copy-back has run...
-        memory_freed(p, p as u64);
         unregister(p, p as u64);
+        freed(p as u64, PAGE as u64);
         // SAFETY: our own allocation, freed once.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // ...and takes the addresses again for something of its own.
@@ -3640,11 +3670,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy.update(p, PAGE);
         copy.writing(p, 64, true);
         copy.write_host(p as u64 + 24, &[0x99]);
-        memory_freed(p, p as u64);
         unregister(p, p as u64);
+        freed(p as u64, PAGE as u64);
         assert_eq!(copy.copy_back_run(&[p]), 0);
         // SAFETY: a byte of our pool.
         assert_eq!(unsafe { ((p + 24) as *const u8).read_volatile() }, 0);
+    }
+
+    /// Views' copies of freed bytes write nothing more, and the next view
+    /// there gets a copy of its own.
+    #[test]
+    fn views_of_freed_memory_are_gone_and_made_anew() {
+        let p = crate::watch::tests::pool(1) as u64;
+        let Some(view) = exact(p + 256, 256, 4) else {
+            return; // no host GPU here
+        };
+        assert!(std::sync::Arc::ptr_eq(&view, &exact(p + 256, 256, 4).unwrap()));
+        freed(p, PAGE as u64);
+        assert!(view.gone.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!std::sync::Arc::ptr_eq(&view, &exact(p + 256, 256, 4).unwrap()));
     }
 
     /// A placed or title-mapped buffer's object goes while its memory stays:
