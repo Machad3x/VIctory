@@ -1713,7 +1713,7 @@ impl Drop for Upload {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
         crate::shadow::unregister(self.at, self.at as u64);
-        crate::shadow::freed(self.at as u64, self.len as u64);
+        let _freeing = crate::shadow::freed(self.at as u64, self.len as u64);
         UPLOADS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         UPLOADS[1].fetch_sub(self.len as u64, std::sync::atomic::Ordering::Relaxed);
         // Not guarded any more: memory allocated here next is new.

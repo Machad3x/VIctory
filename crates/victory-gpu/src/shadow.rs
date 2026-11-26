@@ -1844,10 +1844,11 @@ fn retire(copy: &Arc<Shadow>) {
 /// The title memory `[start, start + len)` is being freed (a committed
 /// resource's, a heap's, one of our uploads): the copies of buffers in it,
 /// released or not, and those of views of its bytes, write nothing into title
-/// memory any more.
+/// memory any more. The caller holds the result until the memory is released:
+/// no [`demand`] window is made over it meanwhile.
 // shortcut: a copy-back already under way is not stopped (hold a per-copy
 // lock if it shows), and memory the title unmaps itself is not told here.
-pub(crate) fn freed(start: u64, len: u64) {
+pub(crate) fn freed(start: u64, len: u64) -> Freeing {
     let end = start.saturating_add(len);
     let gone = |copy: &Shadow| copy.gone.store(true, Ordering::Relaxed);
     for (_, entry) in buffers().range((start, 0)..(end, 0)) {
@@ -1864,9 +1865,11 @@ pub(crate) fn freed(start: u64, len: u64) {
             }
         }
     }
-    // Demand windows touching it go: a later miss makes a new one.
+    // Demand windows touching it go: a miss in a new run of frames makes a new one.
+    // Recorded under the lock windows are made under, so none is missed.
+    let mut windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    FREEING.lock().unwrap_or_else(|e| e.into_inner()).push((start, end));
     if DEMANDED.load(Ordering::Relaxed) {
-        let mut windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         let lowest = start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
         let found: Vec<_> = windows
             .range((lowest, 0)..(end, 0))
@@ -1882,12 +1885,30 @@ pub(crate) fn freed(start: u64, len: u64) {
             changed();
         }
     }
+    drop(windows);
     // Views forgotten too: the next buffer at these addresses gets its own.
     let mut exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let views: Vec<_> = exact.1.range((start, 0, 0)..(end, 0, 0)).map(|(&key, _)| key).collect();
     for key in views {
         if let Some(copy) = exact.1.remove(&key).and_then(|w| w.upgrade()) {
             gone(&copy);
+        }
+    }
+    Freeing((start, end))
+}
+
+/// Ranges between [`freed`] and their release. Taken inside `LOOSE`'s lock or
+/// alone.
+static FREEING: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// One range in [`FREEING`], until dropped.
+pub(crate) struct Freeing((u64, u64));
+
+impl Drop for Freeing {
+    fn drop(&mut self) {
+        let mut ranges = FREEING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = ranges.iter().position(|&r| r == self.0) {
+            ranges.swap_remove(i);
         }
     }
 }
@@ -2067,7 +2088,7 @@ static DEMANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// Shaders keep missing the 64 KiB page at `at` (`frame`): a window copy
 /// for it, also inside a title buffer (whose own copy is not made), if
 /// `room` bytes allow one. Returns whether the page has a demand window
-/// made in this frame, and the bytes made now. None for memory that is not
+/// made in this frame, and the bytes made now. None where the page is not
 /// tracked: a copy-back there could undo the title's writes.
 pub(crate) fn demand(at: u64, frame: u64, room: u64) -> (bool, u64) {
     let end = at.saturating_add(PAGE as u64);
@@ -2099,6 +2120,10 @@ fn loose_as(address: u64, end: u64, demand: Option<u64>) -> Option<Arc<Shadow>> 
     if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
     }
+    let overlaps = |&(s, e): &(u64, u64)| start < e && s < start + len;
+    if demand.is_some() && FREEING.lock().unwrap_or_else(|e| e.into_inner()).iter().any(overlaps) {
+        return None;
+    }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;
     }
@@ -2113,7 +2138,9 @@ fn loose_as(address: u64, end: u64, demand: Option<u64>) -> Option<Arc<Shadow>> 
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
     if let Some(made) = demand {
-        shadow.tracked.as_ref()?;
+        if !shadow.tracked.as_ref()?.untracked(address as usize, end as usize).is_empty() {
+            return None;
+        }
         shadow.demand.store(made, Ordering::Relaxed);
         DEMANDED.store(true, Ordering::Relaxed);
     }
@@ -4265,7 +4292,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         freed(at + PAGE as u64, PAGE as u64);
         assert!(copy.gone.load(Ordering::Relaxed));
         assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(at, WINDOW)));
+        let freeing = freed(at, PAGE as u64);
+        assert_eq!(demand(at, 9, WINDOW), (false, 0), "being freed");
+        drop(freeing);
+        assert_eq!(demand(at, 9, WINDOW), (true, WINDOW));
+        drop(freed(at, PAGE as u64));
         crate::watch::tests::free(p);
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: a fresh reservation, released below.
+        let r = unsafe { VirtualAlloc(std::ptr::null(), 2 * WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(r, 0);
+        let at = r.next_multiple_of(WINDOW as usize);
+        // SAFETY: a page of our reservation: plain memory, beside reserved (tracked) pages.
+        assert!(!unsafe { VirtualAlloc(at as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert_eq!(demand(at as u64, 7, WINDOW), (false, 0), "the missed page is not tracked");
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(r as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A 64 KiB page whose leading 4 KiB OS page is reserved while the rest is

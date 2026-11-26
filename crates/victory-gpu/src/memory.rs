@@ -397,8 +397,8 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// pair: the table's dwords, the level-1 index of each block, and the copy
 /// each entry names. At most [`CAPACITY`] blocks besides the null one;
 /// regions in `wanted` get one too while there is room, after the copies'.
-/// Copies `weak` marks (none past its end) give a whole page to any other
-/// copy holding it.
+/// Copies `weak` marks (none past its end) give a page to any other copy
+/// holding it, or part of it.
 fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32, wanted: &[usize], weak: &[bool]) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
@@ -434,9 +434,10 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32, wanted: &[usize], weak
             }
             let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
             // A later copy (smaller, or not weak) holding the whole page
-            // takes it; one holding part of it only takes it if free.
+            // takes it; one holding part of it only takes it if free or a
+            // weak copy's.
             let whole = page << 16 >= start && (page + 1) << 16 <= start + len;
-            if whole || owner[entry].is_none() {
+            if whole || owner[entry].is_none_or(|(o, _)| weak.get(o) == Some(&true)) {
                 owner[entry] = Some((k, whole));
             }
         }
@@ -522,7 +523,7 @@ impl Shared {
             slots.push(slot);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        let wanted: Vec<usize> = wanted().iter().copied().collect();
+        let wanted: Vec<usize> = if counting() { wanted().iter().copied().collect() } else { Vec::new() };
         self.wanted = wanted.len();
         let weak: Vec<bool> = named.iter().map(|c| c.demanded()).collect();
         let (dwords, blocks, owner) = table(&ranges, &slots, self.null, &wanted, &weak);
@@ -745,7 +746,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
         let stale = s.generation != now;
-        let stale = stale || s.wanted != wanted().len();
+        let stale = stale || counting() && s.wanted != wanted().len();
         if stale {
             s.rewrite(heap, now);
         }
@@ -1010,6 +1011,9 @@ mod tests {
         let (dwords, ..) = table(&copies, &[102, 104], 100, &[], &[false, true]);
         assert_eq!(look_up(&dwords, 0x40_0000).0, 102);
         assert_eq!(look_up(&dwords, 0x41_0000).0, 102, "the smaller copy yields");
+        let copies = [(0x41_0000, 0x1_0000), (0x41_8000, 0x3_0000)];
+        let (dwords, ..) = table(&copies, &[102, 104], 100, &[], &[true]);
+        assert_eq!(look_up(&dwords, 0x41_8000).0, 104, "also to a copy holding part of the page");
     }
 
     /// The shader's lookup (`victory_shader` lowering) over a table's

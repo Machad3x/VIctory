@@ -751,7 +751,7 @@ impl Drop for Memory {
         // Copies of buffers in it may still have a submission's bytes to put
         // back (a heap outlives its placed resources' objects).
         #[cfg(windows)]
-        crate::shadow::freed(self.address(), self.layout.size() as u64);
+        let _freeing = crate::shadow::freed(self.address(), self.layout.size() as u64);
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
