@@ -279,8 +279,9 @@ impl std::ops::DerefMut for Held {
     }
 }
 
-/// Per line taking the guard lock: the line, microseconds held in all, the
-/// longest hold (no allocation: the fault handler takes the lock).
+/// Per line taking the guard lock: the line, nanoseconds held in all, the
+/// longest hold (no allocation: the fault handler takes the lock; not
+/// microseconds: the handler's holds under one added as zero).
 #[cfg(feature = "diagnostics")]
 static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
     [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 16];
@@ -289,15 +290,15 @@ static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
 impl Drop for Held {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let us = self.1.elapsed().as_micros() as u64;
+        let ns = self.1.elapsed().as_nanos() as u64;
         drop(self.0.take());
         let line = u64::from(self.2);
         if let Some(slot) = HELD
             .iter()
             .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
         {
-            slot[1].fetch_add(us, Relaxed);
-            slot[2].fetch_max(us, Relaxed);
+            slot[1].fetch_add(ns, Relaxed);
+            slot[2].fetch_max(ns, Relaxed);
         }
     }
 }
@@ -310,7 +311,7 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
     let mut out: Vec<(u64, f64, f64)> = HELD
         .iter()
         .filter(|s| s[0].load(Relaxed) != 0)
-        .map(|s| (s[0].load(Relaxed), s[1].swap(0, Relaxed) as f64 / 1e3, s[2].swap(0, Relaxed) as f64 / 1e3))
+        .map(|s| (s[0].load(Relaxed), s[1].swap(0, Relaxed) as f64 / 1e6, s[2].swap(0, Relaxed) as f64 / 1e6))
         .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
     out
@@ -1188,7 +1189,18 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
+        #[cfg(feature = "diagnostics")]
+        let asked = std::time::Instant::now();
         let mut g = guards();
+        // Declared after `g`: dropped first, just before the lock goes.
+        #[cfg(feature = "diagnostics")]
+        let _holding = {
+            let now = std::time::Instant::now();
+            let waited = now.duration_since(asked).as_nanos() as u64;
+            crate::copystat::add(crate::copystat::C::HandlerWaitNs, waited);
+            crate::copystat::HANDLER_WAIT_MAX.fetch_max(waited, std::sync::atomic::Ordering::Relaxed);
+            crate::copystat::TimedNs(now, crate::copystat::C::HandlerHoldNs)
+        };
         title_wrote(&g, at / PAGE, at / PAGE + 1);
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]

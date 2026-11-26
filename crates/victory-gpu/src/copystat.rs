@@ -157,11 +157,19 @@ pub(crate) enum C {
     ClosingRootUavs,
     ClosingRootView,
     ClosingTable,
+    /// The guard handler: nanoseconds waiting for the guard lock, and
+    /// holding it.
+    HandlerWaitNs,
+    HandlerHoldNs,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
 const COUNTERS: usize = C::VideoBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+/// The guard handler's longest single wait for the guard lock since the
+/// last line, nanoseconds.
+pub(crate) static HANDLER_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -425,11 +433,21 @@ pub(crate) fn log(frames: f64) {
             c[C::ClosingTable as usize],
         );
     }
-    let held: Vec<String> = crate::watch::held_times()
+    let times = crate::watch::held_times();
+    let handler_hold = c[C::HandlerHoldNs as usize] / 1e6;
+    let all_held: f64 = times.iter().map(|(_, total, _)| total / frames).sum();
+    let held: Vec<String> = times
         .iter()
-        .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
+        .map(|(line, total, longest)| format!("watch.rs:{line} {:.2} ms (longest {longest:.3})", total / frames))
         .collect();
-    tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    tracing::info!(
+        "  guard lock per frame: handler waiting {:.2} ms (longest wait {:.3} ms), holding {:.2} ms; others holding {:.2} ms; held by line: {}",
+        c[C::HandlerWaitNs as usize] / 1e6,
+        HANDLER_WAIT_MAX.swap(0, Relaxed) as f64 / 1e6,
+        handler_hold,
+        (all_held - handler_hold).max(0.0),
+        held.join(", ")
+    );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
     snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
