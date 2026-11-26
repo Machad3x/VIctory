@@ -2011,10 +2011,11 @@ impl Drop for Resource {
         }
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
-            crate::shadow::unregister(
-                std::ptr::from_ref::<Resource>(self) as usize,
-                self.data() as u64,
-            );
+            let (at, data) = (std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
+            if matches!(self.backing, Backing::Committed(_)) {
+                crate::shadow::memory_freed(at, data);
+            }
+            crate::shadow::unregister(at, data);
         }
     }
 }

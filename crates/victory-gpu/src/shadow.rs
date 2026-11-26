@@ -60,8 +60,8 @@ pub(crate) struct Shadow {
     /// what the CPU writes goes on into video memory ([`Shadow::push`]), what
     /// the GPU wrote comes back before the CPU reads it ([`pull`]).
     vram: Option<Vram>,
-    /// The title released the buffer ([`unregister`]): nothing more goes into
-    /// title memory, which may hold something else by now.
+    /// The title memory it stands for was freed ([`memory_freed`]): nothing
+    /// more goes into those addresses, which may hold something else by now.
     gone: std::sync::atomic::AtomicBool,
 }
 
@@ -1735,10 +1735,32 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = map.remove(&(start, resource));
     // Counted once the map has changed.
     OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
-    // shortcut: a release racing a copy-back already under way is not stopped, hold a per-copy lock if it shows.
-    if let Some(shadow) = removed.and_then(|e| e.shadow) {
-        shadow.gone.store(true, Ordering::Relaxed);
+    if removed.is_some_and(|e| e.shadow.is_some()) {
         changed();
+    }
+}
+
+/// The memory of a title buffer goes with it (call before [`unregister`]):
+/// its copy, and those of views of its bytes, write nothing into title
+/// memory any more. Not for placed or title-mapped buffers, whose memory
+/// outlives the object: what shaders write there still goes back.
+// shortcut: a copy-back already under way is not stopped, hold a per-copy
+// lock if it shows.
+pub(crate) fn memory_freed(resource: usize, start: u64) {
+    let Some((end, shadow)) = buffers().get(&(start, resource)).map(|e| (e.end, e.shadow.clone())) else {
+        return;
+    };
+    let gone = |copy: &Shadow| copy.gone.store(true, Ordering::Relaxed);
+    if let Some(copy) = shadow {
+        gone(&copy);
+    }
+    // Forgotten too: the next buffer at these addresses gets copies of its own.
+    let mut exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let views: Vec<_> = exact.1.range((start, 0, 0)..(end, 0, 0)).map(|(&key, _)| key).collect();
+    for key in views {
+        if let Some(copy) = exact.1.remove(&key).and_then(|w| w.upgrade()) {
+            gone(&copy);
+        }
     }
 }
 
@@ -3589,6 +3611,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy.writing(p, 64, false);
         copy.write_host(p as u64 + 24, &[0x99]);
         // The title gives the range back before the copy-back has run...
+        memory_freed(p, p as u64);
         unregister(p, p as u64);
         // SAFETY: our own allocation, freed once.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
@@ -3625,10 +3648,30 @@ void main(uint3 id : SV_DispatchThreadID) {
         copy.update(p, PAGE);
         copy.writing(p, 64, true);
         copy.write_host(p as u64 + 24, &[0x99]);
+        memory_freed(p, p as u64);
         unregister(p, p as u64);
         assert_eq!(copy.copy_back_run(&[p]), 0);
         // SAFETY: a byte of our pool.
         assert_eq!(unsafe { ((p + 24) as *const u8).read_volatile() }, 0);
+    }
+
+    /// A placed or title-mapped buffer's object goes while its memory stays:
+    /// the pending copy-back still lands.
+    #[test]
+    fn a_released_object_whose_memory_stays_is_still_written_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, 64, false);
+        copy.write_host(p as u64 + 24, &[0x99]);
+        unregister(p, p as u64);
+        copy.copy_back(p, 64);
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 24) as *const u8).read_volatile() }, 0x99);
     }
 
     /// Mark bits are handed out in runs and come back joined.
