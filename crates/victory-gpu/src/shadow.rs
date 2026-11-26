@@ -3404,6 +3404,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     fn a_held_page_stays_out_though_other_shaders_marked_it_too() {
         // No submission takes the marks set below meanwhile.
         let _quiet = crate::host::tests::no_submissions();
+        // No miss: the drop waits for the frame's end, so what keeps the
+        // page out is the filter.
+        crate::memory::note_submission(false);
         let p = crate::watch::tests::pool(1);
         register(p, p as u64, PAGE as u64);
         let Some(copy) = find(p as u64, PAGE as u64) else {
