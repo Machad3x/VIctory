@@ -2623,6 +2623,25 @@ fn sub_dword_operands_match_the_hardware() {
                 vop1(0x0A, 5, 0),
                 1,
                 Sdwa {
+                    dst_sel: 4,
+                    unused: 1,
+                    ..SDWA
+                },
+            ),
+            floats.iter().copied().filter(|i| !nan(i[0])).collect(),
+            Kind::Halves { ulps: 0 },
+            |i| vec![to_f16(f64::from(fl(ftz(i[0]))), false) as u16 as i16 as u32],
+        )
+        .shows_where(
+            F16_ROUND,
+            |i| vec![to_f16(d(i[0]), false)],
+            |i| vec![to_f16(d(i[0]), true)],
+        ),
+        probe(
+            sdwa(
+                vop1(0x0A, 5, 0),
+                1,
+                Sdwa {
                     dst_sel: 5,
                     unused: 0,
                     ..SDWA
