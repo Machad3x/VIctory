@@ -1141,13 +1141,25 @@ impl<'a> Lower<'a> {
                     dword(self, at)?
                 }
                 Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    if width > 8 {
+                        // A short at byte 3 takes its high byte from the next
+                        // dword: OR in that dword shifted by 32 - sh, in two
+                        // shifts so that sh = 0 gives 0 (bits past the field
+                        // are cut below).
+                        let (four, one, k31) = (self.s.m.i32(4), self.s.m.i32(1), self.s.m.i32(31));
+                        let next = self.s.m.bin(c, Bin::Add, at, four);
+                        let w2 = dword(self, next)?;
+                        let up = self.s.m.bin(c, Bin::Sub, k31, sh);
+                        let hi = self.s.m.bin(c, Bin::Shl, w2, one);
+                        let hi = self.s.m.bin(c, Bin::Shl, hi, up);
+                        x = self.s.m.bin(c, Bin::Or, x, hi);
+                    }
                     let left = self.s.m.i32(32 - width);
                     let x = self.s.m.bin(c, Bin::Shl, x, left);
                     self.s
@@ -10456,8 +10468,8 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some((width, signed)) = sub {
-            // The dword holding the field, as `global_load_ubyte` and kin.
-            // shortcut: the field is taken not to cross a dword.
+            // The dword holding the field, as `global_load_ubyte` and kin
+            // (a short at byte 3 also the next dword).
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
@@ -10478,7 +10490,17 @@ impl<'a> Lower<'a> {
             let w = self.as_int(w);
             let byte = self.s.m.bin(c, Bin::And, off, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-            let x = self.s.m.bin(c, Bin::LShr, w, sh);
+            let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+            if width > 8 {
+                // As in `flat`: the next dword shifted by 32 - sh.
+                let (four, one, k31) = (self.s.m.i32(4), self.s.m.i32(1), self.s.m.i32(31));
+                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let w2 = self.raw_dword(h, next);
+                let up = self.s.m.bin(c, Bin::Sub, k31, sh);
+                let hi = self.s.m.bin(c, Bin::Shl, w2, one);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, up);
+                x = self.s.m.bin(c, Bin::Or, x, hi);
+            }
             let left = self.s.m.i32(32 - width);
             let x = self.s.m.bin(c, Bin::Shl, x, left);
             let x = self

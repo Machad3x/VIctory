@@ -463,6 +463,107 @@ fn global_store_values_are_visible_across_waves_after_a_barrier() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// Byte and short loads (`global_load_ubyte` and kin) through a root UAV at
+/// every byte of a dword: a short at byte 3 takes its high byte from the
+/// next dword (it read 0 there before), signed ones extend its sign.
+#[test]
+fn sub_dword_global_loads_cross_a_dword_boundary() {
+    // Bytes 11 22 33 99 AA 66 77 88 at byte 0 of the root UAV.
+    let mut w = vec![
+        v_mov_b32(1, ZERO),
+        v_mov_b32(2, 255),
+        0x9933_2211,
+        v_mov_b32(3, 255),
+        0x8877_66AA,
+    ];
+    w.extend(global(28, 0, 1, 2, 0, 0)); // global_store_dword v1, v2, s[0:1]
+    w.extend(global(28, 0, 1, 3, 0, 4)); // global_store_dword v1, v3, s[0:1] offset:4
+    w.push(S_WAITCNT_ALL);
+    // (op, byte): ushort at 0-3, sshort at 3, ubyte and sbyte at 3.
+    let loads = [(10, 0), (10, 1), (10, 2), (10, 3), (11, 3), (8, 3), (9, 3)];
+    for (k, &(op, byte)) in loads.iter().enumerate() {
+        w.extend(global(op, 4 + k as u8, 1, 0, 0, byte));
+    }
+    w.push(S_WAITCNT_ALL);
+    for k in 0..loads.len() {
+        // global_store_dword v1, v[4+k], s[0:1] offset:16+4k
+        w.extend(global(28, 0, 1, 4 + k as u8, 0, 16 + 4 * k as u32));
+    }
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 12,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 2,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let container = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: vec![],
+    };
+    let mut shader = super::emit(&container, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let want: [u32; 7] = [0x2211, 0x3322, 0x9933, 0xAA99, 0xFFFF_AA99, 0x99, 0xFFFF_FF99];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        // User data selects the root UAV's copy at heap index and byte offset 0.
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(16)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(out[0][4..4 + want.len()], want, "{label}: loaded fields");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// A root SRV in a program that does not use title memory is read through
 /// the host's view of its host copy (`emit`, "Root SRVs and root UAVs"): the
 /// view's index and the root address's offset in it come as user data, and
