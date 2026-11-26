@@ -9423,7 +9423,13 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                // The console counts a cube's faces as its depth; DXIL leaves
+                // that channel out.
+                let x = if ch == 2 && kind == 5 {
+                    // shortcut: one cube, as `cube_direction` takes the view;
+                    // cube arrays need 6 × the slice count.
+                    self.s.m.i32(6)
+                } else if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)

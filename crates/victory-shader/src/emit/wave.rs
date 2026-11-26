@@ -197,7 +197,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            i += 1;
+            continue;
         };
         let (shapes, ended) = simulate(&insts[i + 1..end], wave, saved);
         // What wrote each value the simulation could not shape: the last
@@ -1379,6 +1380,22 @@ mod tests {
         let p = build(&w, false);
         let sec = &sections(&p, 0)[&0];
         assert_eq!(sec.ended, Some("a whole-wave section step: s_not_b32"));
+    }
+
+    /// A save whose restore is not in the block does not hide the sections
+    /// after it.
+    #[test]
+    fn an_unmatched_saveexec_keeps_later_sections() {
+        let w = [
+            sop1(0, 0x3D, 193),  // s_or_saveexec_b32 s0, -1 (never restored)
+            sop1(2, 0x3D, 193),  // s_or_saveexec_b32 s2, -1
+            vop1(1, 0x01, 135),  // v_mov_b32 v1, 7
+            sop1(EXEC, 0x03, 2), // s_mov_b32 exec_lo, s2 (the section ends)
+        ];
+        let p = build(&w, false);
+        let found = sections(&p, 0);
+        assert!(!found.contains_key(&0));
+        assert_eq!(found.get(&1).map(|s| s.end), Some(3));
     }
 
     #[test]
