@@ -259,13 +259,14 @@ struct Compared<'a> {
 }
 
 /// The copy's bytes of a page, ready to go back, and the runs of them to
-/// write into title memory; none where title memory cannot be read.
-type Back<'a> = Option<(&'a mut [u8], Vec<(usize, usize)>)>;
+/// write into title memory, and whether the copy took title memory's other
+/// bytes; none where title memory cannot be read.
+type Back<'a> = Option<(&'a mut [u8], Vec<(usize, usize)>, bool)>;
 
 impl Compared<'_> {
     /// Whether it has bytes to write into title memory.
     fn writes(&self) -> bool {
-        self.back.as_ref().is_some_and(|(_, runs)| !runs.is_empty())
+        self.back.as_ref().is_some_and(|(_, runs, _)| !runs.is_empty())
     }
 }
 
@@ -425,7 +426,7 @@ impl Shadow {
         title: &mut [u8],
     ) -> bool {
         match self.compare(page, from, to, saved, title) {
-            Some((host, runs)) => write_runs(from, host, &runs),
+            Some((host, runs, _)) => write_runs(from, host, &runs),
             None => false,
         }
     }
@@ -469,10 +470,11 @@ impl Shadow {
         // Without bytes saved, the runs are every byte that differs: the
         // others are the title's already (copying them cost a 64 KiB write
         // per page).
-        if saved.is_some() {
+        let took = saved.is_some();
+        if took {
             take_others(host, title, &runs);
         }
-        Some((host, runs))
+        Some((host, runs, took))
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -825,7 +827,7 @@ impl Shadow {
             let own = t.write_unseen(from, to);
             let opened = own.is_none().then(|| crate::watch::writing(from, to - from));
             for c in stretch {
-                if let Some((host, runs)) = &c.back {
+                if let Some((host, runs, _)) = &c.back {
                     write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);
                     written += c.to - c.from;
                     if own.is_some() {
@@ -841,12 +843,19 @@ impl Shadow {
         // title memory's bytes: nothing to read again. (A third of the
         // world's marked pages hold no changed byte.)
         let mut again = Vec::with_capacity(compared.len());
+        static PUSH_ALL: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("VICTORY_PUSH_ALL").is_some_and(|v| v == "1"));
         for c in &compared {
-            // The copy took the title's bytes: so does video memory.
-            self.push(c.from - start, c.to - c.from);
             let opened = c.writes() && !unseen.contains(&c.page);
-            if c.from == c.page && c.to == c.page + PAGE && (opened || t.changed(c.page / PAGE)) {
+            let reread = c.from == c.page && c.to == c.page + PAGE && (opened || t.changed(c.page / PAGE));
+            if reread {
                 again.push(c.page / PAGE);
+            }
+            // The copy took the title's bytes: so does video memory (the
+            // pull left it equal to the mirror otherwise; pages read again
+            // are pushed below).
+            if *PUSH_ALL || !reread && c.back.as_ref().is_some_and(|&(_, _, took)| took) {
+                self.push(c.from - start, c.to - c.from);
             }
         }
         drop(compared);
@@ -2659,6 +2668,59 @@ pub(crate) mod tests {
         // SAFETY: our pool's bytes.
         let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
         assert_eq!(title[2 * PAGE + 100..2 * PAGE + 108], [0x4D; 8]);
+        unregister(p, p as u64);
+    }
+
+    /// Marked pages of a mirrored copy, whole and in part, with and without
+    /// a title write the guard saved bytes of: video memory then holds title
+    /// memory's bytes.
+    #[test]
+    fn marked_pages_leave_video_memory_equal_to_title_memory() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::marked_pages_leave_video_memory_equal_to_title_memory",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() || bitmap(false).is_none() {
+            return;
+        }
+        let p = crate::watch::tests::pool(3);
+        let len = 2 * PAGE + PAGE / 2;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("a copy");
+        assert!(copy.mirrored());
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let (src, data) = host.shared_buffer(8).unwrap();
+        // SAFETY: our mapped buffer of 8 bytes.
+        unsafe { std::ptr::write_bytes(data, 0xC3, 8) };
+        for page in 0..3 {
+            // The GPU writes video memory only, and marks the page.
+            let at = (p + page * PAGE + 64) as u64;
+            host.copy_now(&[(&copy.buffer, copy.offset(at), &src, 0, 8)]);
+            let n = base + page;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *(bitmap(false).unwrap().data as *mut u32).add(n / 32) |= 1 << (n % 32) };
+        }
+        // The title writes a whole page and the partial one, not page 1.
+        for page in [0, 2] {
+            // SAFETY: a byte of our pool.
+            unsafe { ((p + page * PAGE + 200) as *mut u8).write_volatile(0x3C) };
+        }
+        copy_back_marks(&[], false);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        for page in 0..3 {
+            assert_eq!(title[page * PAGE + 64], 0xC3, "the GPU's byte, page {page}");
+        }
+        assert_eq!((title[200], title[2 * PAGE + 200]), (0x3C, 0x3C), "the title's bytes");
+        assert!(gpu_bytes(&copy, p, len) == title, "video memory equals title memory");
+        copy.copy_back(p, len);
         unregister(p, p as u64);
     }
 
