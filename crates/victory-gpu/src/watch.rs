@@ -464,14 +464,16 @@ impl Drop for Tracked {
                 }
             }
         }
-        let held = |g: &Guards, p: usize| {
-            g.holders.contains_key(&p) || g.alias_of.get(&p).into_iter().flatten().any(|o| g.holders.contains_key(o))
-        };
         let free: Vec<usize> = free.into_iter().filter(|&p| !held(&g, p)).collect();
         for page in free {
             open(&mut g, page);
         }
     }
+}
+
+/// Whether a tracker holds page `page`, there or at another mapping of it.
+fn held(g: &Guards, page: usize) -> bool {
+    g.holders.contains_key(&page) || g.alias_of.get(&page).into_iter().flatten().any(|o| g.holders.contains_key(o))
 }
 
 /// Gives write access back to page `page` if we guarded it.
@@ -886,6 +888,8 @@ pub(crate) fn frame_done() {
 pub struct Writing {
     first: usize,
     last: usize,
+    /// As [`Unseen::others`].
+    others: Vec<usize>,
 }
 
 impl Drop for Writing {
@@ -895,6 +899,9 @@ impl Drop for Writing {
             g.busy.swap_remove(i);
         }
         changed(&mut g, self.first, self.last, false);
+        for &page in &self.others {
+            mark(&mut g, page, page + 1, false, None);
+        }
     }
 }
 
@@ -917,8 +924,9 @@ pub(crate) fn writing_ours(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
+    let others = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
     changed(&mut g, first, last, true);
-    Writing { first, last }
+    Writing { first, last, others }
 }
 
 /// The runtime shows title memory `[at, at + len)` at `own` as well, in a
@@ -1010,22 +1018,35 @@ fn own_views() -> bool {
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
-    // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
+    // What it showed is gone already: nothing to keep. The other mappings
+    // of it did not change: marked, their copies lost shaders' writes.
+    mark(&mut g, first, last, false, None);
+    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
+    for page in guarded {
+        open(&mut g, page);
+    }
     let gone: Vec<usize> = g.own.range(first..last).map(|(&p, _)| p).collect();
     for page in gone {
         g.own.remove(&page);
     }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
+    let mut others = Vec::new();
     for page in stale {
         for other in g.alias_of.remove(&page).unwrap_or_default() {
+            others.push(other);
             if let Some(links) = g.alias_of.get_mut(&other) {
                 links.retain(|&p| p != page);
                 if links.is_empty() {
                     g.alias_of.remove(&other);
                 }
             }
+        }
+    }
+    // A guard there for a tracker of the old links alone goes too.
+    for page in others {
+        if !held(&g, page) {
+            open(&mut g, page);
         }
     }
 }
@@ -1796,6 +1817,60 @@ pub(crate) mod tests {
         // takes it for `a`'s pages here).
         unsafe { (c as *mut u32).write_volatile(1) };
         assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+    }
+
+    /// Mapping an address anew leaves the other mappings of what it showed
+    /// unchanged and guarded where a tracker holds them; a guard left with no
+    /// tracker is opened.
+    #[test]
+    fn a_remap_leaves_the_other_mapping_unchanged() {
+        let (a, b) = twin_views(2);
+        let ta = track(a, 2 * PAGE, true).expect("views are tracked");
+        let tb = track(b, PAGE, true).expect("views are tracked");
+        ta.take(a, a + 2 * PAGE);
+        tb.take(b, b + PAGE);
+        title_memory_remapped(a, 2 * PAGE);
+        assert!(ta.changed(a / PAGE) && ta.changed(a / PAGE + 1));
+        assert!(!tb.changed(b / PAGE) && tb.clean());
+        {
+            let g = guards();
+            assert!(g.protected.contains(&(b / PAGE)), "still held");
+            assert!(!g.protected.contains(&(b / PAGE + 1)), "nothing holds it");
+        }
+        // SAFETY: a view of ours, still guarded for `tb`: the handler opens it.
+        unsafe { (b as *mut u32).write_volatile(1) };
+        assert!(tb.changed(b / PAGE));
+    }
+
+    /// An address mapped anew during a write: the other mapping of what it
+    /// showed is marked when the write ends, though taken meanwhile.
+    #[test]
+    fn a_remap_during_a_write_still_marks_the_other_mapping() {
+        let (a, b) = twin_views(1);
+        title_memory_aliased(b, &[a]);
+        let tb = track(b, PAGE, true).expect("views are tracked");
+        tb.take(b, b + PAGE);
+        let write = writing(a, 8);
+        title_memory_remapped(a, PAGE);
+        tb.take(b, b + PAGE);
+        assert!(tb.clean(), "no longer linked: taken");
+        drop(write);
+        assert!(tb.changed(b / PAGE) && !tb.clean());
+    }
+
+    /// Mapping `a` anew keeps `b` guarded while a tracker of `c`, linked to
+    /// `b`, holds it.
+    #[test]
+    fn a_remap_keeps_a_guard_held_through_another_link() {
+        let (a, b) = twin_views(1);
+        let (c, _) = twin_views(1);
+        title_memory_aliased(b, &[a]);
+        title_memory_aliased(c, &[b]);
+        let tc = track(c, PAGE, true).expect("views are tracked");
+        tc.take(c, c + PAGE);
+        title_memory_remapped(a, PAGE);
+        assert!(guards().protected.contains(&(b / PAGE)), "held through c");
+        assert!(tc.clean());
     }
 
     /// A tracker over one mapping going away leaves the page guarded there
