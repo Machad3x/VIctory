@@ -994,6 +994,92 @@ helpers moved to `lower/spill.rs`.
 | #2341, #2374, #2380 | Dark pictures in runs that had them; the cause was not isolated |
 | Hot pages (leave pages written every frame unguarded), `gpu244` against `gpu242` (Series X profile) | Frame 361-365 ms against 296-298, moves 49-53 against 24 ms, unmapped 20-21 against 1 MB a frame, watches 5,430-5,500 (27-37 ms) against 2,500-2,650 (13-16 ms), guard faults about 680 against 922, fault handler 110-146 against 93 ms. Open pages stay in `changed` (dirty), so their copies are taken again at each of about 31 submissions, and unmapped hot pages fall into the slow mapped-copy fallback. Kept on branch `dropped/hot-pages` |
 
+## November 26, night: Kelvaroq ideas and reviews, `gpu250` to `gpu256`
+
+Ideas from Kelvaroq (Stellarr Studio, GPL-3.0-or-later, on fxceless's
+victory-fork) are ported one at a time, each checked against the picture
+before it stays. Rule for these ports: nothing may disable, refuse, stub or
+drop shaders, pipelines, draws or dispatches. Kelvaroq's refused pipelines,
+wave64 and ray tracing cuts and FSR refusal are therefore left out.
+
+### Guard faults opened outside the lock (reverted)
+
+`gpu250` (Series X profile, commits 4fa39898, 0a9a7850, b07f661b) opened the
+faulting page outside the guard lock. `gpu251` ran the same build with
+`VICTORY_FAULT_OPEN_UNLOCKED=0`.
+
+| Run | Picture (wall / floor luma) | Draws a frame | Frame ms | Handler lock wait ms a frame |
+|---|---|---|---|---|
+| `gpu242` (reference) | Lit, 45.8 / 20.1 | 5,283 | 296-298 | |
+| `gpu250` (unlocked) | Dark, 2.3 / 9.5, HUD prompt missing | 4,914 | 270-320 at the end, spikes of 400-1,541 mid-run | 82-153 |
+| `gpu251` (switch off) | Lit, 41.8 / 25.3 | | 259-483 | 74-154 |
+
+Opening the page outside the lock loses writes or lets stale data through,
+and gains no frame time. Reverted (aa4bf8d1, bf7939b8, d3099a6a). The lock
+wait did not move, so it is not caused by the time `VirtualProtect` holds
+the lock alone.
+
+### Descriptors translated once (audit: no-go as designed)
+
+Kelvaroq's "observed key" skips a heap slot whose descriptor was already
+seen. Here `made` already acts as that key; a skip saves only 5.5 to 8.9 ms
+of comparison a frame, while the 52 to 75 ms is spent making slots. Counters
+now split stale slots by reason (unmade, recycled, rewritten, released, API
+view writes, forgets). If rewritten slots dominate, the next step is cheaper
+making per slot: one lock of the view table per sync, and host descriptors
+cached by (index, generation) and copied with `CopyDescriptorsSimple`.
+
+### Submissions in flight (audit)
+
+From Kelvaroq's late flights and relay: the first step (P1) is one
+submission in flight with a fixed barrier and no relay, estimated at 40 to
+60 ms a frame and not additive with the descriptor work. Drains stay
+mandatory for declared written ranges, title fence and value waits, our own
+sync executes, present and frame end, an idle card and device removal;
+present stays a drain. Flight study counters (preparation, heap sync, GPU
+wait, settle, drain reasons, fence polls) measure whether it would pay.
+
+### Further counters
+
+`VICTORY_DIAG_FAULT_KINDS=1` counts guard faults by kind (pool, armed, view,
+fixed, other), and dropped indirect mesh dispatches are counted.
+
+`gpu252` (lit, 43.3 / 22.6, 259-315 ms a frame) answered all three:
+
+- Heap sync: 250k-309k stale slots a frame, about 95% "unmade" (record
+  current, nothing made), against about 20k API view writes. Cause (audit):
+  the title's view heap has 1,245,184 slots, but the NVIDIA host heap is
+  capped at 1,000,000 (the 2^21 probe is refused), which leaves 721,469 for
+  the title; every sync visited the slots above the cap, which `mirror`
+  passes by.
+- Flight study: before about 25 of 29 submissions the title waits on a
+  fence; only 2 or 3 would be free to stay in flight. One submission in
+  flight gains little until those waits are met sooner.
+- Guard faults: about 200 a frame in write-watched pools against 600-680 in
+  mapped views, below the 50% that would make write-watch on pools worth it.
+- No indirect mesh dispatch was dropped in this scene.
+
+### Per-command GPU time (`gpu253`, timing run)
+
+Lists take 110-127 ms of wall time, their commands 83-98 ms. By kind:
+indirect mesh draws 39.2 ms (5,104 a frame), dispatches 24.5 ms (2,512),
+direct mesh 8.6 ms, the indirect argument clamp 4.7 ms (1,136). No single
+command passes 5 ms: the time is a long tail, so the wins are in what every
+command pays (translation, barriers, memory). Video memory is at 11,143 of
+11,779 MB with 6.3 GB in system memory.
+
+### Changes measured one at a time
+
+| Run | Change | Picture (wall / floor) | Frame ms | Result |
+|---|---|---|---|---|
+| `gpu254` | Heap sync stops at the host heap's mirrored slots | Lit, 40.2 / 29.6 | 266-307 | Unmade slots 250k to about 2k; sync 58-63 to 55-57 ms. Kept |
+| `gpu255` | Tables every shader reads (page table, view strides, marks, addresses) in GPU upload heaps (`VICTORY_TABLES_GPU_UPLOAD`, capped by `VICTORY_TABLES_GPU_UPLOAD_MAX_MB`, default 512) | Lit, 44.4 / 21.0 | 250-303 (GPU 79-92) | About 10 ms off the frame. Kept |
+| `gpu256` | Heap sync takes the heaps' lock one page at a time | Lit, 43.6 / 23.6 | 262-300 | Title threads still wait 200-220 ms a frame to write views: the wait is not this lock. Reverted |
+
+A draw still reads title slot 999,999, past the host heap: indexed heap
+reads past 721,469 read a null view. A sparse remap of title slots to host
+slots is being designed.
+
 ## Open problems
 
 - About 1 frame per second.
