@@ -559,6 +559,8 @@ pub(crate) fn record_upload(
 ) -> Option<D3D12_RESOURCE_BARRIER> {
     const COPY_DEST: u32 = 0x400;
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+    #[cfg(feature = "diagnostics")]
+    list.note_host("host-upload");
     if let Some(b) = list.move_texture(copy, COPY_DEST) {
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };

@@ -348,13 +348,17 @@ fn integer(format: u32) -> bool {
 /// copy recorded now, or by the list's prelude for its first use). For
 /// unordered access the twin's planes are moved there and true returned:
 /// the depth texture itself is not used.
+// The note between the two conditions exists in diagnostics builds alone.
+#[allow(clippy::collapsible_if)]
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
     let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
-    if let Some(to_depth) = list.twin_use(depth, side, writes)
-        && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
-    {
-        list.need_rebind();
+    if let Some(to_depth) = list.twin_use(depth, side, writes) {
+        #[cfg(feature = "diagnostics")]
+        list.note_host("host-twin");
+        if twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w)) {
+            list.need_rebind();
+        }
     }
     if side == DEPTH {
         return false;

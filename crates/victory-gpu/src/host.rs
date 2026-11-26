@@ -49,6 +49,9 @@ pub(crate) struct Host {
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
+    /// Timestamps around each submission (diagnostics, timing off).
+    #[cfg(feature = "diagnostics")]
+    clock: OnceLock<Option<crate::gpumeasure::Clock>>,
     /// A ring of depth views, used as `rtvs`.
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
@@ -352,6 +355,8 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
+            #[cfg(feature = "diagnostics")]
+            clock: OnceLock::new(),
             rtvs,
             rtv_size,
             dsvs,
@@ -433,9 +438,20 @@ fn gpu_times(wall: Duration, commands: &[(f64, String)]) {
     }
 }
 
+/// Commands past their list's stamp cap, since the last frame-rate line.
+#[cfg(feature = "diagnostics")]
+static UNTIMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Logs [`GPU_TIMES`] per frame over `frames` frames: the 25 costliest.
 #[cfg(feature = "diagnostics")]
 fn log_gpu_times(frames: f64) {
+    let untimed = UNTIMED.swap(0, Ordering::Relaxed);
+    if untimed > 0 {
+        tracing::warn!(
+            "GPU timing: {:.1} commands/frame past the stamp cap, timed together as untimed-tail",
+            untimed as f64 / frames
+        );
+    }
     let Some((by, wall, sum)) = GPU_TIMES.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
@@ -1087,6 +1103,9 @@ pub(crate) struct HostList {
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
+    /// The open window of indirect draws clamped together (`indirect`,
+    /// `VICTORY_CLAMP_WINDOW`).
+    clamp_window: Mutex<Option<crate::indirect::Window>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1099,6 +1118,9 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_PIPELINE_STATS`: the list's statistics query.
+    #[cfg(feature = "diagnostics")]
+    stats: OnceLock<Option<crate::gpumeasure::ListStats>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1113,9 +1135,10 @@ pub(crate) fn warn_depth_bounds() {
     ONCE.call_once(|| tracing::warn!("the host GPU has no depth bounds test; depth bounds are ignored"));
 }
 
-/// Timestamps per list (diagnostics); commands past them are not timed.
+/// Timestamps per list (diagnostics, timing on); commands past them are
+/// counted and timed together.
 #[cfg(feature = "diagnostics")]
-const STAMPS: u32 = 4096;
+const STAMPS: u32 = 1 << 16;
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -1425,7 +1448,7 @@ impl Host {
             )?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
-            Ok(HostList {
+            let made = HostList {
                 allocator,
                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
                 list,
@@ -1443,13 +1466,23 @@ impl Host {
                 id,
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
+                clamp_window: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
-            })
+                #[cfg(feature = "diagnostics")]
+                stats: OnceLock::new(),
+            };
+            #[cfg(feature = "diagnostics")]
+            if crate::gpumeasure::stats_on()
+                && let Some(stats) = made.stats.get_or_init(|| crate::gpumeasure::ListStats::new(&self.device))
+            {
+                stats.begin(&made.list);
+            }
+            Ok(made)
         }
     }
 
@@ -1576,6 +1609,16 @@ impl Host {
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
+        // Diagnostics, timing off: a timestamp before and after the lists.
+        #[cfg(feature = "diagnostics")]
+        let clock = (!timing())
+            .then(|| self.clock.get_or_init(|| crate::gpumeasure::Clock::new(&self.device, &self.queue)))
+            .and_then(Option::as_ref);
+        #[cfg(feature = "diagnostics")]
+        if let Some(clock) = clock {
+            lists.insert(0, Some(clock.begin.clone()));
+            lists.push(Some(clock.end.clone()));
+        }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
@@ -1653,6 +1696,12 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
             #[cfg(feature = "diagnostics")]
+            if let Some(clock) = clock
+                && !unwaited
+            {
+                clock.add(started.elapsed());
+            }
+            #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
@@ -1695,6 +1744,10 @@ impl Host {
                 last_notes(runs),
                 removed_during(runs, removed_in)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if !unwaited {
+            crate::gpumeasure::add_statistics(runs);
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -2079,40 +2132,8 @@ impl HostList {
         }
         self.stamps
             .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
+                let bytes = u64::from(STAMPS) * 8;
+                crate::gpumeasure::queries(&host()?.device, D3D12_QUERY_HEAP_TYPE_TIMESTAMP, STAMPS, bytes)
             })
             .as_ref()
     }
@@ -2139,7 +2160,8 @@ impl HostList {
         let mut times: Vec<(f64, String)> = (0..count)
             .map(|i| {
                 let ticks = stamps[i + 1].saturating_sub(stamps[i]);
-                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.chars().take(300).collect())
+                let note = crate::gpumeasure::span_note(i, count, notes.len(), &notes[i].0);
+                (ticks as f64 * 1e3 / frequency.max(1) as f64, note)
             })
             .collect();
         times.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -2169,7 +2191,16 @@ impl HostList {
             || node_is_list(None, ansi.as_deref(), &pointers, &name)
     }
 
+    /// The list's statistics query, if it has one.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn statistics(&self) -> Option<&crate::gpumeasure::ListStats> {
+        self.stats.get()?.as_ref()
+    }
+
     pub(crate) fn close(&self) {
+        crate::indirect::end_window(self);
+        #[cfg(feature = "diagnostics")]
+        self.note_host("host-close");
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2189,12 +2220,18 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
-            let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+            let noted = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            let count = noted.min(STAMPS - 1);
+            UNTIMED.fetch_add(u64::from(noted - count), Ordering::Relaxed);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
                 self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(stats) = self.statistics() {
+            stats.end(&self.list);
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
@@ -2209,6 +2246,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         self.synced.store(false, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
+        *self.clamp_window() = None;
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2229,6 +2267,10 @@ impl HostList {
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(stats) = self.statistics() {
+            stats.begin(&self.list);
         }
     }
 
@@ -2455,9 +2497,20 @@ impl HostList {
         self.note(what, Some(range));
     }
 
+    /// With `VICTORY_GPU_TIMING`: what the host records next (setup,
+    /// barriers, a command without a note of its own) is timed as `what`,
+    /// not as the command before it.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_host(&self, what: &'static str) {
+        if timing() {
+            self.note(|| what.to_owned(), None);
+        }
+    }
+
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
-        if dred_on() {
+        // Timing alone needs the stamps too, not only device-removed data.
+        if dred_on() || timing() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
@@ -2735,6 +2788,11 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    /// The list's open window of indirect draws clamped together.
+    pub(crate) fn clamp_window(&self) -> std::sync::MutexGuard<'_, Option<crate::indirect::Window>> {
+        self.clamp_window.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Begins occlusion query `index` of `heap` unless it is running in
@@ -3819,6 +3877,7 @@ impl Meter {
                 let drops = crate::pipeline::take_drops();
                 crate::frame::log();
                 log_gpu_times(report_frames);
+                crate::gpumeasure::log(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
                 crate::shadow::log_views(report_frames);

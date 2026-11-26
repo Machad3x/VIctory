@@ -770,6 +770,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
+            #[cfg(feature = "diagnostics")]
+            list.note_host("host-copy");
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             dst_write.record(list);
@@ -886,6 +888,8 @@ extern "system" fn copy_texture_region(
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
+            #[cfg(feature = "diagnostics")]
+            list.note_host("host-copy");
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
@@ -897,6 +901,8 @@ extern "system" fn copy_texture_region(
         {
             crate::texture::upload(list, dst.resource, &to);
         }
+        #[cfg(feature = "diagnostics")]
+        list.note_host("host-copy");
         ensure_state(list, dst.resource, COPY_DEST);
         dst_write.record(list);
         let mut to_location = dst;
@@ -1074,6 +1080,8 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     if crate::texture::title_written(&texture) {
         crate::texture::upload(list, src.resource, &texture);
     }
+    #[cfg(feature = "diagnostics")]
+    list.note_host("host-copy");
     ensure_state(list, src.resource, COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
@@ -1177,6 +1185,8 @@ extern "system" fn resolve(
         }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        #[cfg(feature = "diagnostics")]
+        list.note_host("host-copy");
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         dst_write.record(list);
@@ -1301,6 +1311,8 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(&texture, record.desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_host("clear-rtv");
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
@@ -1347,6 +1359,8 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        #[cfg(feature = "diagnostics")]
+        list.note_host("clear-dsv");
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
@@ -1604,6 +1618,8 @@ extern "system" fn sync(this: This, flags: u32, control: u32, _address: u64, _si
             SYNC_BARRIERS.with(|n| n.set(n.get() + 1));
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            #[cfg(feature = "diagnostics")]
+            list.note_host("host-sync");
             // SAFETY: an open list.
             unsafe { list.list.ResourceBarrier(&[barrier]) };
         }

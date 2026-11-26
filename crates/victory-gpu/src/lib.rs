@@ -37,6 +37,8 @@ pub mod frame;
 mod hold;
 #[cfg(windows)]
 mod fx;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gpumeasure;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]

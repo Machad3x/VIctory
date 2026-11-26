@@ -794,9 +794,15 @@ impl State {
         compute: bool,
         dims: [u32; 3],
     ) -> bool {
+        // A store ends the window of clamped indirect draws first.
+        if crate::indirect::windows_on() && may_store(p) {
+            crate::indirect::end_window(list);
+        }
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
         let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        #[cfg(feature = "diagnostics")]
+        list.note_host("host-setup");
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1257,6 +1263,8 @@ impl State {
         float: bool,
         rects: &[RECT],
     ) {
+        // A clear may write a buffer: no clamp window stays open past it.
+        crate::indirect::end_window(list);
         let Some((view, _pin)) = crate::descriptor::view_pinned(cpu) else {
             once!("an unordered access clear of a slot without a view");
             return;
@@ -1286,6 +1294,8 @@ impl State {
             user_data: 0,
             slot: 0,
         };
+        #[cfg(feature = "diagnostics")]
+        list.note_host("clear-uav");
         readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
@@ -2048,12 +2058,36 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        // A draw whose shaders store nothing may share a clamp pass with the
+        // indirect draws around it (`crate::indirect`).
+        let window = (crate::indirect::windows_on() && kind != DISPATCH)
+            .then(|| {
+                if may_store(crate::pipeline::host_pipeline(self.pipeline as This)?) {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::ClampStoring, 1);
+                    return None;
+                }
+                let (start, _) = args.range();
+                crate::indirect::windowed(list, args.gpu(start), arguments - start, (kind, stride, max))
+            })
+            .flatten();
+        let joined = window.is_some();
+        // The records' buffer and offset, and whether a clamp pass replaced
+        // the compute root signature and pipeline.
+        let (clamped, at, replaced) = match window {
+            Some(window) => window,
+            None => {
+                let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max)) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                (clamped, 0, true)
+            }
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
+        if replaced {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -2069,7 +2103,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            if !joined {
+                crate::indirect::done(list, &clamped);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -2096,7 +2132,7 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                0,
+                at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -2110,10 +2146,13 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, (&clamped, at), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        // A window's buffer stays readable as arguments until it ends.
+        if !joined {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -2121,6 +2160,25 @@ impl State {
         }
         true
     }
+}
+
+/// Whether a pipeline's shaders may store to memory, buffers among it.
+fn may_store(p: &HostPipeline) -> bool {
+    p.stages.iter().any(|s| stores(s.translated()))
+}
+
+/// Whether a shader may store: marked view writes, title memory, heap
+/// views, root unordered views, or any unordered view in a table (read or
+/// written).
+fn stores(t: &crate::pipeline::Translated) -> bool {
+    t.host.view_marks
+        || t.host.memory_writes
+        || t.host.heap_writes
+        || !t.host.written_root_uavs.is_empty()
+        || t.host.user_data.iter().any(|u| {
+            u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_UAV_VIEW
+        })
+        || t.used.iter().any(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -2921,6 +2979,105 @@ uint ps() : SV_Target { return 1; }
                 unsafe { (data.add(f.Offset as usize + (i / 64) * f.Footprint.RowPitch as usize + (i % 64) * 4) as *const u32).read() == 1 }
             })
             .collect()
+    }
+
+    /// A compute shader as translated, with no resources.
+    fn bare(dxil: Vec<u8>) -> crate::pipeline::Translated {
+        crate::pipeline::Translated {
+            host: victory_shader::emit::HostShader {
+                stage: victory_shader::HwStage::Cs,
+                dxil,
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                memory: false,
+                memory_writes: false,
+                view_addresses: false,
+                heap: false,
+                heap_writes: false,
+                view_marks: false,
+            },
+            used: Vec::new(),
+            threads: None,
+        }
+    }
+
+    /// Each way a shader may store is one; reading is not.
+    #[test]
+    fn every_kind_of_store_is_one() {
+        use victory_shader::emit::{ROOT_SRV_VIEW, ROOT_UAV_VIEW, UserData};
+        type Change = fn(&mut crate::pipeline::Translated);
+        let with = |change: Change| {
+            let mut t = bare(Vec::new());
+            change(&mut t);
+            stores(&t)
+        };
+        assert!(!with(|_| {}));
+        let storing: [Change; 6] = [
+            |t| t.host.view_marks = true,
+            |t| t.host.memory_writes = true,
+            |t| t.host.heap_writes = true,
+            |t| t.host.written_root_uavs.push(0),
+            |t| t.used.push(used(ResourceType::Uav)),
+            |t| t.host.user_data.push(UserData { index: 0, slot: 0, root: RootType::Descriptor, dword: ROOT_UAV_VIEW }),
+        ];
+        assert!(storing.into_iter().all(with));
+        assert!(!with(|t| t.used.push(used(ResourceType::Srv))));
+        assert!(!with(|t| t.host.user_data.push(UserData { index: 0, slot: 0, root: RootType::Descriptor, dword: ROOT_SRV_VIEW })));
+    }
+
+    /// A clamp window stays open across a pipeline that stores nothing, and
+    /// ends before one that may store and before an unordered-access clear.
+    #[test]
+    fn stores_and_clears_end_a_clamp_window() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let source = "[numthreads(1, 1, 1)] void main() {}";
+        let mut code = None;
+        // SAFETY: the source and names live through the call.
+        unsafe {
+            windows::Win32::Graphics::Direct3D::Fxc::D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                windows::core::s!("none"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's own bytes.
+        let dxil = unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) }.to_vec();
+        let pipeline = |written: Vec<u8>| {
+            let mut t = bare(dxil.clone());
+            t.host.written_root_uavs = written;
+            let shader = crate::pipeline::translated_for_test("compute", t);
+            crate::pipeline::host::HostPipeline::new(&[shader], None).expect("a host pipeline")
+        };
+        let (reading, storing) = (pipeline(Vec::new()), pipeline(vec![0]));
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        crate::indirect::FORCE_WINDOWS.set(true);
+        crate::indirect::open_for_test(&list);
+        assert!(state.bind(&list, &reading, true));
+        assert!(list.clamp_window().is_some(), "nothing stored");
+        assert!(state.bind(&list, &storing, true));
+        assert!(list.clamp_window().is_none(), "a store");
+        crate::indirect::open_for_test(&list);
+        state.clear_unordered(&list, 0, [0; 4], false, &[]);
+        assert!(list.clamp_window().is_none(), "a clear");
+        list.close();
     }
 
     /// A title buffer of `bytes` in memory of its own.

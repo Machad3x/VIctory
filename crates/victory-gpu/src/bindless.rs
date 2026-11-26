@@ -277,6 +277,8 @@ pub(crate) fn uploads(
             UPLOADED.fetch_add(1, Relaxed);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    list.note_host("host-upload");
     if !readable.is_empty() {
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };

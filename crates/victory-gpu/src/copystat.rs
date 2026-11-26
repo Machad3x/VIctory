@@ -131,10 +131,16 @@ pub(crate) enum C {
     /// the list since the one before.
     Clamps,
     ClampsNoWrite,
+    /// Windows of indirect draws clamped together (`VICTORY_CLAMP_WINDOW`),
+    /// the draws they took, and indirect draws clamped alone because their
+    /// shaders may store.
+    ClampWindows,
+    ClampWindowDraws,
+    ClampStoring,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
-const COUNTERS: usize = 79;
+const COUNTERS: usize = 82;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -370,6 +376,14 @@ pub(crate) fn log(frames: f64) {
         c[C::ClampsNoWrite as usize],
         mb(c[C::VideoBytes as usize]),
     );
+    if crate::indirect::windows_on() {
+        tracing::info!(
+            "  clamp windows per frame: {:.0} holding {:.0} indirect draws; {:.0} indirect draws alone as they may store",
+            c[C::ClampWindows as usize],
+            c[C::ClampWindowDraws as usize],
+            c[C::ClampStoring as usize],
+        );
+    }
     let held: Vec<String> = crate::watch::held_times()
         .iter()
         .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
