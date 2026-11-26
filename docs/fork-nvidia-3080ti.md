@@ -769,7 +769,11 @@ The shader crate tests pass but one that already failed; one game run
 
 Upstream [#1777](https://github.com/Marvisak/VIctory/pull/1777) with the title
 index redirect of [#2628](https://github.com/Marvisak/VIctory/pull/2628) and
-review fixes. Not yet verified in the game.
+review fixes. `gpu218` (compile run) and `gpu219` (warm, 5 minutes) ran with
+it: no errors, `gpu219` rendered lit at about 365 to 405 ms per frame, inside
+the spread of `gpu214` to `gpu217`. `gpu219` warned of title slots past the host
+heap (from 721,469, none for a draw) and of one texture read past the heap. No
+effect on the picture is established.
 
 | Change | What was wrong |
 |---|---|
@@ -792,8 +796,13 @@ From logs and code; no fix yet and no proven cause of the dark interiors.
 - Every `title memory this frame` line of runs `gpu215` to `gpu217` shows
   `0 pages copied back`: persistent title-memory misses hold back the
   copy-back of what shaders wrote.
-- The title's pipeline sync (`sync` in `list.rs`) does nothing: it records no
-  host barrier.
+- The title's pipeline sync (`sync` in `list.rs`) now records a global
+  barrier. The title rarely calls it: one report each in `gpu218` and
+  `gpu219` showed 0.1 calls per frame, the others none.
+- Computes `5e5b5c98afaa1753`, `f0afa89ecfb6944e` and `8d5d3f97369050bd` were
+  bound in every lit run compared. In the dark runs `gpu196`, `gpu211`,
+  `gpu213` and `gpu218` the title created them and never bound them; `gpu200`
+  and `gpu210` bound them and were dark. A correlation, not a cause.
 
 ## Tried and left out
 
