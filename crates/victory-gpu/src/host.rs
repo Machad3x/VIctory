@@ -446,6 +446,17 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn legal_states_are_texture_states_with_writes_alone() {
+        assert_eq!(super::legal_for(0x2, 0x10 | 0x80), 0x10);
+        assert_eq!(super::legal_for(0, 0x40_4080), 0x80);
+        assert_eq!(super::legal_for(0x1, 0x4 | 0x80), 0x4);
+        for (flags, state) in [(0x2, 0x10 | 0x80), (0, 0x40_4080), (0x1, 0x4 | 0x80), (0, 0x100_0080)] {
+            let legal = super::legal_for(flags, state);
+            assert_eq!(super::legal_for(flags, legal), legal);
+        }
+    }
+
     /// Keeps submissions off while held: for tests of what one takes from
     /// state all share, such as the shaders' marks in the bitmaps
     /// (`crate::shadow::copy_back_marks` takes every mark set), which a
@@ -4178,10 +4189,14 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         (0x2, false, 0x10 | 0x20),
         (0x8, true, 0x40 | 0x80),
     ];
-    FORBIDDEN
+    // Only texture states the host takes, and a write state only alone (the
+    // lowest one): D3D12 rejects it combined with any other.
+    let s = FORBIDDEN
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
-        .fold(state, |s, &(_, _, bits)| s & !bits)
+        .fold(state & 0x100_3cfc, |s, &(_, _, bits)| s & !bits);
+    let write = s & 0x141c;
+    if write != 0 { write & write.wrapping_neg() } else { s }
 }
 
 /// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):

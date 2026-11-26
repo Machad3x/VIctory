@@ -58,8 +58,8 @@ pub(crate) struct HostHeap {
     /// and shaders index the view addresses at the slots their tables are
     /// in), the console descriptor's dwords 0-3 as far as the host knows
     /// them (shaders reading a descriptor as data, `crate::memory`;
-    /// [`write_address`]): the buffer, its mapping and host address, made on
-    /// first use.
+    /// [`write_address`]): the buffer, its mapping and host address, made
+    /// with the view heap.
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
@@ -239,6 +239,11 @@ impl HostHeap {
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
+            // Before any slot is made: a first use later can zero entries
+            // made meanwhile, or miss one mirrored as it is published.
+            if h.count > 0 {
+                h.view_addresses();
+            }
         }
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -604,7 +609,8 @@ impl HostHeap {
     }
 
     /// The host address of the slots' view addresses (see the field), made
-    /// on first use from the slots made so far.
+    /// with the view heap (on first use for one with no title slots), from
+    /// the slots made so far.
     pub(crate) fn view_addresses(&self) -> Option<u64> {
         let made = self.addresses.get_or_init(|| {
             // The view is a root view, which has no bounds: an entry for
@@ -612,7 +618,10 @@ impl HostHeap {
             // made afresh on a host whose heap is smaller than the title's
             // read past the title slots' entries: whatever followed the
             // buffer, or a GPU fault).
-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
+            let Some((buffer, data)) = host()?.upload_buffer(u64::from(self.address_slots()) * 16) else {
+                tracing::warn!(slots = self.address_slots(), "no view address buffer");
+                return None;
+            };
             crate::host::name(&buffer, || "view addresses".into());
             let data = data as usize;
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2937,6 +2946,14 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn view_addresses_exist_from_creation() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        assert!(matches!(heap.addresses.get(), Some(Some(_))));
     }
 
     /// A table made afresh lies in dynamic slots, and a shader reading a
