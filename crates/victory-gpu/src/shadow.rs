@@ -862,6 +862,7 @@ impl Shadow {
         // title memory's bytes: nothing to read again. (A third of the
         // world's marked pages hold no changed byte.)
         let mut again = Vec::with_capacity(compared.len());
+        let mut synced = Vec::with_capacity(compared.len());
         static PUSH_ALL: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("VICTORY_PUSH_ALL").is_some_and(|v| v == "1"));
         for c in &compared {
@@ -876,6 +877,9 @@ impl Shadow {
             if *PUSH_ALL || !reread && c.back.as_ref().is_some_and(|&(_, _, took)| took) {
                 self.push(c.from - start, c.to - c.from);
             }
+            if c.back.is_some() {
+                synced.push((c.from - start, c.to - start));
+            }
         }
         drop(compared);
         if !again.is_empty() {
@@ -888,6 +892,25 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), PAGE) };
                 crate::host::read_into((page * PAGE) as *const u8, host);
                 self.push(at, PAGE);
+            }
+        }
+        // What a declared range's copy-back compares with: or the title's
+        // bytes just taken would be taken for the shaders'.
+        if synced.is_empty() {
+            return written;
+        }
+        // shortcut: pages are copied here and compared again by the
+        // copy-back; mark their pieces done if that shows in the timings.
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        for (a, b) in synced {
+            for (at, bytes) in before.0.iter_mut() {
+                let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+                if s < e {
+                    // SAFETY: inside the mapping; only the submitting thread
+                    // writes it.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                    bytes[s - *at..e - *at].copy_from_slice(host);
+                }
             }
         }
         written
@@ -3805,6 +3828,33 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!((read_title(probe), read_title(probe + 1)), (0xaa, 0x33), "{label}: second");
             unregister(p, p as u64);
         }
+    }
+
+    /// A declared copy-back after a marked run of the same page leaves a
+    /// title write made after the run (upstream #2436).
+    #[test]
+    fn a_declared_copy_back_after_a_marked_run_keeps_newer_title_bytes() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            eprintln!("skipped a_declared_copy_back_after_a_marked_run_keeps_newer_title_bytes: no host GPU");
+            return;
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, false);
+        copy.writing(p, PAGE, true);
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + 40) as *mut u8).write_volatile(1) };
+        copy.copy_back_run(&[p]);
+        // SAFETY: as above.
+        unsafe { ((p + 40) as *mut u8).write_volatile(2) };
+        copy.copy_back(p, PAGE);
+        // SAFETY: bytes of our pool.
+        let at = |i: usize| unsafe { ((p + i) as *const u8).read_volatile() };
+        assert_eq!((at(10), at(40)), (0xaa, 2));
+        unregister(p, p as u64);
     }
 
     /// FIND-14: a copy-back that is still pending when the title gives its
