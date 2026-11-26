@@ -2875,14 +2875,18 @@ impl<'a> Lower<'a> {
                 self.as_float(x)
             }
         };
-        if v.abs >> k & 1 != 0 {
+        Ok(self.fmods(f, v.abs, v.neg, k))
+    }
+
+    fn fmods(&mut self, mut f: V, abs: u8, neg: u8, k: usize) -> V {
+        if abs >> k & 1 != 0 {
             f = self.unary(6, f);
         }
-        if v.neg >> k & 1 != 0 {
+        if neg >> k & 1 != 0 {
             let z = self.s.m.f32(0x8000_0000);
             f = self.s.m.bin(self.cur, Bin::Sub, z, f);
         }
-        Ok(f)
+        f
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
@@ -6954,6 +6958,7 @@ impl<'a> Lower<'a> {
                         self.as_float(x)
                     }
                 };
+                let acc = self.fmods(acc, v.abs, v.neg, 2);
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -7689,17 +7694,10 @@ impl<'a> Lower<'a> {
         };
         let h = self.half_src(inst, k)?;
         let f32t = self.s.t.f32;
-        let mut f = self
+        let f = self
             .s
             .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        if v.abs >> k & 1 != 0 {
-            f = self.unary(6, f);
-        }
-        if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
-        }
-        Ok(f)
+        Ok(self.fmods(f, v.abs, v.neg, k))
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
@@ -7875,8 +7873,10 @@ impl<'a> Lower<'a> {
                 };
                 let m = self.s.m.i32(0xFFFF);
                 let x = self.s.m.bin(c, Bin::And, x, m);
-                self.s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                let f = self
+                    .s
+                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                self.fmods(f, v.abs, v.neg, 2)
             } else {
                 self.half_fsrc(inst, 2)?
             };

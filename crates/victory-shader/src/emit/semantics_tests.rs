@@ -1197,19 +1197,11 @@ fn arithmetic_probes() -> Vec<Probe> {
     let small = pairs(F32_EDGES, &F32_EDGES[..16]);
     let abc_small = triples(&F32_EDGES[..16], &F32_EDGES[..16], F32_THIRD);
     for m in source_mods().into_iter().chain(output_mods()) {
-        if m.abs >> 2 != 0 || m.neg >> 2 != 0 {
-            continue;
-        }
-        p.push(vop3_f2(0x107, m, mul_legacy, small.clone(), tolerant(0, m)));
-        p.push(vop3_f2(0x103, m, add, small.clone(), tolerant(0, m)));
-        let subrev: F2 = |a, b| add(b, a ^ 0x8000_0000);
-        p.push(vop3_f2(0x105, m, subrev, small.clone(), tolerant(0, m)));
-        if m.abs | m.neg != 0 {
-            let sub: F2 = |a, b| add(a, b ^ 0x8000_0000);
-            p.push(vop3_f2(0x104, m, sub, small.clone(), tolerant(0, m)));
-        }
         // v_fmac_f32 in VOP3: the accumulator v5 = c.
-        let x = move |i: [u32; 4], f: F3| f(mods_in(i[0], 0, m), mods_in(i[1], 1, m), i[2]);
+        let x = move |i: [u32; 4], f: F3| {
+            let s = |k| mods_in(i[k], k, m);
+            f(s(0), s(1), s(2))
+        };
         let mut body = vec![vop1(0x01, 5, v(3))];
         body.extend(vop3(0x12B, 5, [v(1), v(2), 0], m));
         p.push(
@@ -1227,6 +1219,17 @@ fn arithmetic_probes() -> Vec<Probe> {
                 move |i| vec![mods_out_kept(x(i, fma), m)],
             ),
         );
+        if m.abs >> 2 != 0 || m.neg >> 2 != 0 {
+            continue;
+        }
+        p.push(vop3_f2(0x107, m, mul_legacy, small.clone(), tolerant(0, m)));
+        p.push(vop3_f2(0x103, m, add, small.clone(), tolerant(0, m)));
+        let subrev: F2 = |a, b| add(b, a ^ 0x8000_0000);
+        p.push(vop3_f2(0x105, m, subrev, small.clone(), tolerant(0, m)));
+        if m.abs | m.neg != 0 {
+            let sub: F2 = |a, b| add(a, b ^ 0x8000_0000);
+            p.push(vop3_f2(0x104, m, sub, small.clone(), tolerant(0, m)));
+        }
     }
     for m in source_mods().into_iter().chain(output_mods()) {
         p.push(vop3_f3(
