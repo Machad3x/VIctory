@@ -126,15 +126,16 @@ pub(crate) fn mode() -> u8 {
 type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// A refresh of `len` bytes from `src` (memory type `kind`) copied `copied`
+/// of them and took `us`.
+pub(crate) fn range(src: usize, len: usize, copied: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)
         .entry((src, len))
         .or_insert((0, 0, 0, kind));
     e.0 += 1;
-    e.1 += len as u64;
+    e.1 += copied as u64;
     e.2 += us;
 }
 

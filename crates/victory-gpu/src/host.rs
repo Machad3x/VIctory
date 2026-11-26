@@ -2618,7 +2618,7 @@ impl HostList {
         let deferred = self.deferred();
         let mut steps = deferred.copies.iter().peekable();
         while let Some(step) = steps.next() {
-            let started = std::time::Instant::now();
+            let mut started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
                 started,
@@ -2640,6 +2640,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_written();
+                    // The flush counted its own time.
+                    started = std::time::Instant::now();
                     // The copy follows the recorded order: a source the
                     // submission's shaders write is still old here (it
                     // lands in title memory in the copy-back), and a
@@ -2837,7 +2839,7 @@ impl Batch {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+            crate::copystat::range(from, to - from, copied, started.elapsed().as_micros() as u64, 0);
             #[cfg(not(feature = "diagnostics"))]
             let _ = started;
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
