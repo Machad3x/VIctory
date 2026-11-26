@@ -1377,20 +1377,21 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
-/// Threads that put marked pages back, at most (the title's own threads
-/// run meanwhile).
-const PAGE_THREADS: usize = 6;
-/// Marked pages worth a thread more: fewer go back on the submitting one.
-const PAGES_PER_THREAD: usize = 8;
+/// Marked pages worth other threads: fewer go back on the submitting one.
+const PARALLEL_PAGES: usize = 16;
+
+/// The threads of a copy-back, the submitting one among them (what it had
+/// when it spawned them per submission).
+const COPY_BACK_THREADS: usize = 6;
 
 /// Runs `f` on every `(copy, pages)`, pages next to each other in one copy
-/// together ([`RUN_PAGES`] at most), on several threads when there are many:
-/// a 64 KiB page costs 55 to 80 microseconds (two reads, a compare, writes
-/// and a protection change), and a world frame marks 2,000. The copies of
-/// one page keep their order, on one thread.
+/// together ([`RUN_PAGES`] at most), on several threads when there are many
+/// (kept between submissions): a 64 KiB page costs 55 to 80
+/// microseconds (two reads, a compare, writes and a protection change), and a
+/// world frame marks 2,000. The copies of one page keep their order, on one
+/// thread.
 fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, &[usize]) + Sync) {
     pages.sort_by_key(|&(_, page)| page);
-    let threads = (pages.len() / PAGES_PER_THREAD).min(PAGE_THREADS);
     // A unit of work: the copies of one page, or a run of pages of one copy.
     let mut units: Vec<(Vec<&Arc<Shadow>>, Vec<usize>)> = Vec::new();
     for group in pages.chunk_by(|a, b| a.1 == b.1) {
@@ -1410,22 +1411,13 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
             f(copy, run);
         }
     };
-    if threads < 2 {
+    if pages.len() < PARALLEL_PAGES {
         units.iter().for_each(each);
         return;
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let work = || {
-        while let Some(unit) = units.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            each(unit);
-        }
-    };
-    std::thread::scope(|scope| {
-        for _ in 1..threads {
-            scope.spawn(work);
-        }
-        work();
-    });
+    static POOL: std::sync::OnceLock<crate::texture::ParallelPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| crate::texture::ParallelPool::new(COPY_BACK_THREADS - 1));
+    pool.run(COPY_BACK_THREADS.min(units.len()), units.len(), |i| each(&units[i]));
 }
 
 /// After a submission: every page its shaders marked as written through

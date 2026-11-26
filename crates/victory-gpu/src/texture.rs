@@ -613,7 +613,7 @@ unsafe impl Send for PoolState {}
 /// Persistent worker pool for [`in_parallel`]: worker threads stay alive
 /// across submissions so each thread keeps its `thread_local!` [`Scratch`]
 /// buffer warm instead of re-faulting and zero-filling it on every call.
-struct ParallelPool {
+pub(crate) struct ParallelPool {
     workers: usize,
     run_lock: Mutex<()>,
     state: Arc<(Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar)>,
@@ -622,7 +622,7 @@ struct ParallelPool {
 }
 
 impl ParallelPool {
-    fn new(workers: usize) -> Self {
+    pub(crate) fn new(workers: usize) -> Self {
         let state = Arc::new((
             Mutex::new(PoolState {
                 job: std::ptr::null(),
@@ -687,7 +687,7 @@ impl ParallelPool {
         }
     }
 
-    fn run<F: Fn(usize) + Sync>(&self, threads: usize, n: usize, f: F) {
+    pub(crate) fn run<F: Fn(usize) + Sync>(&self, threads: usize, n: usize, f: F) {
         use std::sync::atomic::AtomicUsize;
 
         let workers = threads.saturating_sub(1).min(self.workers);
