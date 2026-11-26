@@ -116,7 +116,7 @@ impl Lower<'_> {
         let Operand::Vector { reg: out, .. } = *data else {
             return Err("a BVH intersection result");
         };
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let c = self.cur;
         let i64t = self.s.m.int(64);
         // The node's byte offset from the BVH's base: (pointer & !7) * 8.

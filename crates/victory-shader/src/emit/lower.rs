@@ -3370,10 +3370,16 @@ impl<'a> Lower<'a> {
     /// group only keeps for its barriers ([`Self::partial_active`]).
     fn memory_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         let g = self.guard(b, i)?;
-        Ok(match (g, self.partial_active) {
+        Ok(self.launched_guard(g))
+    }
+
+    /// `guard` without the threads a partial final group keeps for its
+    /// barriers ([`Self::partial_active`]).
+    fn launched_guard(&mut self, guard: Option<V>) -> Option<V> {
+        match (guard, self.partial_active) {
             (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
             (g, a) => g.or(a),
-        })
+        }
     }
 
     /// `on` (the lanes of mask `mask`, at `at`) without the threads a partial
@@ -3843,6 +3849,8 @@ impl<'a> Lower<'a> {
     /// quad ops so WQM helper lanes remain active (`waveActiveBallot` excludes
     /// helper lanes in DXIL).
     fn src_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> Option<V> {
+        // A lane the console never launched is a source EXEC leaves out.
+        let guard = self.launched_guard(guard);
         let c = self.cur;
         if self.s.pixel {
             let g = guard?;

@@ -103,7 +103,10 @@ impl<'a> Lower<'a> {
                 lane
             };
             let r = self.read_lane(x, lane);
-            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+            // Lanes the console never launched give 0, as EXEC's others.
+            let on = self
+                .launched_guard(guard)
+                .unwrap_or_else(|| self.s.m.bool(true));
             let i32t = self.s.t.i32;
             let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
             let ballot = self
