@@ -512,6 +512,20 @@ no draws dropped and no device removal. Reported upstream as
 [#3089](https://github.com/Marvisak/VIctory/issues/3089); the bitmap fix is
 also open there as [#2269](https://github.com/Marvisak/VIctory/pull/2269).
 
+## Miss check, host copy wait and mark tests
+
+The miss check after a list using title memory now walks only the set bits of
+its bitmap. The GPU copy before a copy-back waits as submissions do, reporting
+a removed or stalled device, instead of forever; review found that a removed
+device completes its fences and passed that wait as a finished copy, which it
+no longer does. [#3085](https://github.com/Marvisak/VIctory/pull/3085)'s first
+commit is in (its author's), and the other mark tests hold off submissions too.
+
+One run (`gpu191`): frame 376 ms (377 before), copy-back 77 ms (89), marked
+pages 74 ms (80), no draws dropped and no device removal. The people in the
+yard rendered as dark silhouettes in it, as in a run before these changes
+(`gpu189`): the cause is not established.
+
 ## CPU clock and core parking
 
 On a Ryzen 7 5700X the busy logical processors ran at 4.59 GHz in the cell
