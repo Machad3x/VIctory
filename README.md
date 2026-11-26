@@ -16,26 +16,38 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## Status of this fork (2026-11-25)
+## Status of this fork (2026-11-26)
 
 Based on upstream main `63bcca43`, with this fork's changes on top by area.
 
-**Not playable yet.** The title boots, runs its menus, loads the world and
-reaches play inside the prison cell of the first mission: about 1.5 frames per
-second, with rendering defects.
+**About 57% on the [PortWatch VI](https://portwatch-vi.xyz/#method) scale,
+self-assessed** (method and breakdown: [docs/progress-scale.md](docs/progress-scale.md)).
 
-| At the cell window (median of one 7-minute run) | |
+| Step | State |
 |---|---|
-| Frame time | about 390 to 450 ms (about 920 ms before the video-memory copies and the later changes) |
-| GPU step | about 170 ms |
+| Preparation, executable, first frame, main menu, in the world | reached |
+| Playable | in part: play reached in the prison cell of the first mission, HUD prompt shown; a walking session not yet logged |
+| Story | stuck at the start (the cell) |
+| Graphics | lit, but missing major effects |
+| Performance | about 3.5 fps |
+| Stability | no device removal or crash in recent 5-minute runs |
+
+| At the cell window, Series X profile (runs `gpu254` to `gpu256`) | |
+|---|---|
+| Frame time | 250 to 307 ms (390 to 450 ms on 2026-11-25) |
+| GPU step | 79 to 92 ms |
 | Draws and dispatches dropped per frame | 0 in most reports |
 | Device removals in recent runs | none |
 
 What renders: the window with its wired glass, the yard with people, the
-character with hair and clothing, cutscenes, and in some runs the lit cell
-walls and poster. What does not yet: interior lighting varies from run to run
-(the walls are often black), colour banding, and a few shader programs that do
-not translate. In Series S mode the picture turns black after the opening card.
+character with hair and clothing, cutscenes, and the lit cell walls and
+poster. What does not yet: indoor bounce light (the cell is darker than on a
+console), colour banding, lighting that is still dark in some runs, and a few
+shader programs that do not translate. Series S mode renders too, through an
+R9G9B9E5 stand-in for a format the card cannot render to.
+
+Machine: Ryzen 7 5700X, RTX 3080 Ti 12 GB (driver 621.40), 32 GB RAM,
+Windows 11, resizable BAR on.
 
 ### Running it on this fork
 
