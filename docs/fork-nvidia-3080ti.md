@@ -910,6 +910,43 @@ open with one `VirtualProtect`. Against `gpu240`: frame 296-298 ms
 against 309-321, time in the fault handler 93 ms of thread time a frame
 against 120, the interior lit.
 
+### Guard lock timing (`gpu246`)
+
+The fault handler waits 57 to 76 ms a frame for the guard lock, summed
+over threads (longest single wait 6 to 67 ms), while all holders together
+hold it about 33 ms: the handler 11 ms, with single holds up to 3.4 to
+3.7 ms, and `take_split` 10.4 ms, with holds of 0.4 ms or less. Faults
+queue behind faults; the handler's own long holds are the target, not the
+take.
+
+## Series S profile
+
+The scene colour target is DXGI format 67 (`R9G9B9E5_SHAREDEXP`), which the
+host can neither render to nor store to: creating the target failed
+(`E_INVALIDARG`) and the picture was black (`gpu243`). `R11G11B10_FLOAT`
+(26) now stands in for format 67 targets through the existing packed
+stand-in path (as 86 and 115 map to 28):
+
+- texels are converted on upload and read-back (RGB9E5 to and from
+  R11G11B10);
+- read-only placed views of the same memory share the stand-in, also when
+  made before the target;
+- a format 67 target view of the stand-in is made in 26;
+- GPU copies from the stand-in to a native format 67 texture are converted
+  by a compute pass (2D, one slice; other copies are skipped).
+
+The test is ported from Biskwit/VIctory-reloaded (shared-exponent target
+host copy).
+
+| Run | Picture | Frame ms | GPU ms | Copy-back ms |
+|---|---|---|---|---|
+| `gpu243` | Black, wall luma 0.4 | 340-395 | | |
+| `gpu245` | Back, wall luma 45.2, floor 25.3 | 304-337 | 87-95 | 73-84 |
+| `gpu246` (review fixes, guard lock timing) | Back | 286-348 | 90-93 | 66.6 |
+
+`gpu246` dropped 3 draws: a whole-wave `v_or_b32` step does not translate.
+From now on runs use the Series S profile.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
@@ -953,6 +990,7 @@ helpers moved to `lower/spill.rs`.
 | #2121 (paged view heap) | Black picture: the host pages ran out, indirect draws dropped |
 | #2388 | Refuses 19 builder programs that translate today: their descriptors are two pointers read from memory, taken for a loaded descriptor |
 | #2341, #2374, #2380 | Dark pictures in runs that had them; the cause was not isolated |
+| Hot pages (leave pages written every frame unguarded), `gpu244` against `gpu242` (Series X profile) | Frame 361-365 ms against 296-298, moves 49-53 against 24 ms, unmapped 20-21 against 1 MB a frame, watches 5,430-5,500 (27-37 ms) against 2,500-2,650 (13-16 ms), guard faults about 680 against 922, fault handler 110-146 against 93 ms. Open pages stay in `changed` (dirty), so their copies are taken again at each of about 31 submissions, and unmapped hot pages fall into the slow mapped-copy fallback. Kept on branch `dropped/hot-pages` |
 
 ## Open problems
 
