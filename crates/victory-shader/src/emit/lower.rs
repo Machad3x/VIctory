@@ -27,6 +27,7 @@ mod interp;
 mod side_effect;
 use side_effect::has_side_effect;
 mod bvh;
+mod marks;
 
 mod half_round;
 
@@ -5086,6 +5087,9 @@ impl<'a> Lower<'a> {
             let word = self.s.m.bin(c, Bin::Shl, word, k2);
             let bit = self.s.m.bin(c, Bin::And, n, k31);
             let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            let lead = self.mark_lead(n);
+            let led = self.begin_guarded(lead);
+            let c = self.cur;
             // Most writes find their page marked: a load, not an atomic.
             let old = self.raw_dword(bitmap, word);
             let set = self.s.m.bin(c, Bin::And, old, bit);
@@ -5099,6 +5103,7 @@ impl<'a> Lower<'a> {
             // Operation 2 is OR.
             self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
             self.end_guarded(inner, &[]);
+            self.end_guarded(led, &[]);
         }
         self.end_guarded(outer, &[]);
     }
@@ -9002,6 +9007,9 @@ impl<'a> Lower<'a> {
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let lead = self.mark_lead(n);
+        let led = self.begin_guarded(lead);
+        let c = self.cur;
         // Most reads find their slot marked: a load, not an atomic.
         let old = self.raw_dword(bitmap, word);
         let set = self.s.m.bin(c, Bin::And, old, bit);
@@ -9011,6 +9019,7 @@ impl<'a> Lower<'a> {
         // Operation 2 is OR.
         self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[bitmap, k2, word, iu, iu, bit]);
         self.end_guarded(at, &[]);
+        self.end_guarded(led, &[]);
     }
 
     fn image_op(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
