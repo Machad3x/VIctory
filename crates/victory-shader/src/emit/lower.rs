@@ -10498,10 +10498,10 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a byte or half buffer load by index");
             }
+            let (h, off) = self.raw_view(site, src, off, width / 8, (11 | u, 0), false, guard)?;
+            let c = self.cur;
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
             let at = self.s.m.bin(c, Bin::And, off, not3);
-            let (h, at) = self.raw_view(site, src, at, 4, (11 | u, 0), false, guard)?;
-            let c = self.cur;
             let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
             let r = self.s.op(
                 c,
