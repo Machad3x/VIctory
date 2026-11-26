@@ -467,6 +467,24 @@ with marked pages at 101 ms, and one binary has given 68 to 119 ms there across
 runs: marked pages need more than one run to compare. No draws dropped and no
 device removal.
 
+## Marked pages into video memory
+
+The marked copy-back pushed every compared page from its mirror into video
+memory, though the pull before it had made the two equal. Now only a page
+whose mirror took title bytes is pushed (`VICTORY_PUSH_ALL=1` pushes all).
+
+Cell window, one run, medians:
+
+| | Before (`gpu184`) | After |
+|---|---|---|
+| Frame | 406 ms | 390 ms |
+| Copy-back | 78 ms | 67 ms |
+| Marked pages | 73 ms | 61 ms |
+
+One run: marked pages have varied that much between runs of one binary, and an
+intermediate build without this change gave 64 ms. No draws dropped and no
+device removal.
+
 ## CPU clock and core parking
 
 On a Ryzen 7 5700X the busy logical processors ran at 4.59 GHz in the cell
