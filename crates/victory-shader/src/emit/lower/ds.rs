@@ -120,6 +120,8 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        // (a shuffle above reads other lanes, not memory)
+        let guard = self.memory_guard(b, i)?;
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }

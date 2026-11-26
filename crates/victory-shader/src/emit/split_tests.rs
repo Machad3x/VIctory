@@ -1238,6 +1238,101 @@ fn a_bounded_dispatch_numbers_console_lanes_in_the_guard() {
     super::emit_variant::<true>(&c, &native, &p, &st, &io, &res, options).expect("translates");
 }
 
+/// A bounded dispatch (`DISPATCH_THREADS`) of a 64-thread console wave split
+/// in two host waves: the threads past the count stay for the halves'
+/// exchange barriers (a whole upper half past the count must still give its
+/// slot), count in no mask of EXEC's lanes and store nothing. Group 0 is
+/// full; group 1 holds `count - 64` threads. Adapted from
+/// Belobug/VIctory-Belobug-AMD 06fe22a7 (Mumogg).
+#[test]
+fn a_bounded_dispatch_keeps_split_halves_for_their_exchange() {
+    // s_bcnt1 of EXEC, and of VCC from a compare (EXEC's lanes below 40).
+    let exec = [
+        0xBE89_107E, // s_bcnt1_i32_b64 s9, exec
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let vcc = [
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE89_106A, // s_bcnt1_i32_b64 s9, vcc
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let Ok(names) = adapters() else {
+        eprintln!("no DXGI; skipped");
+        return;
+    };
+    let c = crate::Container {
+        digest: [0; 16],
+        version: (1, 0),
+        parts: vec![],
+    };
+    for name in names {
+        let Ok(host) = Host::on(&name) else {
+            continue;
+        };
+        let target = host.target();
+        for (label, body, below) in [("EXEC", &exec[..], 64), ("VCC below 40", &vcc[..], 40)] {
+            let native = program(body, 64);
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let options = super::Options {
+                view_marks: false,
+                target,
+            };
+            let cs = super::emit_variant::<true>(&c, &native, &p, &st, &io, &res, options)
+                .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut cs.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{name}: {label}: validation: {e}"));
+            }
+            let split = !target.runs(64);
+            assert_eq!(
+                wave_size(&cs.dxil),
+                Some(if split { 32 } else { 64 }),
+                "{name}: {label}: the declared wave size"
+            );
+            let limit = cs
+                .user_data
+                .iter()
+                .find(|u| u.root == super::DISPATCH_THREADS && u.dword == 0)
+                .expect("the thread count's user data")
+                .index;
+            let (root, pso) = host
+                .compute_pipeline(&cs)
+                .unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+            // Group 1 with: no upper half launched (1), a partial upper half
+            // (45), one upper lane (33), every thread (64).
+            for count in [64 + 1, 64 + 45, 64 + 33, 64 + 64] {
+                let mut data = vec![0; (cs.user_data_dwords() as usize).max(1)];
+                data[limit as usize] = count;
+                let views = [View::RawUav(128)];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(data))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [2, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{name}: {label}, count {count}: {e}"));
+                let launched = count - 64;
+                let want: Vec<u32> = (0..64)
+                    .map(|_| below)
+                    .chain((0..64).map(|t| if t < launched { below.min(launched) } else { 0 }))
+                    .collect();
+                assert_eq!(out[0], want, "{name}: {label}, count {count} (split {split})");
+            }
+            eprintln!("{name}: {label}: bounded dispatches exact (split {split})");
+        }
+    }
+}
+
 /// `s_*_saveexec` writes the old EXEC to its scalar destination and the new
 /// EXEC to EXEC, and sets SCC to whether the *new* EXEC is non-zero. In
 /// console flow, `s_cbranch_scc0` after `s_and_saveexec_b64` must branch on

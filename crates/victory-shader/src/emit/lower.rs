@@ -368,6 +368,12 @@ struct Lower<'a> {
     /// Console flow with several console waves in the group (see
     /// [`Self::soft_barrier`]).
     multi: bool,
+    /// A partial final group (`DISPATCH_THREADS`) of a console wave split in
+    /// two host waves: the threads past the count stay for the exchange's
+    /// group barriers instead of leaving at entry, and this says which
+    /// threads the console launched. Memory, EXEC's lanes and the wave's
+    /// reductions leave the others out ([`Self::memory_guard`], [`Self::launched`]).
+    partial_active: Option<V>,
     /// Its group-shared state: per-thread barrier counts, per-half
     /// arrivals at the program's barriers, per-half finish stamps.
     multi_sync: Option<(V, V, V)>,
@@ -855,6 +861,7 @@ impl<'a> Lower<'a> {
                 if db_shader_control & 1 << 16 != 0),
             root_memory,
             multi,
+            partial_active: None,
             multi_sync: None,
             flat: None,
             no_barrier,
@@ -978,7 +985,7 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&(b, i))
             .ok_or("an untracked global address")?;
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let Some(Operand::Vector { reg, .. }) = *dst else {
             return Err("a global load result");
         };
@@ -1150,7 +1157,7 @@ impl<'a> Lower<'a> {
         if ops.is_none() && !name.starts_with("global_store_") {
             return Err(name);
         }
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let c = self.cur;
         let d = data.as_ref().ok_or("global store data")?;
         let vals = self.vgprs(inst, d, n)?;
@@ -1350,6 +1357,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.launched(c, on, mask);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -1375,6 +1383,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.launched(c, on, mask);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 let x = self.s.m.select(c, on, x, id);
@@ -1460,6 +1469,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.launched(c, on, mask);
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -1612,6 +1622,7 @@ impl<'a> Lower<'a> {
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
         let on = self.boolean(m, c)?;
+        let on = self.launched(c, on, mask);
         let zero = self.s.m.i32(0);
         let (x, y) = (self.i32_of(lo)?, self.i32_of(hi)?);
         let x = self.s.m.select(c, on, x, zero);
@@ -1696,6 +1707,12 @@ impl<'a> Lower<'a> {
             // Guest inputs, including the first ballot of EXEC, belong in the
             // active arm. Fill the outer entry after guest user data is known.
             self.s.entry = self.s.m.new_block();
+            if self.split && self.x.console_cf && !self.multi {
+                // The halves exchange through group barriers every thread must
+                // reach: the threads past the count stay (the phi takes the
+                // guard's value from the outer entry, its only predecessor).
+                self.partial_active = Some(self.s.m.phi(self.s.entry, self.s.t.i1));
+            }
         }
         let p = self.x.p;
         let entry_round16 = round16(&self);
@@ -1892,6 +1909,11 @@ impl<'a> Lower<'a> {
             let global = self.s.m.bin(entry, Bin::Add, base, local);
             let inside = self.s.m.cmp(entry, pred::IULT, global, limit);
             active = self.s.m.bin(entry, Bin::And, active, inside);
+        }
+        if let Some(phi) = self.partial_active {
+            self.s.m.set_phi(phi, vec![(active, entry)]);
+            self.s.m.terminate(entry, Term::Br(body));
+            return;
         }
         let done = self.abort_block();
         self.s.m.terminate(entry, Term::CondBr(active, body, done));
@@ -2389,6 +2411,7 @@ impl<'a> Lower<'a> {
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
+            let bit = self.launched(at, bit, lo);
             let xy = self.console_ballot(at, bit);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
@@ -3341,6 +3364,26 @@ impl<'a> Lower<'a> {
             inst.write(pick(reg)?)
         };
         together().or_else(|| self.x.st.pairs.get(&lo).copied())
+    }
+
+    /// [`Self::guard`] of a memory access: not by the threads a partial final
+    /// group only keeps for its barriers ([`Self::partial_active`]).
+    fn memory_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        let g = self.guard(b, i)?;
+        Ok(match (g, self.partial_active) {
+            (Some(g), Some(a)) => Some(self.s.m.bin(self.cur, Bin::And, g, a)),
+            (g, a) => g.or(a),
+        })
+    }
+
+    /// `on` (the lanes of mask `mask`, at `at`) without the threads a partial
+    /// final group keeps for its barriers, when the mask holds only EXEC's
+    /// lanes (`Structured::active`): the console never launched them.
+    fn launched(&mut self, at: usize, on: V, mask: Value) -> V {
+        match self.partial_active {
+            Some(a) if self.x.st.active.contains(&mask) => self.s.m.bin(at, Bin::And, on, a),
+            _ => on,
+        }
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -8973,7 +9016,7 @@ impl<'a> Lower<'a> {
         }
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -9998,7 +10041,7 @@ impl<'a> Lower<'a> {
             return Err(name);
         }
         let site = (b, i);
-        let guard = self.guard(b, i)?;
+        let guard = self.memory_guard(b, i)?;
         let c = self.cur;
         let store = name.starts_with("buffer_store_");
         // DXIL atomic operations: add, and, or, xor, signed and unsigned
@@ -10941,13 +10984,10 @@ impl<'a> Lower<'a> {
                     EXEC
                 };
                 let lo = inst.read(Reg::S(reg)).ok_or("a branch's mask")?;
-                let &m = self
-                    .x
-                    .st
-                    .masks
-                    .get(&lo)
-                    .ok_or("a branch on an untracked mask")?;
-                (self.any_lane(m)?, name.ends_with("nz"))
+                if !self.x.st.masks.contains_key(&lo) {
+                    return Err("a branch on an untracked mask");
+                }
+                (self.any_lane(lo)?, name.ends_with("nz"))
             }
             _ => return Err("a branch the console flow does not model"),
         };
@@ -10979,23 +11019,27 @@ impl<'a> Lower<'a> {
         // SCC tests the new EXEC. `s_*_saveexec` also writes a scalar, the
         // EXEC it replaces, and that write comes first (`s_*_wrexec` writes
         // the new EXEC to both).
+        let masks = &self.x.st.masks;
         let mask = inst
             .write(Reg::S(EXEC))
-            .and_then(|w| self.x.st.masks.get(&w).copied())
+            .filter(|w| masks.contains_key(w))
             .or_else(|| {
                 inst.writes
                     .iter()
                     .filter(|w| matches!(w.0, Reg::S(_)))
-                    .find_map(|w| self.x.st.masks.get(&w.1).copied())
+                    .map(|w| w.1)
+                    .find(|w| masks.contains_key(w))
             })
             .ok_or("an SCC the emitter did not compute")?;
         self.any_lane(mask)
     }
 
-    /// Console flow: whether `m` holds in some lane of the console wave.
-    fn any_lane(&mut self, m: Bool) -> Result<V, Why> {
+    /// Console flow: whether mask `lo` holds in some lane of the console wave.
+    fn any_lane(&mut self, lo: Value) -> Result<V, Why> {
         let c = self.cur;
+        let m = self.x.st.masks[&lo];
         let bit = self.boolean(m, c)?;
+        let bit = self.launched(c, bit, lo);
         let (lo, hi) = self.console_ballot(c, bit);
         let or = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
