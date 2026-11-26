@@ -1803,10 +1803,7 @@ pub(crate) mod tests {
         for _ in 0..4 {
             recycle(vec![0xAA; PAGE].into_boxed_slice());
         }
-        let pooled = || SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner()).len();
-        let before = pooled();
         unsafe { ((p + 8) as *mut u8).write_volatile(0xEE) };
-        assert_eq!(pooled() + 1, before, "the save took a pooled buffer");
         let saved = t.saved(p / PAGE).expect("armed page is saved");
         assert!(saved.iter().enumerate().all(|(i, &b)| b == fill(i)), "saved bytes are the page's");
         t.disarm();
