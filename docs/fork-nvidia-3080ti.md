@@ -417,6 +417,28 @@ meanwhile could copy part of a write), the other addresses showing them at
 the write's start are marked at its end, and a section's view is unmapped
 only with no write under way. No draws dropped and no device removal.
 
+## Copies of title memory in user mode
+
+Upstream pull request #1010 (open there): copies from title memory into host
+memory run in a small routine of the layer instead of `ReadProcessMemory`; a
+vectored handler turns a fault of that routine into a failed copy, and a
+guard page it met stays a guard page. Copies into title memory still go
+through the kernel. In this tree a run of fills still holds back each fill
+whose source the shaders write until after the copy-backs.
+
+Cell window, one run each, medians (before: the two runs of the previous
+section's second build and its review):
+
+| | Before | After |
+|---|---|---|
+| Frame | 418 and 430 ms | 407 ms |
+| Preparing | 169 and 173 ms | 151 ms |
+| Copies | 93 and 95 ms | 77 ms |
+
+No draws dropped and no device removal. One known gap, not changed: the
+handler puts a title's guard page back without the write watch's lock, so a
+guard page the title set inside watched memory could race the watch.
+
 ## Tried and left out
 
 | Change | Result here |
