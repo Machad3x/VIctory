@@ -76,7 +76,7 @@ pub(crate) fn pack_row(format: u32, rgba: &[u8], packed: &mut [u8]) {
 /// size again in system memory: 2.6-2.8 GB with placed textures made on
 /// read, run integ2).
 pub(crate) struct Staging {
-    /// A staging buffer's bytes.
+    /// A full upload's staging bytes.
     size: u64,
     packed: Option<u32>,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -599,21 +599,24 @@ fn copies(
     subresources: &[u32],
     name: impl Fn() -> String,
 ) {
+    let mut next = at;
     for &i in subresources {
+        let span = staging.span(i);
         let i = i as usize;
         let mut footprint = staging.footprints[i];
-        footprint.Offset += at;
+        footprint.Offset = next;
+        next += span;
         let footprint = &footprint;
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            let len = span.min(u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth));
             list.note_read(
                 || {
                     format!(
-                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}: offset {:#x}+{len:#x} {}x{}x{} pitch {}",
                         name(),
                         d.Width,
                         d.Height,
@@ -621,7 +624,6 @@ fn copies(
                         d.Format.0,
                         d.MipLevels,
                         staging.footprints.len(),
-                        staging.size,
                         footprint.Offset,
                         f.Width,
                         f.Height,
@@ -899,6 +901,16 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
 }
 
 impl Staging {
+    /// Staging bytes of subresource `i`: its footprint with the driver's
+    /// padding up to the next one. Only the texture's last span can end
+    /// unaligned, and in an increasing list it comes last, so spans packed
+    /// back to back keep copy offsets aligned.
+    fn span(&self, i: u32) -> u64 {
+        let i = i as usize;
+        let end = self.footprints.get(i + 1).map_or(self.size, |next| next.Offset);
+        end.saturating_sub(self.footprints[i].Offset)
+    }
+
     /// Forgets what the title changed so far: the host is about to own the contents.
     fn drain(&self) {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
@@ -1070,11 +1082,12 @@ impl Staging {
         (size, buffer.map(|(b, at)| (b, at, every)))
     }
 
-    /// Detiles `subresources` of `tiled` (the texture's memory) into a
-    /// staging buffer, dropping from the list those that cannot be read
+    /// Detiles `subresources` (increasing) of `tiled` (the texture's memory)
+    /// into staging space, those detiled packed back to back, dropping from the list those that cannot be read
     /// (`None` if no buffer could be had or none was detiled).
     fn detile(&self, tiled: &[u8], subresources: &mut Vec<u32>) -> Option<(ID3D12Resource, u64)> {
-        let Some((buffer, at, data)) = staging_space(self.size) else {
+        let size: u64 = subresources.iter().map(|&i| self.span(i)).sum();
+        let Some((buffer, at, data)) = staging_space(size) else {
             // Space can be had later; a layout error below would only recur.
             self.retry.store(true, std::sync::atomic::Ordering::Relaxed);
             return None;
@@ -1093,16 +1106,19 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
+        // Advanced past detiled subresources only, as `copies` walks the list.
+        let mut next = 0u64;
         subresources.retain(|&i| {
+            let span = self.span(i);
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
             let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = subresource_len(footprint.Offset, pitch, rows, f.Depth, self.size);
-            // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
-            // keeping the slice strictly inside the mapped staging buffer even when
+            let len = subresource_len(pitch, rows, f.Depth, span);
+            // SAFETY: `next + len` is at most the sum of the requested spans, so
+            // the slice stays inside the staging space even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(next as usize), len) };
             let detile = |dst: &mut [u8], pitch| self.layout.detile(tiled, mip, slice, dst, pitch, pitch * rows as usize);
             let result = if let Some(format) = self.packed {
                 let row = f.Width as usize * 2;
@@ -1115,9 +1131,13 @@ impl Staging {
             } else {
                 detile(linear, pitch)
             };
-            result
+            let done = result
                 .inspect_err(|e| tracing::warn!(?e, mip, slice, "texture not detiled"))
-                .is_ok()
+                .is_ok();
+            if done {
+                next += span;
+            }
+            done
         });
         (!subresources.is_empty()).then_some((buffer, at))
     }
@@ -1174,15 +1194,15 @@ impl Drop for Scratch {
     }
 }
 
-/// Bytes available in the staging buffer for a subresource at `offset`.
+/// Bytes of a subresource's staging span of `span` bytes to detile into.
 /// D3D12's `GetCopyableFootprints` omits trailing row-pitch padding on the
 /// final row of the final subresource, so `pitch * rows * depth` can exceed
-/// `total - offset`.
-fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64) -> usize {
+/// the span.
+fn subresource_len(pitch: usize, rows: u32, depth: u32, span: u64) -> usize {
     let padded = pitch
         .saturating_mul(rows as usize)
         .saturating_mul(depth as usize);
-    let remaining = usize::try_from(total.saturating_sub(offset)).unwrap_or(usize::MAX);
+    let remaining = usize::try_from(span).unwrap_or(usize::MAX);
     padded.min(remaining)
 }
 
@@ -1406,11 +1426,59 @@ mod tests {
         let memory = vec![1u8; size];
         staging.memory = memory.as_ptr();
         // A second subresource the layout does not have.
-        staging.footprints.push(staging.footprints[0]);
+        let mut second = staging.footprints[0];
+        second.Offset = staging.size;
+        staging.size *= 2;
+        staging.footprints.push(second);
         staging.rows.push(staging.rows[0]);
         staging.spans = vec![(0, size); 2];
         let (_, _, list) = staging.refresh_now().1.expect("staged");
         assert_eq!(list, [0]);
+    }
+
+    /// The regression test of the packed staging space: only detiled
+    /// subresources take it, so one after a failed one starts where
+    /// [`copies`] looks for it.
+    #[test]
+    fn a_subresource_not_detiled_takes_no_staging_space() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let Some(mut staging) = xor_staging() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        // Two linear slices; the first one's span is too small to detile into.
+        staging.layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 256,
+            height: 256,
+            depth: 2,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        let size = staging.layout.size as usize;
+        let mut memory = vec![1u8; size];
+        memory[size / 2..].fill(2);
+        staging.memory = memory.as_ptr();
+        let mut second = staging.footprints[0];
+        second.Offset = 512;
+        staging.size += 512;
+        staging.footprints.push(second);
+        staging.rows.push(staging.rows[0]);
+        staging.spans = vec![(0, size); 2];
+        let (buffer, at, list) = staging.refresh_now().1.expect("staged");
+        assert_eq!(list, [1]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: an upload buffer, mapped to read what was staged.
+        unsafe { buffer.Map(0, None, Some(&mut mapped)) }.unwrap();
+        // SAFETY: the staged subresource's first row.
+        let got = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(at as usize), 256 * 4) };
+        assert_eq!(got, &memory[size / 2..][..256 * 4]);
+        // SAFETY: unmaps what was mapped above.
+        unsafe { buffer.Unmap(0, None) };
     }
 
     /// The staging state of a 256x256 RGBA8 `SW_64KB_R_X` texture with no
@@ -1506,9 +1574,9 @@ mod tests {
     fn subresource_len_stays_inside_staging_total() {
         // A 4x4 RGBA8 texture has RowPitch=256, rows=4, last_row=16 -> total=784.
         // Padded size (1024) must be clamped to 784 so from_raw_parts_mut stays in bounds.
-        assert_eq!(subresource_len(0, 256, 4, 1, 784), 784);
-        assert_eq!(subresource_len(512, 256, 4, 1, 784), 272);
-        assert_eq!(subresource_len(0, 256, 4, 1, 2048), 1024);
+        assert_eq!(subresource_len(256, 4, 1, 784), 784);
+        assert_eq!(subresource_len(256, 4, 1, 272), 272);
+        assert_eq!(subresource_len(256, 4, 1, 2048), 1024);
     }
 
     #[test]
