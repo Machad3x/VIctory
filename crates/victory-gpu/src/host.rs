@@ -1615,7 +1615,8 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        // Copy, address, bytes, goes back, writes marked.
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool, bool)> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         // Shaders that read memory with no copy computed something else than
         // the console's: it stays out of title memory, where it broke the
@@ -1636,15 +1637,18 @@ impl Host {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                if let Step::GpuWrite(shadow, address, len, marked, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
                     match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
+                        Some(&i) => {
+                            back[i].3 &= goes_back;
+                            back[i].4 &= *marked;
+                        }
                         None => {
                             index.insert(key, back.len());
-                            back.push((shadow.clone(), *address, *len, goes_back));
+                            back.push((shadow.clone(), *address, *len, goes_back, *marked));
                         }
                     }
                 }
@@ -1656,7 +1660,7 @@ impl Host {
         let held: Vec<(usize, usize, usize)> = back
             .iter()
             .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
+            .map(|(s, a, n, ..)| (std::sync::Arc::as_ptr(s) as usize, *a, *n))
             .collect();
         for b in back.iter_mut().filter(|b| b.3) {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
@@ -1667,7 +1671,7 @@ impl Host {
         let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
             .iter()
             .filter(|b| !b.3)
-            .map(|(s, a, n, _)| (s.clone(), *a, *n))
+            .map(|(s, a, n, ..)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld, withholding);
         // Texture views left null that shaders read: made for what follows.
@@ -1679,7 +1683,9 @@ impl Host {
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
         crate::shadow::pull(&snapshots);
-        for (shadow, address, len, goes_back) in &back {
+        static RETAKE_ALL: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RETAKE_ALL").is_some_and(|v| v != "0"));
+        for (shadow, address, len, goes_back, marked) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
                 let written = shadow.copy_back(address, len);
@@ -1687,7 +1693,12 @@ impl Host {
             } else {
                 shadow.keep_writes(address, len);
                 crate::memory::note_withheld(len as u64);
-                crate::memory::drop_withheld(address, len);
+                // Writes that mark their pages: `copy_back_marks` dropped
+                // those, and the others hold nothing of the shaders'.
+                // `VICTORY_RETAKE_ALL=1`: the whole range.
+                if !*marked || *RETAKE_ALL {
+                    crate::memory::drop_withheld(address, len);
+                }
             }
         }
         crate::shadow::snapshots_done(&snapshots);

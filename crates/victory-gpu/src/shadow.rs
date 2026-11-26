@@ -1435,8 +1435,9 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
 /// views goes back ([`Shadow::copy_back_run`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
-/// title memory marked; the bitmaps are cleared. Before the copy-backs of
-/// declared ranges, which disarm the copies.
+/// title memory marked, which leave the copies instead
+/// (`crate::memory::drop_withheld`); the bitmaps are cleared. Before the
+/// copy-backs of declared ranges, which disarm the copies.
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
@@ -1495,16 +1496,15 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
     );
-    for_each_by_page(pages, |copy, run| {
-        let run: Vec<usize> = run
+    let kept = |copy: &Arc<Shadow>, page: usize| {
+        withheld
             .iter()
-            .copied()
-            .filter(|&page| {
-                !withheld
-                    .iter()
-                    .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
-            })
-            .collect();
+            .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
+    };
+    let dropped: Vec<usize> =
+        pages.iter().filter(|(copy, page)| kept(copy, *page)).map(|&(_, page)| page).collect();
+    for_each_by_page(pages, |copy, run| {
+        let run: Vec<usize> = run.iter().copied().filter(|&page| !kept(copy, page)).collect();
         let written = copy.copy_back_run(&run);
         #[cfg(feature = "diagnostics")]
         {
@@ -1514,6 +1514,10 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     });
+    // After the copy-backs, so that none takes these pages as current again.
+    for page in dropped {
+        crate::memory::drop_withheld(page, PAGE);
+    }
 }
 
 /// Before the CPU reads what shaders may have written: the title address
@@ -3327,6 +3331,36 @@ void main(uint3 id : SV_DispatchThreadID) {
         let t = copy.tracked.as_ref().expect("tracked memory");
         assert!(!t.changed(p / PAGE), "still taken");
         assert_eq!(copy.copy_back(p, PAGE), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    /// In a withheld range whose writes mark their pages, the marked pages
+    /// alone leave the copy: the others hold nothing the shaders wrote.
+    #[test]
+    fn a_withheld_marking_range_gives_up_only_its_marked_pages() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        for page in 0..2 {
+            copy.write_host((p + page * PAGE + 16) as u64, &[0xaa]);
+        }
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[(copy.clone(), p, len)], false);
+        copy.keep_writes(p, len);
+        crate::memory::log_frame();
+        copy.update(p, len);
+        let byte = |page: usize| copy.read_host((p + page * PAGE + 16) as u64, 1)[0] & 0xff;
+        assert_eq!((byte(0), byte(1)), (0, 0xaa), "the marked page from title memory, the other kept");
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 16) as *const u8).read_volatile() }, 0, "title memory untouched");
         unregister(p, p as u64);
     }
 
