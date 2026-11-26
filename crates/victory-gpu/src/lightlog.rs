@@ -13,7 +13,7 @@ use crate::resource::MemoryKey;
 const PER_SECOND: u32 = 40;
 /// The world's ray traced pass. Other ray walking programs are found in the
 /// pipeline sets logged.
-const RAY: &str = "f607780aa8e502d0";
+pub(crate) const RAY: &str = "f607780aa8e502d0";
 
 /// Second, lines logged in it, lines left out since the last one logged.
 #[derive(Default)]

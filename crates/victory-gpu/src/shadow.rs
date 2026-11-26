@@ -132,6 +132,12 @@ const POOL_BYTES: usize = 512 << 20;
 /// Equal stretches are skipped a block at a time, and a block that differs is
 /// compared 64 bytes at once into a bit per byte: most marked pages differ in
 /// most of their bytes.
+///
+/// Without `before`, the differing bytes of each 64 make one run, the equal
+/// bytes between them included: those are title memory's already, and
+/// [`write_spans`] joins runs that close anyway. A run per stretch cost a
+/// step and an entry each, thousands on a page whose changed and equal bytes
+/// alternate.
 fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, usize)> {
     const BLOCK: usize = 1 << 10;
     let n = host.len().min(title.len());
@@ -145,6 +151,10 @@ fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, us
                 let mut mask = unequal(&host[at..end], &title[at..end]);
                 if let Some(before) = before.filter(|_| mask != 0) {
                     mask &= unequal(&host[at..end], &before[at..end]);
+                }
+                if before.is_none() && mask != 0 {
+                    // Every bit from the first set one to the last.
+                    mask = (u64::MAX >> mask.leading_zeros()) & (u64::MAX << mask.trailing_zeros());
                 }
                 // Each run of set bits: from its first, the ones that follow.
                 while mask != 0 {
@@ -189,6 +199,8 @@ fn unequal(a: &[u8], b: &[u8]) -> u64 {
 /// kernel copy per run cost over 1 ms per page in the world, where shaders
 /// change many scattered words of a page.
 const SPAN_GAP: usize = 256;
+// A compare without a snapshot marks whole 64-byte windows as one run.
+const _: () = assert!(SPAN_GAP >= 64);
 
 /// Writes the runs `[start, end)` of `merged` (title memory as read, with
 /// the shaders' bytes in the runs) into title memory at `at`, and nothing
@@ -3757,6 +3769,17 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             runs
         };
+        // Without bytes from before, runs that meet the same 64 bytes are one.
+        let joined = |runs: Vec<(usize, usize)>| {
+            let mut out: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in runs {
+                match out.last_mut() {
+                    Some((_, last)) if (*last - 1) / 64 == start / 64 => *last = end,
+                    _ => out.push((start, end)),
+                }
+            }
+            out
+        };
         // Dense, irregular differences: runs that start, end and cross at
         // every offset of a 64-byte step.
         let mut x = 0x9e37_79b9_u32;
@@ -3777,7 +3800,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 naive(&host, &title, &|i| host[i] != before[i]),
                 "noise, length {len}"
             );
-            assert_eq!(differing(&host, &title, None), naive(&host, &title, &|_| true), "noise, length {len}");
+            assert_eq!(differing(&host, &title, None), joined(naive(&host, &title, &|_| true)), "noise, length {len}");
         }
         for len in [0, 1, 31, 33, 1023, 1025, PAGE - 7, PAGE] {
             let title = vec![0x5au8; len];
@@ -3810,7 +3833,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             );
             assert_eq!(
                 differing(&host, &title, None),
-                naive(&host, &title, &|_| true),
+                joined(naive(&host, &title, &|_| true)),
                 "length {len}"
             );
         }

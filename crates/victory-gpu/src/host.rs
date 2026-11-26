@@ -1724,14 +1724,14 @@ impl Host {
         let withholding = crate::memory::withholding();
         #[cfg(feature = "diagnostics")]
         {
-            // Collected before the log's lock; the hash is `lightlog::RAY`.
+            // Collected before the log's lock.
             let lists: Vec<_> = runs
                 .iter()
                 .zip(&missed)
                 .map(|(list, &missed)| {
                     let memory = !list.deferred().missed.is_empty();
                     let bound = list.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-                    let logged = memory || bound.iter().any(|p| p.contains("f607780aa8e502d0"));
+                    let logged = memory || bound.iter().any(|p| p.contains(crate::lightlog::RAY));
                     let pipelines = if logged { bound.clone() } else { Default::default() };
                     (memory, missed, pipelines)
                 })
