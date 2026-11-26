@@ -423,8 +423,7 @@ Upstream pull request #1010 (open there): copies from title memory into host
 memory run in a small routine of the layer instead of `ReadProcessMemory`; a
 vectored handler turns a fault of that routine into a failed copy, and a
 guard page it met stays a guard page. Copies into title memory still go
-through the kernel. In this tree a run of fills still holds back each fill
-whose source the shaders write until after the copy-backs.
+through the kernel.
 
 Cell window, one run each, medians (before: the two runs of the previous
 section's second build and its review):
@@ -438,6 +437,44 @@ section's second build and its review):
 No draws dropped and no device removal. One known gap, not changed: the
 handler puts a title's guard page back without the write watch's lock, so a
 guard page the title set inside watched memory could race the watch.
+
+## Released buffers, fills and integer targets
+
+Fixes after a review of the fork's own changes.
+
+| Change | What was wrong |
+|---|---|
+| Copies go quiet when their memory is freed (from upstream pull request #3036, extended) | A pending copy-back wrote into addresses the title had taken back. Upstream's version stops at the release of the resource object and covers one of the write-back paths: here the marked pages, the copies of views and released placed buffers whose heap is freed later are covered, and releasing an object whose memory stays (placed, title-mapped) still writes back |
+| A deferred fill never waits for the copy-backs | Held back, it ran after the lists that read its destination: they read memory never filled |
+| Integer render targets | The format list held 37 and 39 for 36 and 38, and `IndependentBlendEnable` off was ignored: pipelines refused, their draws dropped |
+| Heap textures walked once a submission, copy-back threads kept, page table hashing | Repeated work and thread creation per submission |
+| Copy counters | The per-buffer line summed bytes asked for, not copied; the copy time held some flushes twice. Older logs do not compare in these two numbers |
+
+Not covered: memory the title unmaps itself is not told to the copies, and a
+copy-back already under way when memory is freed can still write.
+
+Cell window, one run each, medians:
+
+| | Before (#1010) | After |
+|---|---|---|
+| Frame | 407 ms | 406 ms |
+| Preparing | 151 ms | 154 ms |
+| Copy-back | 81 ms | 78 ms |
+| Marked pages | 73 ms | 73 ms |
+
+No gain measured at the frame. One run of an intermediate build measured 457 ms
+with marked pages at 101 ms, and one binary has given 68 to 119 ms there across
+runs: marked pages need more than one run to compare. No draws dropped and no
+device removal.
+
+## CPU clock and core parking
+
+On a Ryzen 7 5700X the busy logical processors ran at 4.59 GHz in the cell
+scene (Windows reports the fixed base clock, 3401 MHz, in
+`ProcessorFrequency`). The process used 2.5 of 16, its busiest thread 39 % of
+one, with a median of 6 parked. With parking off for one run preparing took
+141 ms (151 and 162 before) and copy-back 99 ms (81 and 78): the frame did not
+change, and the setting was put back.
 
 ## Tried and left out
 
