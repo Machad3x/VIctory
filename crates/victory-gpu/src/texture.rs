@@ -840,7 +840,8 @@ impl Staging {
 
     /// A staging buffer with the texture memory detiled into it if it
     /// changed since the last time (and is mapped at all), and the
-    /// subresources that changed (only those are detiled and to be copied).
+    /// subresources detiled: those that changed and could be read, which
+    /// are the ones to copy.
     pub(crate) fn refresh(&self) -> Option<Upload> {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
@@ -906,7 +907,7 @@ impl Staging {
             // cost 8 ms a frame.)
             let page = crate::watch::PAGE;
             last.hashes.resize(n, None);
-            let fresh: Vec<u32> = touched
+            let mut fresh: Vec<u32> = touched
                 .into_iter()
                 .filter(|&i| {
                     let (a, b) = span(i);
@@ -924,7 +925,7 @@ impl Staging {
                 return (bytes, None);
             }
             self.retry.store(false, std::sync::atomic::Ordering::Relaxed);
-            let buffer = self.detile(read, &fresh);
+            let buffer = self.detile(read, &mut fresh);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
@@ -943,8 +944,8 @@ impl Staging {
                 return (0, None);
             }
             let zeros = vec![0u8; size];
-            let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let mut every = all();
+            let buffer = self.detile(&zeros, &mut every);
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
@@ -956,8 +957,8 @@ impl Staging {
         if last.hash == Some(hash) {
             return (size, None);
         }
-        let every = all();
-        let buffer = self.detile(tiled, &every);
+        let mut every = all();
+        let buffer = self.detile(tiled, &mut every);
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -965,9 +966,9 @@ impl Staging {
     }
 
     /// Detiles `subresources` of `tiled` (the texture's memory) into a
-    /// staging buffer (`None` if none could be had or a subresource could
-    /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
+    /// staging buffer, dropping from the list those that cannot be read
+    /// (`None` if no buffer could be had or none was detiled).
+    fn detile(&self, tiled: &[u8], subresources: &mut Vec<u32>) -> Option<(ID3D12Resource, u64)> {
         let Some((buffer, at, data)) = staging_space(self.size) else {
             // Space can be had later; a layout error below would only recur.
             self.retry.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -987,7 +988,7 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
-        for &i in subresources {
+        subresources.retain(|&i| {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
             let (mip, slice) = (i % self.mips, i / self.mips);
             let f = footprint.Footprint;
@@ -1009,12 +1010,11 @@ impl Staging {
             } else {
                 detile(linear, pitch)
             };
-            if let Err(e) = result {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
-                return None;
-            }
-        }
-        Some((buffer, at))
+            result
+                .inspect_err(|e| tracing::warn!(?e, mip, slice, "texture not detiled"))
+                .is_ok()
+        });
+        (!subresources.is_empty()).then_some((buffer, at))
     }
 }
 
@@ -1254,6 +1254,25 @@ mod tests {
         assert!(!staging.maybe_changed());
         drop(staging);
         watch::free(p);
+    }
+
+    /// A subresource that cannot be detiled does not take the others of the
+    /// same refresh with it.
+    #[test]
+    fn a_subresource_not_detiled_leaves_the_others_staged() {
+        let Some(mut staging) = xor_staging() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let size = staging.layout.size as usize;
+        let memory = vec![1u8; size];
+        staging.memory = memory.as_ptr();
+        // A second subresource the layout does not have.
+        staging.footprints.push(staging.footprints[0]);
+        staging.rows.push(staging.rows[0]);
+        staging.spans = vec![(0, size); 2];
+        let (_, _, list) = staging.refresh_now().1.expect("staged");
+        assert_eq!(list, [0]);
     }
 
     /// The staging state of a 256x256 RGBA8 `SW_64KB_R_X` texture with no
