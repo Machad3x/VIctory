@@ -3995,6 +3995,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(shown.upgrade().is_some_and(|s| std::sync::Arc::ptr_eq(&s, &found)), "the slot's copy");
         drop(found);
         slots.make_null(0);
+        // Kept until the work that may read the old view has run, then
+        // dropped on the release thread.
+        crate::host::release_retired();
+        let started = std::time::Instant::now();
+        while shown.upgrade().is_some() && started.elapsed().as_secs() < 10 {
+            std::thread::yield_now();
+        }
         assert!(shown.upgrade().is_none(), "released with the slot");
     }
 

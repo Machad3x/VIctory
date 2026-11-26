@@ -1524,6 +1524,16 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        // Slots the title wrote since the sync above, made while
+                        // the GPU is busy: less is left for the next submission.
+                        static SYNC: OnceLock<bool> = OnceLock::new();
+                        if *SYNC.get_or_init(|| std::env::var_os("VICTORY_SYNC_IN_WAIT").is_none_or(|v| v != "0"))
+                            && self.fence.GetCompletedValue() < *submitted
+                        {
+                            #[cfg(feature = "diagnostics")]
+                            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
+                            crate::descriptor::sync_heaps();
+                        }
                         ended = wait_for_submission(
                             // The event is auto-reset and shared: an earlier wait's
                             // signal may wake this one (#2899).
@@ -4355,14 +4365,15 @@ impl Host {
 
 /// Host resources that view heap slots stopped viewing while a submission
 /// may have been running ([`retire`]).
-static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+#[allow(clippy::type_complexity)]
+static RETIRED: Mutex<Vec<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::Shadow>>)>> = Mutex::new(Vec::new());
 
 /// Keeps `resource` alive until the GPU work running now (or the next
 /// submission's) has run: title threads rewrite view heap slots while the
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
-pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+pub(crate) fn retire(resource: ID3D12Resource, copy: Option<std::sync::Arc<crate::shadow::Shadow>>) {
+    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((resource, copy));
 }
 
 /// After a submission has run, with none running: the retired resources go.

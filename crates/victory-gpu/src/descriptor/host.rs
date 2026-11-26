@@ -586,10 +586,11 @@ impl HostHeap {
             }
             // Title threads rewrite slots while the GPU runs a submission;
             // one of its shaders may hold the old descriptor (or read the
-            // slot at an index from wrong data): what it views is freed
-            // only once that work has run.
-            if let Some((old, _)) = old {
-                crate::host::retire(old);
+            // slot at an index from wrong data): what it views, and the
+            // view's own copy (its bytes in a shared buffer go to the next
+            // one), are freed only once that work has run.
+            if let Some((old, copy)) = old {
+                crate::host::retire(old, copy);
             }
         }
     }
