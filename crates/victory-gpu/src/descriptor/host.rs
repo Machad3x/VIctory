@@ -148,13 +148,13 @@ impl HostHeap {
         // which has no bounds, at indices clamped below `heap_views`.
         let views = crate::host::heap_views();
         let strides = (!sampler)
-            .then(|| host.upload_buffer(u64::from(count.max(views)) * 4))
+            .then(|| host.table_buffer(u64::from(count.max(views)) * 4))
             .flatten()
             .map(|(buffer, data)| (buffer, data as usize));
         let marks = (!sampler)
             .then(|| {
                 let bytes = u64::from(count.max(views)) * 8;
-                let (buffer, data) = host.upload_buffer(bytes)?;
+                let (buffer, data) = host.table_buffer(bytes)?;
                 crate::host::name(&buffer, || "view marks".into());
                 // Every slot unmarked (all ones) until a view is made there.
                 // SAFETY: our mapped buffer of `bytes` bytes.
@@ -597,7 +597,7 @@ impl HostHeap {
             // made afresh on a host whose heap is smaller than the title's
             // read past the title slots' entries: whatever followed the
             // buffer, or a GPU fault).
-            let Some((buffer, data)) = host()?.upload_buffer(u64::from(self.address_slots()) * 16) else {
+            let Some((buffer, data)) = host()?.table_buffer(u64::from(self.address_slots()) * 16) else {
                 tracing::warn!(slots = self.address_slots(), "no view address buffer");
                 return None;
             };

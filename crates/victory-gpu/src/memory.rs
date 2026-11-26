@@ -501,7 +501,7 @@ impl Shared {
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
         let bytes = (LEVEL1 + (CAPACITY + 1) * BLOCK * 2) as u64 * 4;
-        let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
+        let (table, data) = crate::host::host()?.table_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
         heap.raw_pair_at(null, None, 0);

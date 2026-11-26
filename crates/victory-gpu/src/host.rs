@@ -4570,6 +4570,20 @@ impl Host {
             if !crate::switch::on("VICTORY_GPU_UPLOAD") {
                 return false;
             }
+            let on = self.gpu_upload_heaps();
+            tracing::info!(
+                on,
+                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
+            );
+            on
+        })
+    }
+
+    /// Whether the host has GPU upload heaps (`D3D12_OPTIONS16`: resizable
+    /// BAR and a recent runtime). Asked once.
+    fn gpu_upload_heaps(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
             let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             // SAFETY: a feature query writing the structure of its size.
             let known = unsafe {
@@ -4580,13 +4594,25 @@ impl Host {
                 )
             }
             .is_ok();
-            let on = known && o.GPUUploadHeapSupported.as_bool();
-            tracing::info!(
-                on,
-                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
-            );
-            on
+            known && o.GPUUploadHeapSupported.as_bool()
         })
+    }
+
+    /// A mapped buffer for a table every shader reads and only the CPU
+    /// writes (the title memory page table, the view strides, marks and
+    /// addresses): in a GPU upload heap where the host has one, so shaders
+    /// read it from video memory instead of over the bus; upload memory
+    /// otherwise, or with `VICTORY_TABLES_GPU_UPLOAD=0`. Both are
+    /// write-combined: callers only write it. Outside [`UPLOAD_BUDGET`]:
+    /// a few tables per view heap, made once.
+    pub(crate) fn table_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            let on = crate::switch::on_by_default("VICTORY_TABLES_GPU_UPLOAD") && self.gpu_upload_heaps();
+            tracing::info!(on, "tables shaders read in GPU upload heaps (VICTORY_TABLES_GPU_UPLOAD)");
+            on
+        });
+        on.then(|| self.shared_mapped_buffer(size, true)).flatten().or_else(|| self.upload_buffer(size))
     }
 
     /// Whether host copies that shaders write go to GPU upload heaps too,
