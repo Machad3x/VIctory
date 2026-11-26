@@ -3479,6 +3479,7 @@ impl<'a> Lower<'a> {
         let u = self.unlaunched(lo, &mut known, &mut busy)?;
         match self.pair_high(lo) {
             Some(hi) => (self.unlaunched(hi, &mut known, &mut busy)? == u).then_some(u),
+            None if self.x.p.wave64 => None,
             None => Some(u),
         }
     }
@@ -3504,8 +3505,8 @@ impl<'a> Lower<'a> {
 
     /// A lane mask's bit, in a lane the console never launched, next to
     /// the host's (whose EXEC on entry has the lane); `None` where that is
-    /// not known. A join in `busy` (a loop's) takes its other edges' bit;
-    /// a value reaching a join in `busy` through an instruction is `None`.
+    /// not known. Any value reached through a value in `busy` (a loop's
+    /// back edge), a join included, is `None`.
     fn unlaunched(
         &self,
         v: Value,
@@ -3520,7 +3521,16 @@ impl<'a> Lower<'a> {
         }
         let u = self.unlaunched_def(v, known, busy);
         busy.remove(&v);
-        known.insert(v, u);
+        // A join cut off at a busy edge has no verdict here, not in general.
+        let cut = self.def_block.get(&v).is_some_and(|&b| {
+            self.x.p.blocks[b]
+                .phis
+                .iter()
+                .any(|q| q.value == v && q.args.iter().any(|a| busy.contains(a)))
+        });
+        if !cut {
+            known.insert(v, u);
+        }
         u
     }
 
@@ -3549,7 +3559,7 @@ impl<'a> Lower<'a> {
             let mut all = None;
             for &arg in &phi.args {
                 if busy.contains(&arg) {
-                    continue;
+                    return None;
                 }
                 let u = self.unlaunched(arg, known, busy)?;
                 if all.is_some_and(|a| a != u) {
