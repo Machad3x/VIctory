@@ -318,7 +318,8 @@ static WAITERS: AtomicU64 = AtomicU64::new(0);
 /// Saves the cache if one is due ([`Save`]), unless a title thread waits
 /// for a pipeline: the next pipeline made, or the workers' idle check,
 /// tries again. With `VICTORY_PIPELINE_SAVE_EVERY_SECS`, by the timer and
-/// waits or not, as before.
+/// waits or not, as before. Best effort: a wait may start during a save,
+/// but blocks no draw, since pipelines made meanwhile queue to be stored.
 fn save(why: Save) {
     if super::library::save_every().is_some() || WAITERS.load(Ordering::Relaxed) == 0 {
         super::library::save(why);

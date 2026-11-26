@@ -284,15 +284,16 @@ pub(crate) fn pipeline(
         return create();
     };
     let _held = NAMES.hold(name);
+    // Made by another thread and not stored yet (a save held the library).
+    // Checked first: a pipeline leaves the queue only once stored.
+    if let Some(pso) = library.queued(&wide) {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        return Ok(pso);
+    }
     // Outside the lock: loads take up to seconds, and a save holds the lock
     // for as long as it serialises. The library's blob lives as long as it
     // does, which is never dropped.
     if let Ok(pso) = load(&library.loads, PCWSTR(wide.as_ptr())) {
-        LOADED.fetch_add(1, Ordering::Relaxed);
-        return Ok(pso);
-    }
-    // Made by another thread and not stored yet (a save held the library).
-    if let Some(pso) = library.queued(&wide) {
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
@@ -325,7 +326,10 @@ impl Shared {
 
     /// Stores the queued pipelines and `also`, with `state` held.
     fn store(&self, l: &mut Library, also: Option<(HSTRING, ID3D12PipelineState)>) {
-        let mut queued = std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()));
+        // Cloned, not taken: a pipeline stays findable in the queue until
+        // stored, so no thread compiles it again in between.
+        let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let taken = queued.len();
         queued.extend(also);
         for (name, pso) in &queued {
             // SAFETY: a live pipeline; a name already stored (a description
@@ -334,6 +338,11 @@ impl Shared {
                 l.added += 1;
             }
         }
+        let stored = &queued[..taken];
+        self.queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(n, _)| !stored.iter().any(|(s, _)| s == n));
     }
 }
 
