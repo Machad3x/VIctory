@@ -360,6 +360,243 @@ pub(crate) fn windows_on() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_WINDOW"))
 }
 
+// Adapted from fxceless's window check (fxceless's fork, commit f85101b6).
+
+/// Whether every draw served from a window is checked against a fresh clamp
+/// of its records (`VICTORY_CLAMP_WINDOW_CHECK`, with `VICTORY_CLAMP_WINDOW`;
+/// off by default). The check clamps the records again just before the draw
+/// (into a buffer of its own, charging a budget of its own) and compares the
+/// two on the card. A record written between the window's pass and its draw
+/// differs; one the list's budget cut and the fresh budget did not is counted
+/// apart.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_WINDOW_CHECK"))
+}
+
+/// The compare of [`window_check`]: `records` records of `per` dwords,
+/// `stride` dwords apart, the window clamped (`t0`) against the same clamped
+/// just now (`t1`); the dwords between records are not written by a clamp.
+/// Counts in `u0` the records that differ, the checks, and the records the
+/// list's budget cut (zeroed in the window, not in the fresh clamp, whose
+/// budget starts at zero); keeps the first that differs (eight dwords of
+/// each), and zeroes the fresh clamp's budget (`u1`) for the next check.
+#[cfg(feature = "diagnostics")]
+const CHECK_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=3, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+cbuffer Check : register(b0) { uint per; uint stride; uint records; };
+ByteAddressBuffer window_record : register(t0);
+ByteAddressBuffer fresh_record : register(t1);
+RWByteAddressBuffer results : register(u0);
+RWByteAddressBuffer fresh_budget : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    for (uint r = 0; r < records; r++) {
+        uint base = 4 * r * stride;
+        bool same = true;
+        for (uint i = 0; i < per; i++) {
+            if (window_record.Load(base + 4 * i) != fresh_record.Load(base + 4 * i)) {
+                same = false;
+            }
+        }
+        if (same) {
+            continue;
+        }
+        uint before;
+        if (window_record.Load(base) == 0 && fresh_record.Load(base) != 0) {
+            results.InterlockedAdd(72, 1, before);
+            continue;
+        }
+        results.InterlockedAdd(0, 1, before);
+        if (before == 0) {
+            for (uint k = 0; k < min(per, 8u); k++) {
+                results.Store(8 + 4 * k, window_record.Load(base + 4 * k));
+                results.Store(40 + 4 * k, fresh_record.Load(base + 4 * k));
+            }
+        }
+    }
+    uint was;
+    results.InterlockedAdd(4, 1, was);
+    fresh_budget.Store(0, 0);
+}
+"#;
+
+#[cfg(feature = "diagnostics")]
+fn compare() -> Option<&'static Clamp> {
+    static COMPARE: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    COMPARE
+        .get_or_init(|| match make_from(CHECK_SOURCE) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "no window check");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// A list's buffers for [`window_check`]: the fresh clamps' records and
+/// budget (video memory, common between checks), and the results (mapped:
+/// records that differed, checks, then the first differing record as the
+/// window had it and as the fresh clamp made it, eight dwords each, then
+/// records the list's budget cut).
+#[cfg(feature = "diagnostics")]
+pub(crate) struct WindowCheck {
+    args: ID3D12Resource,
+    budget: ID3D12Resource,
+    results: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: D3D12 objects are free-threaded; the mapping is read only at
+// submission, when the list's last run has finished.
+#[cfg(feature = "diagnostics")]
+unsafe impl Send for WindowCheck {}
+// SAFETY: as above.
+#[cfg(feature = "diagnostics")]
+unsafe impl Sync for WindowCheck {}
+
+#[cfg(feature = "diagnostics")]
+impl WindowCheck {
+    pub(crate) fn new() -> Option<WindowCheck> {
+        let host = host()?;
+        let (results, data) = host.shared_buffer(256)?;
+        // SAFETY: the mapping holds 256 bytes; nothing runs yet.
+        unsafe { std::ptr::write_bytes(data, 0, 256) };
+        Some(WindowCheck {
+            args: host.uav_buffer(WINDOW_BYTES)?,
+            budget: host.uav_buffer(256)?,
+            results,
+            data: data as usize,
+        })
+    }
+}
+
+/// What the list's last run found at `data` (a [`WindowCheck`]'s mapping),
+/// zeroed for the next: checks, records that differed, records the list's
+/// budget cut, and the first that differed (as the window had it, as the
+/// fresh clamp made it). Only between runs of the list.
+#[cfg(feature = "diagnostics")]
+fn take(data: usize) -> (u32, u32, u32, [u32; 8], [u32; 8]) {
+    let words = data as *mut u32;
+    // SAFETY: the list's own mapped words; its last run has finished.
+    unsafe {
+        let at = |k: usize| words.add(k).read_volatile();
+        let window = std::array::from_fn(|k| at(2 + k));
+        let fresh = std::array::from_fn(|k| at(10 + k));
+        let found = (at(1), at(0), at(18), window, fresh);
+        std::ptr::write_bytes(words, 0, 19);
+        found
+    }
+}
+
+/// Checks, differing records and cut records seen by [`window_check`] so far.
+#[cfg(feature = "diagnostics")]
+static CHECKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`window_check`] for a draw served from a window: its `records` records
+/// of `kind` `stride` bytes apart at host GPU address `src` (a title
+/// buffer's copy, only read), which the window clamped into `window` at
+/// `at`, are clamped again into the list's check buffer and compared.
+/// Replaces the list's compute root signature and pipeline. False if
+/// nothing was recorded.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_hit(
+    list: &HostList,
+    src: u64,
+    (kind, stride, records): (u32, u32, u32),
+    window: &ID3D12Resource,
+    at: u64,
+) -> bool {
+    const CHECK_USE: usize = usize::MAX - 0x78;
+    let (Some(c), Some(cmp), Some(check)) = (clamp(), compare(), list.window_check()) else {
+        return false;
+    };
+    if list.first_use(CHECK_USE) {
+        // At this recording's submission: what the list's last run found.
+        let data = check.data;
+        list.defer_host(move || {
+            let (checked, differed, cut, window, fresh) = take(data);
+            if checked == 0 {
+                return;
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            let total = CHECKED[0].fetch_add(u64::from(checked), Relaxed) + u64::from(checked);
+            let bad = CHECKED[1].fetch_add(u64::from(differed), Relaxed) + u64::from(differed);
+            let cuts = CHECKED[2].fetch_add(u64::from(cut), Relaxed) + u64::from(cut);
+            if differed > 0 {
+                tracing::warn!(
+                    differed,
+                    checked,
+                    ?window,
+                    ?fresh,
+                    "window check: a draw served from a window read a record that differs from a fresh clamp of it"
+                );
+            }
+            if total / 10_000 != (total - u64::from(checked)) / 10_000 {
+                tracing::info!(checked = total, differed = bad, cut = cuts, "window check");
+            }
+        });
+    }
+    // SAFETY: live buffers.
+    let (budget, results, fresh, windowed) = unsafe {
+        (
+            check.budget.GetGPUVirtualAddress(),
+            check.results.GetGPUVirtualAddress(),
+            check.args.GetGPUVirtualAddress(),
+            window.GetGPUVirtualAddress() + at,
+        )
+    };
+    let constants = [kind, stride, records, 0];
+    // Dwords a clamp writes per record of `kind`, as `clamped` in the tests.
+    let per: u32 = match kind {
+        0 => 4,
+        1 => 5,
+        _ => 3,
+    };
+    let compared = [per, stride / 4, records];
+    let common = D3D12_RESOURCE_STATE_COMMON;
+    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    let l = &list.list;
+    list.note_host("host-clamp");
+    // SAFETY: an open list; our root signatures, pipelines and buffers, the
+    // window's argument buffer (indirect arguments while the window is
+    // open), and a title buffer's copy the caller's list holds.
+    unsafe {
+        // The previous check's compare zeroed the fresh budget.
+        l.ResourceBarrier(&[uav_barrier(), transition(&check.args, common, uav)]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src);
+        l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, fresh);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(window, args, D3D12_RESOURCE_STATES(args.0 | read.0)),
+            transition(&check.args, uav, read),
+        ]);
+        l.SetComputeRootSignature(&cmp.root);
+        l.SetPipelineState(&cmp.pso);
+        l.SetComputeRoot32BitConstants(0, 3, compared.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, windowed);
+        l.SetComputeRootShaderResourceView(2, fresh);
+        l.SetComputeRootUnorderedAccessView(3, results);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[
+            transition(window, D3D12_RESOURCE_STATES(args.0 | read.0), args),
+            transition(&check.args, read, common),
+        ]);
+    }
+    true
+}
+
 /// Records a window clamps at most: one tile of its pass.
 const WINDOW_RECORDS: u32 = 64;
 /// Bytes of clamped records a window holds at most.
@@ -450,6 +687,13 @@ pub(crate) fn windowed(
     unsafe { table.write_volatile(w.records) };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::ClampWindowDraws, 1);
+    #[cfg(feature = "diagnostics")]
+    if window_check() {
+        let out = w.out.clone();
+        drop(window);
+        let checked = check_hit(list, source + offset, (kind, stride, records), &out, at);
+        return Some((out, at, !fits || checked));
+    }
     Some((w.out.clone(), at, !fits))
 }
 

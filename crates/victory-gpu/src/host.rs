@@ -1120,6 +1120,9 @@ pub(crate) struct HostList {
     /// The open window of indirect draws clamped together (`indirect`,
     /// `VICTORY_CLAMP_WINDOW`).
     clamp_window: Mutex<Option<crate::indirect::Window>>,
+    /// The buffers of the window check (`VICTORY_CLAMP_WINDOW_CHECK`).
+    #[cfg(feature = "diagnostics")]
+    window_check: OnceLock<Option<crate::indirect::WindowCheck>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1481,6 +1484,8 @@ impl Host {
                 budget: OnceLock::new(),
                 arguments: Mutex::new(None),
                 clamp_window: Mutex::new(None),
+                #[cfg(feature = "diagnostics")]
+                window_check: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2807,6 +2812,12 @@ impl HostList {
     /// The list's open window of indirect draws clamped together.
     pub(crate) fn clamp_window(&self) -> std::sync::MutexGuard<'_, Option<crate::indirect::Window>> {
         self.clamp_window.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The list's window check buffers, made on first use.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn window_check(&self) -> Option<&crate::indirect::WindowCheck> {
+        self.window_check.get_or_init(crate::indirect::WindowCheck::new).as_ref()
     }
 
     /// Begins occlusion query `index` of `heap` unless it is running in
