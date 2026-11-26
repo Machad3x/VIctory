@@ -1226,6 +1226,8 @@ struct Deferred {
     refreshed: crate::fx::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: crate::fx::Set<usize>,
+    /// Textures an alias was copied into, with the source's write stamp then.
+    aliased: crate::fx::Map<usize, u64>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2643,6 +2645,12 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether the list has yet to copy into texture `to` its aliased source
+    /// as written at `stamp`; it counts as copied from now.
+    pub(crate) fn first_alias(&self, to: usize, stamp: u64) -> bool {
+        self.deferred().aliased.insert(to, stamp) != Some(stamp)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

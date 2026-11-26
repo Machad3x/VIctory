@@ -879,6 +879,11 @@ pub(crate) const HOST_WRITTEN: usize = 1 << (usize::BITS - 2);
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// When a GPU write into it was last recorded ([`HostTexture::note_written`]),
+    /// 0 for never: which of two textures of one memory is newer.
+    // shortcut: record order is taken for submission order, and a stamp covers
+    // the whole texture; track per submission and subresource if a title needs it.
+    pub(crate) written: std::sync::atomic::AtomicU64,
     /// Formats views may take besides the texture's own family: the host
     /// took them as castable formats when it made the texture.
     pub(crate) castable: Vec<u32>,
@@ -933,6 +938,7 @@ impl HostTexture {
         HostTexture {
             texture,
             state: state.into(),
+            written: 0.into(),
             castable,
             host_written: false.into(),
             pending_host_writes: 0.into(),
@@ -945,6 +951,13 @@ impl HostTexture {
             placement: None,
             last: [crate::queue::presented().into(), now_ms().into()],
         }
+    }
+
+    /// A GPU write into it is recorded now.
+    pub(crate) fn note_written(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        static ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        self.written.store(ORDER.fetch_add(1, Relaxed) + 1, Relaxed);
     }
 
     /// The title used it now: a list of the title's names it, or a shader
@@ -1977,7 +1990,10 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         .peekable();
     written.peek()?;
     let want = bytes(&b.desc)?;
-    written.find(|&r| bytes(&resource(r).desc) == Some(want))
+    // The newest written; the first of equals.
+    written
+        .filter(|&r| bytes(&resource(r).desc) == Some(want))
+        .min_by_key(|&r| std::cmp::Reverse(made(resource(r)).map_or(0, |t| t.written.load(std::sync::atomic::Ordering::Relaxed))))
 }
 
 #[cfg(windows)]
