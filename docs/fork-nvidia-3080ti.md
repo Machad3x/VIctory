@@ -707,7 +707,7 @@ None of these is verified in the game.
 | Interpolation writes obey EXEC (upstream [#3153](https://github.com/Marvisak/VIctory/issues/3153)) | Inactive lanes lost their destination. A lane whose EXEC differs between `p1` and `p2` still does not get the console's partial value. Exception: f16 packed interpolation whose destination holds its own first half is not guarded |
 | Title resources are pinned while views of them are read (upstream [#3213](https://github.com/Marvisak/VIctory/issues/3213)) | A release on another thread could free a resource still being read. Shader and unordered views only: render target and depth lookups are not pinned |
 | Render targets are resolved when set and replayed on a cut (upstream [#3217](https://github.com/Marvisak/VIctory/issues/3217)) | A cut read the title's descriptors again, which may have changed since |
-| Early pipelines are made in first-use order, and compute pipelines are waited for like screen passes (`VICTORY_COMPUTE_WAIT=0` gives them the other draws' 500 ms instead). Both share the 20 s per-frame wait budget, so a slow compute pipeline can make a screen pass drop | A one-off dispatch dropped while its pipeline was made is lost |
+| Early pipelines are made in first-use order. Waiting for compute pipelines like screen passes is off unless `VICTORY_COMPUTE_WAIT=1`: on by default at first, it made frames take 15 to 26 s while the cache was cold (`gpu218`, against about 1 s in `gpu209` and `gpu210`) and did not explain the dark scene | A one-off dispatch dropped while its pipeline was made is lost |
 
 Observation: the scene was dark in runs `gpu196`, `gpu200`, `gpu210` and
 `gpu211` (which dropped passes while pipelines were being made), but also in

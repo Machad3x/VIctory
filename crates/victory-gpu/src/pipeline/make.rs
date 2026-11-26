@@ -20,9 +20,9 @@
 //! `PS_AreaLightIlluminance`) with such draws once, at the world's first
 //! frame, behind more than a thousand other pipelines. Dropped, the tables
 //! stay empty for the whole run. Idea from Belobug's fork (18e57db).
-//! Compute pipelines wait in the same class, as a one-off dispatch dropped
-//! is lost for the rest of the scene (`VICTORY_COMPUTE_WAIT=0` gives them
-//! the other draws' budget instead).
+//! `VICTORY_COMPUTE_WAIT=1` makes compute pipelines wait in the same class,
+//! for a one-off dispatch that would be lost: with a cold cache frames then
+//! took 15 to 26 s against about 1 s, so it is off by default.
 //!
 //! shortcut: both budgets are guesses; any other draw the title runs only
 //! once and whose pipeline takes longer than half a second is lost.
@@ -100,12 +100,10 @@ impl Pending {
         self.graphics.as_ref().is_some_and(|g| g.screen_pass())
     }
 
-    /// Waited for like a screen pass: a one-off dispatch dropped is lost.
+    /// Waited for like a screen pass ([`waits_compute`] for compute).
     fn urgent(&self) -> bool {
         static COMPUTE: OnceLock<bool> = OnceLock::new();
-        let compute = || {
-            std::env::var_os("VICTORY_COMPUTE_WAIT").as_deref() != Some("0".as_ref())
-        };
+        let compute = || waits_compute(std::env::var_os("VICTORY_COMPUTE_WAIT").as_deref());
         self.screen()
             || *COMPUTE.get_or_init(compute) && self.shaders.iter().any(|s| s.stage == "compute")
     }
@@ -212,6 +210,12 @@ const BUDGET: Duration = Duration::from_millis(500);
 // pipelines can use it up and a later screen pass of that frame is dropped;
 // split it if a run loses one.
 const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
+/// Whether `VICTORY_COMPUTE_WAIT`'s value asks compute pipelines to be waited
+/// for like screen passes.
+fn waits_compute(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some("1".as_ref())
+}
 
 /// The queue a pipeline goes into, the first served first: urgent pipelines
 /// a draw or dispatch waits for, other draws' pipelines, early starts.
@@ -466,17 +470,12 @@ mod tests {
         assert!(!p.screen());
     }
 
-    /// A compute pipeline waits like a screen pass without being one.
+    /// Compute pipelines wait like screen passes only when asked to.
     #[test]
-    fn compute_is_urgent() {
-        let shader = Arc::new(Shader::new("compute", b""));
-        let p = Pending::new(
-            vec![shader],
-            None,
-            #[cfg(feature = "diagnostics")]
-            &[],
-        );
-        assert!(p.urgent() && !p.screen());
+    fn compute_waits_only_when_asked() {
+        assert!(!waits_compute(None));
+        assert!(!waits_compute(Some("0".as_ref())));
+        assert!(waits_compute(Some("1".as_ref())));
     }
 
     /// Early starts are taken in the early list's order, not creation's.
