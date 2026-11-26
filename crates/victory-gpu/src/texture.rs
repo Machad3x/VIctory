@@ -463,7 +463,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
     to_write.record(list);
-    crate::list::ensure_state(list, from, COPY_SOURCE);
+    let bound = crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the copy does not release.
@@ -482,6 +482,14 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     unsafe {
         for i in 0..n {
             l.CopyTextureRegion(&place(&buffer, fa[i as usize]), 0, 0, 0, &sub(&a, i), None);
+        }
+        // The draw or dispatch reading `to` may have bound `from` as an
+        // unordered or shader view already: back to that state. Targets are
+        // set after the tables are bound, and restoring a depth write would
+        // tell a twin of it of a write that never happened.
+        // D3D12_RESOURCE_STATE_ UNORDERED_ACCESS and both shader resources.
+        if let Some(state) = bound.filter(|&s| s != 0 && s & !(0x8 | 0x40 | 0x80) == 0) {
+            crate::list::ensure_state(list, from, state);
         }
         l.ResourceBarrier(&[crate::host::transition(
             &buffer,

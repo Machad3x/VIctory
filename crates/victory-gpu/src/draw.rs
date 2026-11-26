@@ -4614,6 +4614,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// One dispatch writing a texture and reading an alias of its memory:
+    /// the copy into the alias leaves the written texture writable.
+    #[test]
+    fn an_alias_copy_leaves_its_source_in_the_bound_state() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _ = host.log_messages();
+        let va = title_memory(1 << 20);
+        // R32G32_UINT blocks written, read as BC1: the same bytes per row.
+        let written = texture_words(2, 2, 17, 0, 4);
+        let read = texture_words(8, 8, 71, 0, 0);
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1]) = (17, 4); // D3D12_UAV_DIMENSION_TEXTURE2D
+        (desc[10], desc[11]) = (va as u32, (va >> 32) as u32);
+
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &View::Placed(true, written, desc), false);
+        let copies = crate::texture::ALIAS_COPIES.load(std::sync::atomic::Ordering::Relaxed);
+        readable(&list, &used(ResourceType::Srv), &placed_view(va, read), false);
+        assert!(crate::texture::ALIAS_COPIES.load(std::sync::atomic::Ordering::Relaxed) > copies);
+        let source = crate::resource::texture_at(va, &written).unwrap();
+        let alias = crate::resource::texture_at(va, &read).unwrap();
+        assert_eq!(crate::resource::alias_source(alias), Some(source));
+        assert_eq!(
+            list.transition(source, 0x8).map(|(_, before)| before),
+            None,
+            "the written texture left UNORDERED_ACCESS"
+        );
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+    }
+
     /// `OMSetRenderTargets` records references to the bound render-target and
     /// depth-stencil host textures straight onto the command list. Even when no
     /// draw runs with them (dropped draws or later target switches) and the
