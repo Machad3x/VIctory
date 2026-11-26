@@ -804,6 +804,9 @@ From logs and code; no fix yet and no proven cause of the dark interiors.
   `gpu213` and `gpu218` the title created them and never bound them; `gpu200`
   and `gpu210` bound them and were dark. A correlation, not a cause.
 
+`VICTORY_DEMAND_COPIES=1` is an experiment against these misses: copies for
+the pages missed 8 frames running. Off by default, not yet run in the game.
+
 ## Tried and left out
 
 | Change | Result here |

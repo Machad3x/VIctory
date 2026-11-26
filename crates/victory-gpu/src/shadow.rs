@@ -63,6 +63,9 @@ pub(crate) struct Shadow {
     /// The title memory it stands for was freed ([`freed`]): nothing
     /// more goes into those addresses, which may hold something else by now.
     gone: std::sync::atomic::AtomicBool,
+    /// A window made for a persistent miss ([`demand`]): the frame it was
+    /// made in, plus 1 (0: any other copy).
+    demand: AtomicU64,
 }
 
 /// The video memory side of a mirrored copy.
@@ -524,6 +527,7 @@ impl Shadow {
             upload: std::sync::atomic::AtomicBool::new(false),
             vram,
             gone: std::sync::atomic::AtomicBool::new(false),
+            demand: AtomicU64::new(0),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -540,6 +544,11 @@ impl Shadow {
         let base = self.marks?;
         let page = (start >> 16).checked_sub(self.start >> 16)?;
         Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
+    }
+
+    /// Whether it was made for a persistent miss ([`demand`]).
+    pub(crate) fn demanded(&self) -> bool {
+        self.demand.load(Ordering::Relaxed) != 0
     }
 
     /// Whether writes through views of this copy are marked.
@@ -1855,6 +1864,24 @@ pub(crate) fn freed(start: u64, len: u64) {
             }
         }
     }
+    // Demand windows touching it go: a later miss makes a new one.
+    if DEMANDED.load(Ordering::Relaxed) {
+        let mut windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = start.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        let found: Vec<_> = windows
+            .range((lowest, 0)..(end, 0))
+            .filter(|&(&(s, l), copy)| copy.demanded() && start < s.saturating_add(l))
+            .map(|(&key, _)| key)
+            .collect();
+        for key in &found {
+            if let Some(copy) = windows.remove(key) {
+                gone(&copy);
+            }
+        }
+        if !found.is_empty() {
+            changed();
+        }
+    }
     // Views forgotten too: the next buffer at these addresses gets its own.
     let mut exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
     let views: Vec<_> = exact.1.range((start, 0, 0)..(end, 0, 0)).map(|(&key, _)| key).collect();
@@ -2031,6 +2058,38 @@ fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u6
 /// later ranges in it share), else a new one. None for memory that is not
 /// committed (a stale or null address): 4 MiB of zeros would not help.
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    loose_as(address, end, None)
+}
+
+/// Whether any [`demand`] window was made.
+static DEMANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Shaders keep missing the 64 KiB page at `at` (`frame`): a window copy
+/// for it, also inside a title buffer (whose own copy is not made), if
+/// `room` bytes allow one. Returns whether the page has a demand window
+/// made in this frame, and the bytes made now. None for memory that is not
+/// tracked: a copy-back there could undo the title's writes.
+pub(crate) fn demand(at: u64, frame: u64, room: u64) -> (bool, u64) {
+    let end = at.saturating_add(PAGE as u64);
+    let this = frame.wrapping_add(1);
+    {
+        let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(copy) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), at, end) {
+            return (copy.demand.load(Ordering::Relaxed) == this, 0);
+        }
+    }
+    if room < WINDOW {
+        return (false, 0);
+    }
+    match loose_as(at, end, Some(this)) {
+        // Another thread may have made it meanwhile: not ours then.
+        Some(copy) if copy.demand.load(Ordering::Relaxed) == this => (true, copy.len),
+        _ => (false, 0),
+    }
+}
+
+/// [`loose`], a window made now marked with `demand` ([`Shadow::demand`]).
+fn loose_as(address: u64, end: u64, demand: Option<u64>) -> Option<Arc<Shadow>> {
     if address < LOWEST_MAPPED {
         return None;
     }
@@ -2053,6 +2112,11 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    if let Some(made) = demand {
+        shadow.tracked.as_ref()?;
+        shadow.demand.store(made, Ordering::Relaxed);
+        DEMANDED.store(true, Ordering::Relaxed);
+    }
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
@@ -4177,6 +4241,31 @@ void main(uint3 id : SV_DispatchThreadID) {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
+    }
+
+    /// A demand window inside a title buffer leaves the buffer without a
+    /// copy, stays within the room given, and goes when the memory is freed.
+    #[test]
+    fn demand_windows_are_small_bounded_and_go_with_their_memory() {
+        if host().is_none() {
+            return;
+        }
+        let pages = 2 * WINDOW as usize / PAGE;
+        let p = crate::watch::tests::pool(pages);
+        let at = (p as u64).next_multiple_of(WINDOW);
+        register(p, p as u64, (pages * PAGE) as u64);
+        assert_eq!(demand(at, 7, WINDOW - 1), (false, 0), "no room");
+        assert_eq!(demand(at, 7, WINDOW), (true, WINDOW));
+        assert_eq!(demand(at + PAGE as u64, 7, 0), (true, 0), "the same window");
+        assert_eq!(demand(at, 8, WINDOW), (false, 0), "made earlier, still missed");
+        assert!(buffers().get(&(p as u64, p)).unwrap().shadow.is_none());
+        let copy = loose(at, at + 4).unwrap();
+        assert!(copy.demanded());
+        unregister(p, p as u64);
+        freed(at + PAGE as u64, PAGE as u64);
+        assert!(copy.gone.load(Ordering::Relaxed));
+        assert!(!LOOSE.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&(at, WINDOW)));
+        crate::watch::tests::free(p);
     }
 
     /// A 64 KiB page whose leading 4 KiB OS page is reserved while the rest is

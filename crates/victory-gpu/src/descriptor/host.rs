@@ -2590,6 +2590,7 @@ mod tests {
         let mut view = [0u32; 16];
         view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
         (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        // SAFETY: the heap's start holds at least one record.
         let record =|| unsafe { (title_heap.start as *const [u32; 3]).read_unaligned() };
         crate::descriptor::create_placed_srv(null, &words, &view, title_heap.start);
         let first = record();
