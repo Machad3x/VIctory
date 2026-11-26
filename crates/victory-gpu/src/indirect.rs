@@ -244,10 +244,14 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
         // One group walks every record.
         l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-        ]);
+        // No unordered-access barrier here: the transition orders `out`
+        // before its read as arguments, and only the next clamp touches the
+        // budget (and `out`) unordered again, behind its own barrier above.
+        l.ResourceBarrier(&[transition(
+            &out,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        )]);
     }
     Some(out)
 }
@@ -265,6 +269,8 @@ pub(crate) fn done(list: &HostList, arguments: &ID3D12Resource) {
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    #[cfg(test)]
+    tests::UAV_BARRIERS.with(|n| n.set(n.get() + 1));
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -276,6 +282,11 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// The unordered-access barriers built on this thread.
+        pub(super) static UAV_BARRIERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -476,6 +487,18 @@ void main(uint3 group : SV_GroupID) {
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [(1 << 20) + 1, 1, 1], "the title's copy as written");
         }
+    }
+
+    /// A clamp records one unordered-access barrier, ahead of its dispatch:
+    /// it orders the title's writes and the previous clamp's budget.
+    #[test]
+    fn a_clamp_records_one_uav_barrier() {
+        let before = UAV_BARRIERS.get();
+        let Some(twice) = clamped(0, &[1], 1, 2) else {
+            return; // no host GPU here
+        };
+        assert_eq!(UAV_BARRIERS.get() - before, 2);
+        assert_eq!(twice, [1]);
     }
 
     /// The budget is the list's: a second execution of the same records
