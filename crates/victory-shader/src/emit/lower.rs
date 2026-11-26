@@ -1151,9 +1151,13 @@ impl<'a> Lower<'a> {
                         // A short at byte 3 takes its high byte from the next
                         // dword: OR in that dword shifted by 32 - sh, in two
                         // shifts so that sh = 0 gives 0 (bits past the field
-                        // are cut below).
+                        // are cut below). Only byte 3 reads it (root views
+                        // have no bounds); elsewhere `at` again, whose bits
+                        // land at 16 or above and are cut too.
                         let (four, one, k31) = (self.s.m.i32(4), self.s.m.i32(1), self.s.m.i32(31));
-                        let next = self.s.m.bin(c, Bin::Add, at, four);
+                        let after = self.s.m.bin(c, Bin::Add, at, four);
+                        let last = self.s.m.cmp(c, pred::EQ, byte, three);
+                        let next = self.s.m.select(c, last, after, at);
                         let w2 = dword(self, next)?;
                         let up = self.s.m.bin(c, Bin::Sub, k31, sh);
                         let hi = self.s.m.bin(c, Bin::Shl, w2, one);
@@ -10492,9 +10496,12 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
             if width > 8 {
-                // As in `flat`: the next dword shifted by 32 - sh.
+                // As in `flat`: the next dword (only at byte 3) shifted by
+                // 32 - sh.
                 let (four, one, k31) = (self.s.m.i32(4), self.s.m.i32(1), self.s.m.i32(31));
-                let next = self.s.m.bin(c, Bin::Add, at, four);
+                let after = self.s.m.bin(c, Bin::Add, at, four);
+                let last = self.s.m.cmp(c, pred::EQ, byte, three);
+                let next = self.s.m.select(c, last, after, at);
                 let w2 = self.raw_dword(h, next);
                 let up = self.s.m.bin(c, Bin::Sub, k31, sh);
                 let hi = self.s.m.bin(c, Bin::Shl, w2, one);
