@@ -108,9 +108,21 @@ struct Fixed {
     scissors: Option<Vec<RECT>>,
     blend_factor: Option<Option<[f32; 4]>>,
     stencil_ref: Option<u32>,
-    /// Render target and depth view handles.
-    targets: Option<(Vec<u64>, u64)>,
+    /// Render targets by title slot (None where unresolved) and depth, as
+    /// resolved when set.
+    targets: Option<(Colours, Depth)>,
     topology: bool,
+}
+
+type Colours = Vec<Option<Target<D3D12_RENDER_TARGET_VIEW_DESC>>>;
+type Depth = Option<Target<D3D12_DEPTH_STENCIL_VIEW_DESC>>;
+
+/// A bound view, resolved while the title's resource and descriptor held it.
+struct Target<D> {
+    /// The title resource, for its state in the list.
+    resource: This,
+    texture: ID3D12Resource,
+    desc: Option<D>,
 }
 
 impl Drop for State {
@@ -443,8 +455,8 @@ impl State {
         if let Some(s) = fixed.stencil_ref {
             self.stencil_ref(list, s);
         }
-        if let Some((targets, depth)) = &fixed.targets {
-            self.set_targets(list, targets, *depth);
+        if let Some((targets, depth)) = fixed.targets {
+            self.bind_targets(list, targets, depth);
         }
     }
 
@@ -517,7 +529,39 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        self.fixed.targets = Some((handles.to_vec(), depth));
+        // Resolved now: once set, the title may overwrite a descriptor.
+        let mut targets = self.fixed.targets.take().map(|t| t.0).unwrap_or_default();
+        targets.clear();
+        targets.extend(handles.iter().map(|&h| {
+            let Some(record) = crate::descriptor::rtv_record(h) else {
+                once!(
+                    handle = format_args!("{h:#x}"),
+                    "render target without a recorded view"
+                );
+                return None;
+            };
+            Some(Target {
+                resource: record.resource,
+                texture: crate::resource::host_resource(record.resource)?,
+                desc: record.desc(),
+            })
+        }));
+        let depth = crate::descriptor::dsv_record(depth).and_then(|record| {
+            Some(Target {
+                resource: record.resource,
+                texture: crate::resource::host_resource(record.resource)?,
+                desc: record.depth_desc(),
+            })
+        });
+        self.bind_targets(list, targets, depth);
+    }
+
+    fn bind_targets(
+        &mut self,
+        list: &HostList,
+        targets: Vec<Option<Target<D3D12_RENDER_TARGET_VIEW_DESC>>>,
+        depth: Option<Target<D3D12_DEPTH_STENCIL_VIEW_DESC>>,
+    ) {
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -526,43 +570,36 @@ impl State {
         #[cfg(feature = "diagnostics")]
         {
             self.target_formats.clear();
-            self.target_formats.resize(handles.len(), None);
+            self.target_formats.resize(targets.len(), None);
         }
         // The index is for diagnostics.
         #[allow(clippy::unused_enumerate_index)]
-        for (_slot, &h) in handles.iter().enumerate() {
-            let Some(record) = crate::descriptor::rtv_record(h) else {
-                once!(
-                    handle = format_args!("{h:#x}"),
-                    "render target without a recorded view"
-                );
+        for (_slot, target) in targets.iter().enumerate() {
+            let Some(target) = target else {
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
-                continue;
-            };
-            self.targets.push(record.resource as usize);
+            self.targets.push(target.resource as usize);
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(list, record.resource);
-            list.keep(&texture);
+            crate::capture::note_target(list, target.resource);
+            list.keep(&target.texture);
             #[cfg(feature = "diagnostics")]
             {
                 // A view without a format takes its resource's.
-                let format = record.desc().map(|d| d.Format.0).filter(|&f| f != 0);
+                let format = target.desc.map(|d| d.Format.0).filter(|&f| f != 0);
                 // SAFETY: a live resource.
-                let format = format.unwrap_or_else(|| unsafe { texture.GetDesc() }.Format.0);
+                let format =
+                    format.unwrap_or_else(|| unsafe { target.texture.GetDesc() }.Format.0);
                 self.target_formats[_slot] = Some(format as u32);
             }
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&target.texture, target.desc.as_ref()));
         }
         self.depth = 0;
-        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
-            let texture = crate::resource::host_resource(record.resource)?;
-            self.depth = record.resource as usize;
+        let dsv = depth.as_ref().map(|target| {
+            self.depth = target.resource as usize;
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(list, record.resource);
-            list.keep(&texture);
-            Some(host.dsv(&texture, record.depth_desc().as_ref()))
+            crate::capture::note_target(list, target.resource);
+            list.keep(&target.texture);
+            host.dsv(&target.texture, target.desc.as_ref())
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
@@ -573,6 +610,7 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        self.fixed.targets = Some((targets, depth));
     }
 
     /// The user-data value of a root argument, as translated shaders read
@@ -4703,6 +4741,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         list.close();
         host.execute(&[&list]);
         assert_eq!(host.log_messages(), None);
+        // As a title's list reset does: the state holds its targets too.
+        state.reset(null);
         list.reset();
         assert_eq!(
             com_refs(&probe_rt),
@@ -4715,6 +4755,28 @@ void main(uint3 id : SV_DispatchThreadID) {
             "list reset must release its reference to the bound depth target"
         );
         drop((probe_rt, probe_ds));
+
+        // Part 3: a cut replays the views as they were set (upstream #3217),
+        // not what the title's descriptor holds by then.
+        let rt3 = make_target(28, 1);
+        let rt4 = make_target(28, 1);
+        let ds3 = make_target(40, 2);
+        let ds4 = make_target(40, 2);
+        crate::descriptor::create_rtv(null, rt3, std::ptr::null(), rtv);
+        crate::descriptor::create_dsv(null, ds3, std::ptr::null(), dsv);
+        state.set_targets(&list, &[rtv], dsv);
+        crate::descriptor::create_rtv(null, rt4, std::ptr::null(), rtv);
+        crate::descriptor::create_dsv(null, ds4, std::ptr::null(), dsv);
+        state.cut(&list);
+        assert_eq!(state.targets, [rt3 as usize]);
+        assert_eq!(state.depth, ds3 as usize);
+        list.close();
+        assert_eq!(host.log_messages(), None);
+        state.reset(null);
+        list.reset();
+        for target in [rt3, rt4, ds3, ds4] {
+            assert_eq!(release(target), 0);
+        }
 
         assert_eq!(release(rtv_heap), 0);
         assert_eq!(release(dsv_heap), 0);
