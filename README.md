@@ -18,13 +18,15 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 
 ## Status of this fork (2026-11-25)
 
+Based on upstream main `63bcca43`, with this fork's changes on top by area.
+
 **Not playable yet.** The title boots, runs its menus, loads the world and
 reaches play inside the prison cell of the first mission: about 1.5 frames per
 second, with rendering defects.
 
 | At the cell window (median of one 7-minute run) | |
 |---|---|
-| Frame time | about 670 to 690 ms (about 920 ms before the video-memory copies and the later changes) |
+| Frame time | about 670 ms (about 920 ms before the video-memory copies and the later changes) |
 | GPU step | about 300 ms |
 | Draws and dispatches dropped per frame | 0 in most reports |
 | Device removals in recent runs | none |
@@ -54,6 +56,8 @@ cargo build --profile diag -p victory --features diagnostics --locked
 the start, takes screenshots and prints a summary. It needs the diagnostics
 build (a release build ignores the key presses and the loop limit). The
 plain release steps under Getting started work too, without those settings.
+After a translator change the world stays black for some minutes while the
+host pipelines are made.
 
 Changes in this fork are made with AI assistance (Claude Code).
 

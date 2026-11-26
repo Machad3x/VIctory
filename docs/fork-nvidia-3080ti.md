@@ -272,6 +272,45 @@ screenshots of one 7-minute run (they were in the run before). Window scene
 medians: 692 ms a frame, GPU step 297 ms (675 and 314 the run before). The
 cell walls were black in both of these runs.
 
+## Rebased on upstream 63bcca43
+
+The fork's changes now sit on upstream main as commits by area (formats;
+loader, runtime and config; shaders and GPU; docs and tools) instead of a
+history with merges. Where both had a version of the same change, upstream's
+was kept, except:
+
+- Title-memory page bitmaps stay in video memory (not the pooled bitmaps of
+  #1865), and copy-backs keep this fork's comparison (not #2054's).
+- #2172 is joined with this fork's queued and mirrored refreshes: tracked
+  memory takes a refreshed range in one call.
+- Integer render targets keep this fork's blend change; the depth bounds
+  test of upstream is in.
+
+Also new here: barycentrics read directly come from `SV_Barycentrics`,
+rounding modes set from constant SGPRs and kept through whole-wave sections,
+and a side effect inside a whole-wave section refused (the last two from
+Yumaste's changes).
+
+Runs on the cell window, one each, 4,900 to 5,100 draws:
+
+| | before the rebase | after |
+|---|---|---|
+| Frame | 708 ms | 671 ms |
+| Preparing | 261 ms | 225 ms |
+| GPU | 305 ms | 318 ms |
+| Copy-back | 136 ms | 121 ms |
+| Draws dropped | 0 | 0 |
+
+The run after the rebase showed lit walls and the poster; interior lighting
+has differed between runs of one build before, so one run does not settle it.
+The two programs still untranslated in it are whole-wave sections of the
+water shading. Unmodified upstream main stopped on this machine 39 s in with
+an access violation inside the title's image (not looked into).
+
+The first run after a translator change is black in the world for minutes
+while the host pipelines are made (about 2,300 queued here, done during the
+second run).
+
 ## Tried and left out
 
 | Change | Result here |
