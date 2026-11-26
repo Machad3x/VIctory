@@ -508,7 +508,9 @@ Cell window, one run each, medians:
 The copies shrink as counted. The frame gain is within the noise: marked pages
 rose in this run, as they have between runs of one binary (61 to 119 ms), and
 whether the change adds to them is not settled. Image unchanged at the window,
-no draws dropped and no device removal.
+no draws dropped and no device removal. Reported upstream as
+[#3089](https://github.com/Marvisak/VIctory/issues/3089); the bitmap fix is
+also open there as [#2269](https://github.com/Marvisak/VIctory/pull/2269).
 
 ## CPU clock and core parking
 
