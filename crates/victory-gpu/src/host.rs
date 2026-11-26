@@ -734,6 +734,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// A list twice in one submission gets a prelude for each place: the
+    /// second must not record over the first's barriers.
+    #[test]
+    fn a_list_run_twice_keeps_both_preludes() {
+        let Some(host) = host() else { return };
+        let address = crate::watch::tests::pool(1) as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut object = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(std::ptr::null(), address, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut object), 0);
+        let copy = crate::resource::host_copy(object).expect("a host texture");
+        let (common, copy_dest, generic_read) = (0, 0x400, 0xac3);
+        let real = copy.state.swap(common, Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        list.track(&copy, copy_dest);
+        list.track(&copy, generic_read);
+        list.close();
+        let _ = issued();
+        let first = list.prelude(host, 0).expect("from the common state");
+        let second = list.prelude(host, 1).expect("from the state the first run leaves");
+        assert_ne!(first.as_raw(), second.as_raw());
+        let texture = copy.texture.as_raw() as usize;
+        assert_eq!(issued(), [(texture, common, copy_dest), (texture, generic_read, copy_dest)]);
+        // Neither prelude ran.
+        copy.state.store(real, Ordering::Relaxed);
+    }
+
     /// Textures the heaps view are brought up to date only if the title used
     /// them lately: one whose pages changed but that no shader read is not
     /// uploaded; read in the last pass, it is.
@@ -978,7 +1005,7 @@ pub(crate) struct HostList {
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
-    /// submission, in `prelude`. Holding the copies keeps every texture the
+    /// submission, in `preludes`. Holding the copies keeps every texture the
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
@@ -995,8 +1022,10 @@ pub(crate) struct HostList {
     /// The draw or dispatch being recorded runs a program using title
     /// memory ([`HostList::writer_uses_memory`]).
     memory_writer: std::sync::atomic::AtomicBool,
-    /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// The lists that run those transitions just before this one, one per
+    /// place the list has in a submission: each must keep its barriers until
+    /// the submission runs.
+    preludes: Mutex<Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// Which list this is, for the name that tells it apart in device-removed
@@ -1341,16 +1370,6 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
             name(&list, || list_name(id));
             Ok(HostList {
@@ -1364,7 +1383,7 @@ impl Host {
                 rebind: false.into(),
                 ours: false.into(),
                 memory_writer: false.into(),
-                prelude: (prelude_allocator, prelude),
+                preludes: Mutex::default(),
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
@@ -1487,12 +1506,13 @@ impl Host {
             .collect();
         crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
-        for list in runs {
+        for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
-            if let Some(prelude) = list.prelude() {
+            let nth = runs[..i].iter().filter(|r| std::ptr::eq(**r, *list)).count();
+            if let Some(prelude) = list.prelude(self, nth) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -2241,7 +2261,8 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    /// `nth` counts the list's earlier places in the same submission.
+    fn prelude(&self, host: &Host, nth: usize) -> Option<ID3D12CommandList> {
         // Depth textures and their twins first, from their real states and
         // back: the side each first use needs, made newer.
         let twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -2270,8 +2291,26 @@ impl HostList {
             left();
             return None;
         }
-        let (allocator, list) = &self.prelude;
-        // SAFETY: the prelude is not executing (every submission is waited
+        let mut preludes = self.preludes.lock().unwrap_or_else(|e| e.into_inner());
+        while preludes.len() <= nth {
+            // SAFETY: plain object creation.
+            let made = unsafe {
+                host.device
+                    .CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .and_then(|allocator| {
+                        let list: ID3D12GraphicsCommandList =
+                            host.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                        list.Close()?;
+                        Ok((allocator, list))
+                    })
+            };
+            match made {
+                Ok(pair) => preludes.push(pair),
+                Err(e) => fail(format_args!("no host state prelude ({e})")),
+            }
+        }
+        let (allocator, list) = &preludes[nth];
+        // SAFETY: this prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
@@ -3595,8 +3634,9 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 tracing::info!(
-                    "host copies kept over changed title memory {:.1}/frame",
-                    crate::texture::HOST_KEPT_STALE.swap(0, Ordering::Relaxed) as f64 / report_frames
+                    "host copies kept over changed title memory {:.1}/frame, host-written marks cleared {} in all",
+                    crate::texture::HOST_KEPT_STALE.swap(0, Ordering::Relaxed) as f64 / report_frames,
+                    crate::texture::HOST_MARKS_CLEARED.swap(0, Ordering::Relaxed)
                 );
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
                     let (commit, working_set) = process_memory();

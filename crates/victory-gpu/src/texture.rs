@@ -343,7 +343,14 @@ pub(crate) fn still_host(copy: &crate::resource::HostTexture) -> bool {
         return false;
     }
     let staging = copy.staging.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(t) = staging.as_ref().and_then(|s| s.tracked.as_ref()) else {
+    // Another thread may have cleared it before the lock was ours.
+    if !copy.host_written.load(Acquire) {
+        return false;
+    }
+    let Some((_memory, t)) = staging
+        .as_ref()
+        .and_then(|s| Some((s.memory, s.tracked.as_ref()?)))
+    else {
         return true;
     };
     // Lock free: nothing changed at all.
@@ -358,6 +365,17 @@ pub(crate) fn still_host(copy: &crate::resource::HostTexture) -> bool {
     }
     copy.host_written.store(false, Release);
     copy.pending_host_writes.fetch_and(!crate::resource::HOST_WRITTEN, Release);
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        HOST_MARKS_CLEARED.fetch_add(1, Relaxed);
+        if LOGGED.fetch_update(Relaxed, Relaxed, |n| (n < 20).then_some(n + 1)).is_ok() {
+            // SAFETY: a live resource.
+            let desc = unsafe { copy.texture.GetDesc() };
+            tracing::info!("host-written mark cleared: memory {_memory:p}, {desc:?}");
+        }
+    }
     false
 }
 
@@ -376,6 +394,10 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// of its memory had changed.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HOST_KEPT_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Host-written marks cleared since the last frame-rate line.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HOST_MARKS_CLEARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Records, once per list, the copy of `from`'s host texture into `to`'s:
 /// two title textures at one memory that cannot share a host texture
