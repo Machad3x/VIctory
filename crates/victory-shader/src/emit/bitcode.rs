@@ -585,24 +585,6 @@ impl Module {
         live
     }
 
-    /// Live `icmp` instructions comparing against constant `k` with `pred`.
-    #[cfg(test)]
-    pub fn live_cmps_with_const(&self, pred: u8, k: i64) -> u32 {
-        let live = self.live();
-        self.insts
-            .iter()
-            .enumerate()
-            .filter(|&(i, inst)| {
-                live[i]
-                    && matches!(
-                        inst.op,
-                        Op::Cmp(p, _, V::Const(c))
-                            if p == pred && self.consts[c as usize].1 == Const::Int(k)
-                    )
-            })
-            .count() as u32
-    }
-
     /// Block `b`'s terminator, a branch on a constant taking its one edge
     /// (lowering leaves many: lane conditions structurisation knows, edges
     /// no lane takes).
