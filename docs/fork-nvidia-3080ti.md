@@ -824,6 +824,14 @@ threads spent about 306 ms comparing, 145 ms writing and 20 ms reading;
 5118 indirect argument clamps per frame, 2236 with no shader write since the
 one before; no null UAV barriers for title buffer barriers.
 
+`gpu224` (lit, demand copies off, with the clamp barrier, staging and
+writer-cache changes): no errors, frames 351 to 436 ms, noisy; copy-back 71
+to 112 ms, above `gpu221` (54) and `gpu222` (62), cause not established (the
+new counters time every page). Of 55 to 68 ms of marked-page wall time the
+threads spent about 150 ms comparing, 90 to 117 ms writing and 20 ms reading.
+Pull and copy-back overlap could save at most about 13 ms per frame, so the
+first overlap stage is not worth building.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
