@@ -931,7 +931,9 @@ impl Shadow {
         let (a, b) = (from - start, to - start);
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         if !before.0.iter().any(|(at, bytes)| *at < b && a < *at + bytes.len()) {
-            return self.copy_queued(from, to);
+            // Mirrored: at once, as its pages may be armed, and a title write
+            // before a queued copy would save bytes the copy never takes.
+            return if self.vram.is_some() { self.copy(from, to) } else { self.copy_queued(from, to) };
         }
         let copied = self.copy(from, to);
         for (at, bytes) in before.0.iter_mut() {
@@ -1027,20 +1029,32 @@ impl Shadow {
 
     /// As [`Shadow::copy`], queued where the caller collects a
     /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
-    /// nothing reads back before they are made. A mirrored copy, and a
-    /// range with bytes saved for a copy-back, are copied at once.
+    /// nothing reads back before they are made. A mirrored copy's goes into
+    /// video memory alone, its mirror marked behind already. A range with
+    /// bytes saved for a copy-back, and a mirrored copy with snapshots ahead
+    /// (or with `VICTORY_MIRROR_QUEUE=0`), are copied at once.
     fn copy_queued(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
             return 0;
         }
-        if self.vram.is_some() || self.tracked.as_ref().is_some_and(|t| t.has_saved(from, to)) {
+        static MIRRORED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("VICTORY_MIRROR_QUEUE").is_none_or(|v| v != "0")
+        });
+        if self.tracked.as_ref().is_some_and(|t| t.has_saved(from, to))
+            || self.vram.as_ref().is_some_and(|v| {
+                !*MIRRORED || !v.ahead.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            })
+        {
             return self.copy(from, to);
         }
+        let into = self.vram.as_ref().map_or(self.data, |v| v.data);
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
+        let at = unsafe { into.add(from - start) };
         crate::copy_pool::copy(at, from as *const u8, to - from);
+        // Nothing for a copy without a mirror.
+        self.stale(from - start, to - start);
         to - from
     }
 
@@ -2573,6 +2587,49 @@ pub(crate) mod tests {
         copy.freshen(0, len);
         assert!(copy.stale_pages().is_empty());
         assert!(mirror == title, "the mirror has all of it");
+        unregister(p, p as u64);
+    }
+
+    /// A mirrored copy's refresh is queued with a submission's others: video
+    /// memory has title memory's bytes once they are made, and the mirror is
+    /// behind; the same through a submission's batch.
+    #[test]
+    fn mirrored_refreshes_are_queued_and_reach_video_memory() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::mirrored_refreshes_are_queued_and_reach_video_memory",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        // Nothing is queued with the switch off.
+        if !host.gpu_upload_writes() || std::env::var_os("VICTORY_MIRROR_QUEUE").is_some_and(|v| v == "0") {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(4);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        copy.freshen(0, len);
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + PAGE + 7) as *mut u8).write_volatile(0xB1) };
+        let (copied, pieces) = crate::copy_pool::queued(|| copy.update(p, len));
+        assert_eq!((copied, pieces.len()), (PAGE, 1), "queued");
+        assert_eq!(copy.stale_pages(), [1]);
+        crate::copy_pool::run(pieces);
+        assert!(gpu_bytes(&copy, p, len) == title);
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + 2 * PAGE + 9) as *mut u8).write_volatile(0xB2) };
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        list.close();
+        host.execute(&[&list]);
+        assert!(gpu_bytes(&copy, p, len) == title, "through the batch");
+        assert_eq!(copy.stale_pages(), [1, 2]);
+        copy.freshen(0, len);
+        // SAFETY: the mirror's bytes.
+        assert!(unsafe { std::slice::from_raw_parts(copy.data, len) } == title);
         unregister(p, p as u64);
     }
 
