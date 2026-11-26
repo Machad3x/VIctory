@@ -765,6 +765,36 @@ The shader crate tests pass but one that already failed; one game run
   translator assumes 32-bit denormals flushed and does not read the denormal
   modes.
 
+## View heap limit
+
+Upstream [#1777](https://github.com/Marvisak/VIctory/pull/1777) with the title
+index redirect of [#2628](https://github.com/Marvisak/VIctory/pull/2628) and
+review fixes. Not yet verified in the game.
+
+| Change | What was wrong |
+|---|---|
+| The device is probed for the view heap size (2^21, else 1,000,000), and shaders clamp indices and place the null buffer views below that size | This host takes 1,000,000 descriptors in a shader-visible heap, but shaders used null views and a clamp at 2^21, outside the heap. The long-failing test `emit::stride_tests::a_heap_buffer_read_where_no_buffer_view_is_reads_zeros`, failing until now, was this |
+| On a capped heap, a title index taken from the heap itself past the title's slots reads the heap's last, null view; title, dynamic and pair slots end before three null views | Such an index could reach the host's dynamic slots and view pairs |
+| The shader and pipeline cache keys include the view heap size | Translations made for another size would be reused. The shader cache is invalidated |
+
+Limits on capped hosts:
+
+- Title slots at or above 721,469 read null when a shader indexes the heap
+  itself. Their content is not restored.
+- A redirected texture read gets a 2D null view, whatever its dimension.
+
+Diagnostics builds warn when texture reads land on the null views.
+
+## Lighting findings
+
+From logs and code; no fix yet and no proven cause of the dark interiors.
+
+- Every `title memory this frame` line of runs `gpu215` to `gpu217` shows
+  `0 pages copied back`: persistent title-memory misses hold back the
+  copy-back of what shaders wrote.
+- The title's pipeline sync (`sync` in `list.rs`) does nothing: it records no
+  host barrier.
+
 ## Tried and left out
 
 | Change | Result here |
@@ -787,9 +817,6 @@ The shader crate tests pass but one that already failed; one game run
 - Three programs of the world scene do not translate: two whole-wave sections
   of split wave64 programs and barycentrics read directly.
 - Interior lighting has differed from run to run (walls black in many).
-- Tests failing on this GPU:
-  `emit::stride_tests::a_heap_buffer_read_where_no_buffer_view_is_reads_zeros`
-  (view heap cap).
 - The multi-wave barriers of #2214 are called undefined by D3D12 in its own
   review when reached from different places in one group; the pull request is
   a draft. Diagnostics builds now report wave32 programs whose lanes may skip
