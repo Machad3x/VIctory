@@ -4462,6 +4462,16 @@ unsafe extern "system" fn give_back_upload(size: *mut std::ffi::c_void) {
     UPLOAD_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
 }
 
+/// Live [`Host::table_buffer`]s in GPU upload heaps, and their bytes.
+static TABLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TABLE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by D3D12 when a table in a GPU upload heap is destroyed.
+unsafe extern "system" fn give_back_table(size: *mut std::ffi::c_void) {
+    TABLE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    TABLE_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+}
+
 /// [`UPLOAD_BYTES`], for tests.
 #[cfg(test)]
 pub(crate) fn upload_bytes() -> u64 {
@@ -4612,7 +4622,37 @@ impl Host {
             tracing::info!(on, "tables shaders read in GPU upload heaps (VICTORY_TABLES_GPU_UPLOAD)");
             on
         });
-        on.then(|| self.shared_mapped_buffer(size, true)).flatten().or_else(|| self.upload_buffer(size))
+        static CAP: OnceLock<u64> = OnceLock::new();
+        let cap = *CAP.get_or_init(|| {
+            let mb = std::env::var("VICTORY_TABLES_GPU_UPLOAD_MAX_MB").ok().and_then(|v| v.parse::<u64>().ok());
+            mb.unwrap_or(512).saturating_mul(1 << 20)
+        });
+        if on {
+            if TABLE_BYTES.fetch_add(size, Ordering::Relaxed) + size > cap {
+                TABLE_BYTES.fetch_sub(size, Ordering::Relaxed);
+                static FULL: std::sync::Once = std::sync::Once::new();
+                FULL.call_once(|| {
+                    tracing::info!(cap, "tables past VICTORY_TABLES_GPU_UPLOAD_MAX_MB go to upload memory")
+                });
+            } else if let Some((buffer, data)) = self.shared_mapped_buffer(size, true) {
+                let count = TABLE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                // SAFETY: a live buffer; the callback's data is the size alone.
+                // Without the callback the table stays counted for good.
+                let _ = unsafe {
+                    buffer
+                        .cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>()
+                        .and_then(|n| {
+                            n.RegisterDestructionCallback(Some(give_back_table), size as *const _)
+                        })
+                };
+                let mb = TABLE_BYTES.load(Ordering::Relaxed) as f64 / (1 << 20) as f64;
+                tracing::info!(count, mb, "tables in GPU upload heaps");
+                return Some((buffer, data));
+            } else {
+                TABLE_BYTES.fetch_sub(size, Ordering::Relaxed);
+            }
+        }
+        self.upload_buffer(size)
     }
 
     /// Whether host copies that shaders write go to GPU upload heaps too,
