@@ -328,6 +328,29 @@ block walls and the poster were lit. Interior walls still come out black in
 some runs of the same build (open). #2810 did not change that; the cutscene
 looked better with it.
 
+## Marked pages: comparison and guard changes
+
+Putting a marked page back cost about 165 µs summed over the threads: 55 to
+62 µs comparing it byte by byte, and about 130 µs in the three steps that take
+the guard lock (opening the page, marking it, taking it again), most of that
+waiting while another thread changed a page's protection. Now:
+
+- A block that differs is compared 8 bytes at once (same runs as before).
+- Up to 4 marked pages next to each other in one copy are compared, then
+  opened once and taken once. Pages with nothing to write, or that keep the
+  title's bytes, are not opened.
+
+Cell window, 4,900 to 5,100 draws, one run each, medians:
+
+| | Before | 8-byte comparison | And runs of pages |
+|---|---|---|---|
+| Marked pages | 115 ms | 102 ms | 91 ms |
+| Copy-back | 128 ms | 118 ms | 104 ms |
+| Frame | 644 ms | 644 ms | 635 ms |
+
+The frame difference is within the noise between runs (about 5 %). No draws
+dropped and no device removal.
+
 ## Tried and left out
 
 | Change | Result here |

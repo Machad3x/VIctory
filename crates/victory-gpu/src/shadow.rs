@@ -119,35 +119,51 @@ fn give_back(v: Vec<u8>) {
 const POOL_BYTES: usize = 512 << 20;
 
 /// The runs `[start, end)` of bytes where the copy differs from title
-/// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
-/// GPU wrote byte `i`: what a copy-back puts into title memory.
+/// memory (`host`, `title`: the same bytes of each) and, with the copy's
+/// bytes `before` the submission, from those too (the GPU wrote them): what
+/// a copy-back puts into title memory.
 ///
-/// Equal stretches (most of a page) are skipped a block at a time, then a
-/// line at a time inside a block that differs: one comparison per 8 bytes
-/// cost ~30 us per 64 KiB page, ~70 ms per world frame of marked pages.
-fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+/// Equal stretches are skipped a block at a time, and a block that differs is
+/// compared 8 bytes at once: byte by byte, a page the shaders rewrote cost
+/// ~55 us (most marked pages differ in most of their bytes).
+fn differing(host: &[u8], title: &[u8], before: Option<&[u8]>) -> Vec<(usize, usize)> {
     const BLOCK: usize = 1 << 10;
-    const LINE: usize = 32;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    // The high bit of each byte of `x` that is not zero.
+    let set = |x: u64| (((x & !HIGH) + !HIGH) | x) & HIGH;
     let n = host.len().min(title.len());
     let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, to: usize| match runs.last_mut() {
+        Some((_, end)) if *end == from => *end = to,
+        _ => runs.push((from, to)),
+    };
+    // Up to 8 bytes from `at`, zeros past the end (equal in each, so never
+    // in a run).
+    let word = |bytes: &[u8], at: usize| {
+        let mut out = [0; 8];
+        let len = (n - at).min(8);
+        out[..len].copy_from_slice(&bytes[at..at + len]);
+        u64::from_le_bytes(out)
+    };
     let mut block = 0;
     while block < n {
         let block_end = (block + BLOCK).min(n);
         if host[block..block_end] != title[block..block_end] {
-            let mut line = block;
-            while line < block_end {
-                let line_end = (line + LINE).min(block_end);
-                if host[line..line_end] != title[line..line_end] {
-                    for i in line..line_end {
-                        if host[i] != title[i] && gpu(i) {
-                            match runs.last_mut() {
-                                Some((_, end)) if *end == i => *end = i + 1,
-                                _ => runs.push((i, i + 1)),
-                            }
-                        }
-                    }
+            for at in (block..block_end).step_by(8) {
+                let copy = word(host, at);
+                let mut mask = set(copy ^ word(title, at));
+                if let Some(before) = before {
+                    mask &= set(copy ^ word(before, at));
                 }
-                line = line_end;
+                if mask == HIGH {
+                    push(at, at + 8);
+                    continue;
+                }
+                while mask != 0 {
+                    let i = at + mask.trailing_zeros() as usize / 8;
+                    push(i, i + 1);
+                    mask &= mask - 1;
+                }
             }
         }
         block = block_end;
@@ -171,6 +187,14 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
     if runs.is_empty() {
         return false;
     }
+    let _writing = crate::watch::writing(at, merged.len());
+    write_spans(at, merged, runs);
+    true
+}
+
+/// [`write_runs`] with title memory held open by the caller
+/// ([`crate::watch::writing`]).
+fn write_spans(at: usize, merged: &[u8], runs: &[(usize, usize)]) {
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
     for &(start, end) in runs {
         match spans.last_mut() {
@@ -178,11 +202,9 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
             _ => spans.push((start, end)),
         }
     }
-    let _writing = crate::watch::writing(at, merged.len());
     for (start, end) in spans {
         crate::host::write_mapped((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
     }
-    true
 }
 
 /// Outside `runs`, the copy takes title memory's bytes (`title`, read at the
@@ -212,6 +234,36 @@ thread_local! {
     /// Title memory as a copy-back reads it, a page at most: a fresh zeroed
     /// buffer cost a page's memset per page, thousands per world frame.
     static TITLE: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
+    /// [`TITLE`] for the pages of a marked run.
+    static RUN_TITLE: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(vec![0; RUN_PAGES * PAGE]);
+}
+
+/// Marked pages next to each other that go back with title memory opened and
+/// taken once: each change of its guard holds the lock every thread's
+/// copy-back and page fault takes, and at a page a time the threads mostly
+/// waited for it. A longer run would leave title memory unwritten for longer
+/// after it is read.
+const RUN_PAGES: usize = 4;
+
+/// A marked page `[from, to)` of a copy compared with title memory: what
+/// [`Shadow::compare`] found.
+struct Compared<'a> {
+    page: usize,
+    from: usize,
+    to: usize,
+    back: Back<'a>,
+}
+
+/// The copy's bytes of a page, ready to go back, and the runs of them to
+/// write into title memory; none where title memory cannot be read.
+type Back<'a> = Option<(&'a mut [u8], Vec<(usize, usize)>)>;
+
+impl Compared<'_> {
+    /// Whether it has bytes to write into title memory.
+    fn writes(&self) -> bool {
+        self.back.as_ref().is_some_and(|(_, runs)| !runs.is_empty())
+    }
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -369,6 +421,24 @@ impl Shadow {
         saved: Option<Box<[u8]>>,
         title: &mut [u8],
     ) -> bool {
+        match self.compare(page, from, to, saved, title) {
+            Some((host, runs)) => write_runs(from, host, &runs),
+            None => false,
+        }
+    }
+
+    /// [`Shadow::put_back`] up to the write: the copy's bytes `[from, to)`,
+    /// ready to go back, and the runs of them to write. None where title
+    /// memory cannot be read.
+    #[allow(clippy::mut_from_ref)] // the mapping, not `self`
+    fn compare(
+        &self,
+        page: usize,
+        from: usize,
+        to: usize,
+        saved: Option<Box<[u8]>>,
+        title: &mut [u8],
+    ) -> Back<'_> {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host =
@@ -386,15 +456,9 @@ impl Shadow {
             None => saved,
         };
         if !read {
-            return false;
+            return None;
         }
-        let runs = match &saved {
-            None => differing(host, title, |_| true),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                differing(host, title, |i| host[i] != before[i])
-            }
-        };
+        let runs = differing(host, title, saved.as_ref().map(|b| &b[from - page..to - page]));
         // The copy takes the title's other bytes, and holds what goes back.
         // Without bytes saved, the runs are every byte that differs: the
         // others are the title's already (copying them cost a 64 KiB write
@@ -402,7 +466,7 @@ impl Shadow {
         if saved.is_some() {
             take_others(host, title, &runs);
         }
-        write_runs(from, host, &runs)
+        Some((host, runs))
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -486,7 +550,7 @@ impl Shadow {
     ///
     /// `marked`: the shaders mark the pages they write through this copy's
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
-    /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
+    /// the pages they marked are compared ([`Shadow::copy_back_run`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         if self.upload.load(std::sync::atomic::Ordering::Relaxed) {
             // A view of the memory that writes (through another resource,
@@ -566,7 +630,7 @@ impl Shadow {
     /// `[address, address + len)` expanded outward to 64 KiB page
     /// boundaries and cut to the copy (`[start, start + len)`): whole pages
     /// so [`crate::watch::Tracked::take`] guards them for
-    /// [`Shadow::copy_back_marked`].
+    /// [`Shadow::copy_back_run`].
     pub(crate) fn page_range(&self, address: u64, len: u64) -> (u64, u64) {
         let end = self.start.saturating_add(self.len);
         let from = address.clamp(self.start, end);
@@ -639,7 +703,7 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // The GPU's bytes go into title memory, and no others:
                     // the title writes the piece meanwhile.
-                    let runs = differing(host, title, |i| host[i] != old[i]);
+                    let runs = differing(host, title, Some(old));
                     // The copy takes the title's bytes in turn.
                     take_others(host, title, &runs);
                     if write_runs(start + at, host, &runs) {
@@ -684,52 +748,94 @@ impl Shadow {
         written
     }
 
-    /// After a submission whose shaders marked the 64 KiB title page at
-    /// `page` as written through views of this copy: the bytes they changed
-    /// go into title memory, and the copy takes the title's others. What
-    /// they changed is what differs from the copy's bytes before the
-    /// submission: title memory where the title has not written the page
-    /// since the copy took it, else what the page held when the title first
-    /// wrote it ([`crate::watch::Tracked::saved`], if the page was armed).
+    /// After a submission whose shaders marked the 64 KiB title pages at
+    /// `pages` (in order) as written through views of this copy: the bytes
+    /// they changed go into title memory, and the copy takes the title's
+    /// others. What they changed is what differs from the copy's bytes
+    /// before the submission: title memory where the title has not written
+    /// the page since the copy took it, else what the page held when the
+    /// title first wrote it ([`crate::watch::Tracked::saved`], if the page
+    /// was armed). Up to [`RUN_PAGES`] pages are written and taken together.
     /// Returns the bytes written.
     // shortcut: a page the title wrote that was not armed (a write through
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
-    pub(crate) fn copy_back_marked(&self, page: usize) -> usize {
+    pub(crate) fn copy_back_run(&self, pages: &[usize]) -> usize {
+        RUN_TITLE.with(|title| {
+            let title = &mut title.borrow_mut();
+            pages.chunks(RUN_PAGES).map(|run| self.run_back(run, title)).sum()
+        })
+    }
+
+    fn run_back(&self, pages: &[usize], title: &mut [u8]) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (page.max(start), (page + PAGE).min(end));
-        if from >= to {
-            return 0;
+        // Each page compared with title memory, still guarded.
+        let mut compared: Vec<Compared> = Vec::with_capacity(pages.len());
+        for (&page, title) in pages.iter().zip(title.chunks_mut(PAGE)) {
+            let (from, to) = (page.max(start), (page + PAGE).min(end));
+            if from >= to {
+                continue;
+            }
+            self.freshen(from - start, to - start);
+            let saved = t.saved(page / PAGE);
+            if saved.is_none() && t.changed(page / PAGE) {
+                t.unarm(page / PAGE);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MarkedKept, 1);
+                continue;
+            }
+            // A title write while the page is read saves its bytes from before.
+            t.arm(from, to);
+            let back = self.compare(page, from, to, saved, title);
+            compared.push(Compared { page, from, to, back });
         }
-        self.freshen(from - start, to - start);
-        let saved = t.saved(page / PAGE);
-        if saved.is_none() && t.changed(page / PAGE) {
-            t.unarm(page / PAGE);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::MarkedKept, 1);
-            return 0;
+        let mut written = 0;
+        // Title memory opened once for each stretch of pages with bytes to
+        // write: never a page between them, which may be one that keeps the
+        // shaders' bytes out of title memory.
+        for stretch in compared.chunk_by(|a, b| a.to == b.from && a.writes() && b.writes()) {
+            if !stretch[0].writes() {
+                continue;
+            }
+            let (from, to) = (stretch[0].from, stretch[stretch.len() - 1].to);
+            let _writing = crate::watch::writing(from, to - from);
+            for c in stretch {
+                if let Some((host, runs)) = &c.back {
+                    write_spans(c.from, host, runs);
+                    written += c.to - c.from;
+                }
+            }
         }
-        // A title write while the page is read saves its bytes from before.
-        t.arm(from, to);
-        let written = self.put_back(page, from, to, saved);
-        // The copy took the title's bytes: so does video memory.
-        self.push(from - start, to - from);
-        // Equal to title memory now: taken, unless it holds the page in part.
-        // A page neither we nor the title wrote meanwhile (a title write
+        // Equal to title memory now: taken, unless the copy holds the page in
+        // part. A page neither we nor the title wrote meanwhile (a title write
         // marks it changed) is still taken and guarded, and the copy has
         // title memory's bytes: nothing to read again. (A third of the
         // world's marked pages hold no changed byte.)
-        if from == page && to == page + PAGE && (written || t.changed(page / PAGE)) {
-            // SAFETY: inside the mapping; only the submitting thread writes it.
-            let host =
-                unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
-            take_and_read(t, page, from, host);
-            self.push(from - start, to - from);
+        let mut again = Vec::with_capacity(compared.len());
+        for c in &compared {
+            // The copy took the title's bytes: so does video memory.
+            self.push(c.from - start, c.to - c.from);
+            if c.from == c.page && c.to == c.page + PAGE && (c.writes() || t.changed(c.page / PAGE)) {
+                again.push(c.page / PAGE);
+            }
         }
-        if written { to - from } else { 0 }
+        drop(compared);
+        if !again.is_empty() {
+            // Taken before they are read again, as in [`take_and_read`].
+            t.taken(&again);
+            for page in again {
+                let at = page * PAGE - start;
+                // SAFETY: inside the mapping (a page the copy holds whole);
+                // only the submitting thread writes it.
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), PAGE) };
+                crate::host::read_into((page * PAGE) as *const u8, host);
+                self.push(at, PAGE);
+            }
+        }
+        written
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -1250,26 +1356,41 @@ const PAGE_THREADS: usize = 6;
 /// Marked pages worth a thread more: fewer go back on the submitting one.
 const PAGES_PER_THREAD: usize = 8;
 
-/// Runs `f` on every `(copy, page)`, on several threads when there are many:
+/// Runs `f` on every `(copy, pages)`, pages next to each other in one copy
+/// together ([`RUN_PAGES`] at most), on several threads when there are many:
 /// a 64 KiB page costs 55 to 80 microseconds (two reads, a compare, writes
 /// and a protection change), and a world frame marks 2,000. The copies of
 /// one page keep their order, on one thread.
-fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, usize) + Sync) {
+fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, &[usize]) + Sync) {
     pages.sort_by_key(|&(_, page)| page);
     let threads = (pages.len() / PAGES_PER_THREAD).min(PAGE_THREADS);
-    if threads < 2 {
-        for (copy, page) in &pages {
-            f(copy, *page);
+    // A unit of work: the copies of one page, or a run of pages of one copy.
+    let mut units: Vec<(Vec<&Arc<Shadow>>, Vec<usize>)> = Vec::new();
+    for group in pages.chunk_by(|a, b| a.1 == b.1) {
+        let page = group[0].1;
+        if let ([(copy, _)], Some((copies, run))) = (group, units.last_mut())
+            && matches!(copies[..], [last] if Arc::ptr_eq(last, copy))
+            && run.len() < RUN_PAGES
+            && run.last() == Some(&(page - PAGE))
+        {
+            run.push(page);
+            continue;
         }
+        units.push((group.iter().map(|(copy, _)| copy).collect(), vec![page]));
+    }
+    let each = |(copies, run): &(Vec<&Arc<Shadow>>, Vec<usize>)| {
+        for copy in copies {
+            f(copy, run);
+        }
+    };
+    if threads < 2 {
+        units.iter().for_each(each);
         return;
     }
-    let groups: Vec<&[(Arc<Shadow>, usize)]> = pages.chunk_by(|a, b| a.1 == b.1).collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let work = || {
-        while let Some(group) = groups.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-            for (copy, page) in *group {
-                f(copy, *page);
-            }
+        while let Some(unit) = units.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            each(unit);
         }
     };
     std::thread::scope(|scope| {
@@ -1281,7 +1402,7 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
 }
 
 /// After a submission: every page its shaders marked as written through
-/// views goes back ([`Shadow::copy_back_marked`]), but for pages in
+/// views goes back ([`Shadow::copy_back_run`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
 /// memory declared) and, with `memory_withheld`, pages that shaders using
 /// title memory marked; the bitmaps are cleared. Before the copy-backs of
@@ -1344,17 +1465,20 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
     );
-    for_each_by_page(pages, |copy, page| {
-        if withheld
+    for_each_by_page(pages, |copy, run| {
+        let run: Vec<usize> = run
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
-        {
-            return;
-        }
-        let written = copy.copy_back_marked(page);
+            .copied()
+            .filter(|&page| {
+                !withheld
+                    .iter()
+                    .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
+            })
+            .collect();
+        let written = copy.copy_back_run(&run);
         #[cfg(feature = "diagnostics")]
         {
-            crate::copystat::add(crate::copystat::C::MarkedPages, 1);
+            crate::copystat::add(crate::copystat::C::MarkedPages, run.len() as u64);
             crate::copystat::add(crate::copystat::C::MarkedBytes, written as u64);
         }
         #[cfg(not(feature = "diagnostics"))]
@@ -3239,14 +3363,22 @@ void main(uint3 id : SV_DispatchThreadID) {
             if let Some(last) = host.last_mut() {
                 *last = 1;
             }
-            let gpu = |i: usize| !i.is_multiple_of(5);
+            // Every byte differing in a stretch, over word edges.
+            for i in (2000..2100).filter(|&i| i < len) {
+                host[i] = !title[i];
+            }
+            // Every fifth byte as before the submission: not the GPU's.
+            let before: Vec<u8> = (0..len)
+                .map(|i| if i.is_multiple_of(5) { host[i] } else { !host[i] })
+                .collect();
+            let gpu = |i: usize| host[i] != before[i];
             assert_eq!(
-                differing(&host, &title, gpu),
+                differing(&host, &title, Some(&before)),
                 naive(&host, &title, &gpu),
                 "length {len}"
             );
             assert_eq!(
-                differing(&host, &title, |_| true),
+                differing(&host, &title, None),
                 naive(&host, &title, &|_| true),
                 "length {len}"
             );
@@ -3301,6 +3433,41 @@ void main(uint3 id : SV_DispatchThreadID) {
         outer.copy_back(p, len);
         inner.copy_back(p + len / 2, len / 2);
         unregister(p + 1, (p + len / 2) as u64);
+        unregister(p, p as u64);
+    }
+
+    /// A run of marked pages with one the title wrote in it (not armed):
+    /// that page keeps the title's bytes, those around it take the shaders'.
+    #[test]
+    fn a_marked_run_keeps_the_page_the_title_wrote() {
+        const PAGES: usize = 11;
+        const TITLE_PAGE: usize = 5;
+        let p = crate::watch::tests::pool(PAGES);
+        let len = PAGES * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        for page in 0..PAGES {
+            if page != TITLE_PAGE {
+                copy.writing(p + page * PAGE, PAGE, true);
+            }
+            copy.write_host((p + page * PAGE + 10) as u64, &[page as u8 + 1]);
+        }
+        // SAFETY: a byte of our pool.
+        unsafe { ((p + TITLE_PAGE * PAGE + 20) as *mut u8).write_volatile(0xaa) };
+        let marked: Vec<usize> = (0..PAGES).map(|page| p + page * PAGE).collect();
+        assert_eq!(copy.copy_back_run(&marked), (PAGES - 1) * PAGE);
+        for page in 0..PAGES {
+            // SAFETY: bytes of our pool.
+            let at = |i: usize| unsafe { ((p + page * PAGE + i) as *const u8).read_volatile() };
+            let shader = if page == TITLE_PAGE { 0 } else { page as u8 + 1 };
+            let title = if page == TITLE_PAGE { 0xaa } else { 0 };
+            assert_eq!((at(10), at(20)), (shader, title), "page {page}");
+        }
+        copy.copy_back(p, len);
         unregister(p, p as u64);
     }
 
