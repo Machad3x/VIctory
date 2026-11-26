@@ -543,7 +543,14 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    // The resources aliasing and unordered access barriers name are held
+    // until the list is reset, as a transition's texture is (by its state):
+    // the title may release one before the list runs (fork PR #540).
+    let held = |h: &windows::Win32::Graphics::Direct3D12::ID3D12Resource| {
+        list.keep(h);
+        h.as_raw().cast_const().cast()
+    };
+    let host = |r: This| crate::resource::host_resource(r).map(|h| held(&h));
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
