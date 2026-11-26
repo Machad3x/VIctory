@@ -464,6 +464,15 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // Below the title's threads and the GPU submission: streaming takes idle
+    // CPU only, and no read is dropped. VICTORY_DSTORAGE_PRIORITY=0 keeps normal.
+    if std::env::var("VICTORY_DSTORAGE_PRIORITY").as_deref() != Ok("0") {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: a plain call on our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
