@@ -7,54 +7,46 @@ use super::Lower;
 
 impl Lower<'_> {
     /// Whether this lane sets mark bit `n` (its load and atomic go to the
-    /// bitmap in system memory): lanes with the first active lane's bit
-    /// leave it to that lane. Most lanes of a wave mark the same page, so
-    /// one load crosses the bus instead of 32. In pixel shaders the lane
-    /// that leads is the first that is no helper: a helper's writes are
-    /// dropped.
+    /// bitmap in system memory): one lane per distinct bit in the wave, the
+    /// lowest of the lanes `WaveMatch` groups with it. Most lanes of a wave
+    /// mark the same page, so one load crosses the bus instead of 32. One
+    /// wave op decides it, so lanes cannot see different active sets. In
+    /// pixel shaders helpers match only each other (bit 31 of the key; bits
+    /// stay below it): a helper's writes are dropped, so a non-helper lane
+    /// leads every bit the shader really marks.
     pub(super) fn mark_lead(&mut self, n: V) -> Option<V> {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
         let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
-        let (f, first) = if self.s.pixel {
+        let lane = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadNone, i32t, 111, &[]);
+        let key = if self.s.pixel {
             let helper = self
                 .s
                 .op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
-            let lane = self
-                .s
-                .op(c, "waveGetLaneIndex", Attr::ReadNone, i32t, 111, &[]);
-            let none = self.s.m.i32(u32::MAX);
-            let key = self.s.m.select(c, helper, none, lane);
-            // Operation 2, unsigned: the minimum.
-            let (min, unsigned) = (self.s.m.i8(2), self.s.m.i8(1));
-            let lead = self.s.op(
-                c,
-                "waveActiveOp.i32",
-                Attr::NoUnwind,
-                i32t,
-                119,
-                &[key, min, unsigned],
-            );
-            let f = self.s.op(
-                c,
-                "waveReadLaneAt.i32",
-                Attr::NoUnwind,
-                i32t,
-                117,
-                &[n, lead],
-            );
-            (f, self.s.m.cmp(c, pred::EQ, lane, lead))
+            let (top, zero) = (self.s.m.i32(1 << 31), self.s.m.i32(0));
+            let tag = self.s.m.select(c, helper, top, zero);
+            self.s.m.bin(c, Bin::Or, n, tag)
         } else {
-            let f = self
-                .s
-                .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[n]);
-            (
-                f,
-                self.s
-                    .op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]),
-            )
+            n
         };
-        let differ = self.s.m.cmp(c, pred::NE, n, f);
-        Some(self.s.m.bin(c, Bin::Or, differ, first))
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let m = self
+            .s
+            .op(c, "waveMatch.i32", Attr::NoUnwind, four, 165, &[key]);
+        let (lo, hi) = (self.s.m.extract(c, m, 0), self.s.m.extract(c, m, 1));
+        // The lowest lane of the match: in `lo` (lanes 0-31) or `hi` + 32.
+        let flo = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let (zero, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let some_lo = self.s.m.cmp(c, pred::NE, lo, zero);
+        let first = self.s.m.select(c, some_lo, flo, fhi);
+        Some(self.s.m.cmp(c, pred::EQ, first, lane))
     }
 }
