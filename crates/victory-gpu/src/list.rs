@@ -831,7 +831,11 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A box may not cover a texture never uploaded; marked host-written, it never would be.
-        if crate::texture::title_written(&to) {
+        // Title writes to this memory earlier in the same submission are not seen by the upload (it runs first).
+        if crate::texture::title_written(&to)
+            // SAFETY: `from` names the live source (`_upload` or the title's texture).
+            && !(source_box.is_null() && [x, y, z] == [0; 3] && unsafe { replaces_whole(&to, &from) })
+        {
             crate::texture::upload(list, dst.resource, &to);
         }
         ensure_state(list, dst.resource, COPY_DEST);
@@ -878,6 +882,53 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Whether a boxless copy at the origin from `from` (in the host's layout)
+/// replaces all of `to`: one subresource, equal sizes and block sizes.
+///
+/// # Safety
+/// A `from` of a texture's kind names a live resource.
+#[cfg(windows)]
+unsafe fn replaces_whole(to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, from: &CopyLocation) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, ID3D12Resource,
+    };
+    use windows::core::Interface;
+    // SAFETY: a live texture.
+    let d = unsafe { to.GetDesc() };
+    let volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    // A depth-stencil texture's planes are subresources of their own.
+    if d.MipLevels != 1
+        || (!volume && d.DepthOrArraySize != 1)
+        || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+    {
+        return false;
+    }
+    let depth = if volume { u32::from(d.DepthOrArraySize) } else { 1 };
+    let (size, format) = if from.kind == 1 {
+        let f = from.footprint;
+        ([u64::from(f.width), u64::from(f.height), u64::from(f.depth)], f.format)
+    } else {
+        let raw = from.resource.cast_mut().cast();
+        // SAFETY: the caller's live resource.
+        let Some(texture) = (unsafe { ID3D12Resource::from_raw_borrowed(&raw) }) else {
+            return false;
+        };
+        // SAFETY: as above.
+        let s = unsafe { texture.GetDesc() };
+        // A subresource index shares the footprint's first dword.
+        let mip = from.footprint.offset as u32 % u32::from(s.MipLevels.max(1));
+        let depth = if s.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(s.DepthOrArraySize) } else { 1 };
+        (
+            [(s.Width >> mip).max(1), u64::from((s.Height >> mip).max(1)), u64::from((depth >> mip).max(1))],
+            s.Format.0 as u32,
+        )
+    };
+    let block = |format| crate::resource::element(format).map(|e| e.1);
+    size == [d.Width, u64::from(d.Height), u64::from(depth)]
+        && block(format).is_some()
+        && block(format) == block(d.Format.0 as u32)
 }
 
 /// Doubling a packed pitch preserves its alignment and doubles every texel offset.

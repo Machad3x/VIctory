@@ -923,8 +923,8 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
+            self.retry.store(false, std::sync::atomic::Ordering::Relaxed);
             let buffer = self.detile(read, &fresh);
-            self.retry.store(buffer.is_none(), std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
             return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
@@ -968,7 +968,11 @@ impl Staging {
     /// staging buffer (`None` if none could be had or a subresource could
     /// not be read).
     fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+        let Some((buffer, at, data)) = staging_space(self.size) else {
+            // Space can be had later; a layout error below would only recur.
+            self.retry.store(true, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -1232,8 +1236,8 @@ mod tests {
         staging.memory = p as *const u8;
         staging.tracked = crate::watch::track(p, size, true);
         assert!(staging.tracked.is_some());
-        // No room for the subresource: the detile fails.
-        let total = std::mem::replace(&mut staging.size, 0);
+        // No staging space (no buffer is this large): the detile fails.
+        let total = std::mem::replace(&mut staging.size, 1 << 62);
         assert!(staging.refresh_now().1.is_none());
         assert!(staging.tracked.as_ref().unwrap().clean());
         assert!(staging.maybe_changed());
@@ -1242,6 +1246,12 @@ mod tests {
         assert_eq!(list, [0]);
         assert!(!staging.maybe_changed());
         assert!(staging.refresh_now().1.is_none());
+        // No room for the subresource: a layout error, not tried again.
+        staging.size = 0;
+        drop(crate::watch::writing(p, PAGE));
+        assert!(staging.maybe_changed());
+        assert!(staging.refresh_now().1.is_none());
+        assert!(!staging.maybe_changed());
         drop(staging);
         watch::free(p);
     }
