@@ -1074,9 +1074,10 @@ impl State {
                 for (address, shadow) in &roots {
                     if let (Some(shadow), Some((_, map))) = (shadow, &self.memory) {
                         let len = shadow.left(*address).min(1 << 20);
-                        shadow.refresh(list, *address, len);
-                        shadow.gpu_writes(list, *address, len, false);
-                        map.precise(*address, len);
+                        let (from, len) = shadow.page_range(*address, len);
+                        shadow.refresh(list, from, len);
+                        shadow.gpu_writes(list, from, len, false);
+                        map.precise(from, len);
                     }
                 }
                 // SAFETY: an open list; list memory alive until it is reset.

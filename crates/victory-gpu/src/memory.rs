@@ -113,8 +113,11 @@ impl Map {
     /// that. A whole page from the copy would put back what it held at
     /// the submission over what the title (or DirectStorage, through
     /// physical pages no watch sees) wrote there since.
-    /// shortcut: a marked page partly in such a range loses what shaders
-    /// wrote in its other part.
+    /// The range is whole pages (`Shadow::page_range`): a marked page it covered only
+    /// in part would lose what shaders wrote in its other part.
+    /// shortcut: a page the table reads from another copy than the range's
+    /// is still skipped, losing the writes to it; declare the range's pages
+    /// in that copy too if a title shows it.
     pub(crate) fn precise(&self, address: u64, len: u64) {
         self.precise
             .lock()
