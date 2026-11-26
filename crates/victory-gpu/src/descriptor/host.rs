@@ -589,7 +589,15 @@ impl HostHeap {
             // slot at an index from wrong data): what it views, and the
             // view's own copy (its bytes in a shared buffer go to the next
             // one), are freed only once that work has run.
-            if let Some((old, copy)) = old {
+            // The same view again keeps both alive through the slot.
+            // shortcut: with no submission (loading screens) what is retired
+            // waits for the next one; free it at once if memory shows it.
+            if let Some((old, copy)) = old
+                && !slot.as_ref().is_some_and(|(new, held)| {
+                    windows::core::Interface::as_raw(new) == windows::core::Interface::as_raw(&old)
+                        && held.as_ref().map(std::sync::Arc::as_ptr) == copy.as_ref().map(std::sync::Arc::as_ptr)
+                })
+            {
                 crate::host::retire(old, copy);
             }
         }
