@@ -832,6 +832,11 @@ threads spent about 150 ms comparing, 90 to 117 ms writing and 20 ms reading.
 Pull and copy-back overlap could save at most about 13 ms per frame, so the
 first overlap stage is not worth building.
 
+`gpu225` (dark interior, with runs joined while comparing): no errors. Median
+of the last 20 reports against `gpu224`: comparing 20 ms of thread time
+against 133, marked-page wall time 33 ms against 50, copy-back 49 ms against
+92, frame 379 ms against 436 (one run each).
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
