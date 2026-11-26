@@ -224,6 +224,8 @@ pub(crate) fn bound(list: &HostList, gpu: u64, (kind, stride, records): (u32, u3
         return None;
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
+    #[cfg(feature = "diagnostics")]
+    list.note_clamp();
     let l = &list.list;
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and buffers, and

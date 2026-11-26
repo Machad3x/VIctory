@@ -1099,6 +1099,20 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::binding("");
+        // shortcut: by what the shaders declare (any unordered view used
+        // counts, read or written); clears and copies of ours do not.
+        #[cfg(feature = "diagnostics")]
+        if p.marks.is_some()
+            || p.stages.iter().any(|s| {
+                let t = s.translated();
+                s.memory.is_some()
+                    || t.host.heap_writes
+                    || !t.host.written_root_uavs.is_empty()
+                    || t.used.iter().any(|r| r.kind == ResourceType::Uav)
+            })
+        {
+            list.note_shader_write();
+        }
         true
     }
 
@@ -3291,6 +3305,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// bridged by a copy at the read.
     #[test]
     fn a_texture_written_in_one_format_reads_in_another_through_a_placed_view() {
+        let _alone = ALIAS_COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -4614,10 +4629,14 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// Held by the tests that read `ALIAS_COPIES`, which counts for all.
+    static ALIAS_COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// One dispatch writing a texture and reading an alias of its memory:
     /// the copy into the alias leaves the written texture writable.
     #[test]
     fn an_alias_copy_leaves_its_source_in_the_bound_state() {
+        let _alone = ALIAS_COUNTING.lock().unwrap_or_else(|e| e.into_inner());
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };

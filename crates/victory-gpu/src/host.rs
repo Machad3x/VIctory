@@ -1285,6 +1285,9 @@ struct Deferred {
     waits: Vec<crate::hold::ValueWait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// An indirect clamp was recorded and no shader write since.
+    #[cfg(feature = "diagnostics")]
+    clamp_clean: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -1719,6 +1722,15 @@ impl Host {
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
+        #[cfg(feature = "diagnostics")]
+        crate::lightlog::submission(
+            withholding,
+            runs.iter().zip(&missed).map(|(list, &missed)| {
+                let memory = !list.deferred().missed.is_empty();
+                let pipelines = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                (memory, missed, pipelines)
+            }),
+        );
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
@@ -2512,6 +2524,22 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+    }
+
+    /// A draw or dispatch that may write through views is being recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_shader_write(&self) {
+        self.deferred().clamp_clean = false;
+    }
+
+    /// An indirect clamp is being recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_clamp(&self) {
+        use crate::copystat::{C, add};
+        add(C::Clamps, 1);
+        if std::mem::replace(&mut self.deferred().clamp_clean, true) {
+            add(C::ClampsNoWrite, 1);
         }
     }
 

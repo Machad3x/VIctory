@@ -1054,6 +1054,14 @@ impl Drop for HostTexture {
             USED.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
+        if let Some(k) = &self.key {
+            // SAFETY: a live texture.
+            let uses = unsafe { self.texture.GetDesc() }.Flags.0 as u32 & USES;
+            if uses != 0 {
+                crate::lightlog::dropped(k, uses);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
         {
             use windows::core::Interface;
             life::note(self.texture.as_raw() as usize, life::LET_GO, 0, life::holders(&self.texture));
@@ -1370,6 +1378,10 @@ fn shared_texture(
     }
     let mut t = make_texture(&d, state, clear)?;
     t.key = key;
+    #[cfg(feature = "diagnostics")]
+    if let Some(k) = &key {
+        crate::lightlog::created(address, k, d.flags & USES, live.is_some());
+    }
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
         remade(&k);

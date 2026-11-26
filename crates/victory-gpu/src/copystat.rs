@@ -104,8 +104,36 @@ pub(crate) enum C {
     /// Title threads writing a view into a shader-visible heap: time
     /// waiting for the heaps' lock (held by heap syncs and other writers).
     MirrorWaitUs,
+    /// Marked copy-backs: the pull from video memory and the pages' wall
+    /// time; thread time bringing the mirror up to date, reading title
+    /// memory, comparing, taking its other bytes, writing it and taking
+    /// pages again; spans written; per submission the smaller of pull and
+    /// wall time.
+    MarkedPullUs,
+    MarkedBackWallUs,
+    MarkedFreshenUs,
+    MarkedReadUs,
+    MarkedDiffUs,
+    MarkedTakeUs,
+    MarkedWriteUs,
+    MarkedRetakeUs,
+    MarkedSpans,
+    MarkedOverlapUs,
+    /// Null UAV barriers recorded: for title buffer barriers (by cause, see
+    /// `crate::list`), the title's own, and for enhanced barrier groups.
+    BarriersReadRead,
+    BarriersBeginOnly,
+    BarriersOther,
+    BarriersTitle,
+    BarriersGroups,
+    /// Indirect argument clamps, and those with no shader write recorded in
+    /// the list since the one before.
+    Clamps,
+    ClampsNoWrite,
+    /// Bytes refreshed into video memory only (mirrored copies).
+    VideoBytes,
 }
-const COUNTERS: usize = 61;
+const COUNTERS: usize = 79;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -305,6 +333,30 @@ pub(crate) fn log(frames: f64) {
             let hard = hard_faults();
             (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
         },
+    );
+    tracing::info!(
+        "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (smaller of the two per submission, summed: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans",
+        ms(c[C::MarkedPullUs as usize]),
+        ms(c[C::MarkedBackWallUs as usize]),
+        ms(c[C::MarkedOverlapUs as usize]),
+        ms(c[C::MarkedFreshenUs as usize]),
+        ms(c[C::MarkedReadUs as usize]),
+        ms(c[C::MarkedDiffUs as usize]),
+        ms(c[C::MarkedTakeUs as usize]),
+        ms(c[C::MarkedWriteUs as usize]),
+        ms(c[C::MarkedRetakeUs as usize]),
+        c[C::MarkedSpans as usize],
+    );
+    tracing::info!(
+        "  null UAV barriers per frame: title buffer barriers {:.0} read to read, {:.0} begin only, {:.0} other; {:.0} the title's own; {:.0} for barrier groups; {:.0} indirect clamps ({:.0} with no shader write since the one before); {:.1} MB refreshed into video memory only",
+        c[C::BarriersReadRead as usize],
+        c[C::BarriersBeginOnly as usize],
+        c[C::BarriersOther as usize],
+        c[C::BarriersTitle as usize],
+        c[C::BarriersGroups as usize],
+        c[C::Clamps as usize],
+        c[C::ClampsNoWrite as usize],
+        mb(c[C::VideoBytes as usize]),
     );
     let held: Vec<String> = crate::watch::held_times()
         .iter()

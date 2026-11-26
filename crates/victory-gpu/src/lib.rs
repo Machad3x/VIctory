@@ -41,6 +41,8 @@ mod fx;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod lightlog;
 pub mod list;
 #[cfg(windows)]
 mod memory;

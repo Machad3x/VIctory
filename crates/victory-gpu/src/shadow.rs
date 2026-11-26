@@ -207,7 +207,8 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
 
 /// [`write_runs`] with title memory held open by the caller
 /// ([`crate::watch::writing_ours`]).
-fn write_spans(at: usize, merged: &[u8], runs: &[(usize, usize)]) {
+/// Returns the spans written.
+fn write_spans(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> usize {
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
     for &(start, end) in runs {
         match spans.last_mut() {
@@ -215,9 +216,11 @@ fn write_spans(at: usize, merged: &[u8], runs: &[(usize, usize)]) {
             _ => spans.push((start, end)),
         }
     }
+    let count = spans.len();
     for (start, end) in spans {
         crate::host::write_mapped((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
     }
+    count
 }
 
 /// Outside `runs`, the copy takes title memory's bytes (`title`, read at the
@@ -435,7 +438,7 @@ impl Shadow {
         saved: Option<Box<[u8]>>,
         title: &mut [u8],
     ) -> bool {
-        match self.compare(page, from, to, saved, title) {
+        match self.compare(page, from, to, saved, title, false) {
             Some((host, runs, _)) => write_runs(from, host, &runs),
             None => false,
         }
@@ -452,6 +455,8 @@ impl Shadow {
         to: usize,
         saved: Option<Box<[u8]>>,
         title: &mut [u8],
+        // A marked page's: its times are counted (diagnostics).
+        #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] marked: bool,
     ) -> Back<'_> {
         if self.gone.load(Ordering::Relaxed) {
             return None;
@@ -461,7 +466,11 @@ impl Shadow {
         let host =
             unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
         let title = &mut title[..n];
+        #[cfg(feature = "diagnostics")]
+        let reading = marked.then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedReadUs));
         let read = crate::host::read_into(from as *const u8, title);
+        #[cfg(feature = "diagnostics")]
+        drop(reading);
         #[cfg(test)]
         tests::after_read();
         // Our own write below must not save the page for this copy again.
@@ -475,13 +484,19 @@ impl Shadow {
         if !read {
             return None;
         }
+        #[cfg(feature = "diagnostics")]
+        let comparing = marked.then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedDiffUs));
         let runs = differing(host, title, saved.as_ref().map(|b| &b[from - page..to - page]));
+        #[cfg(feature = "diagnostics")]
+        drop(comparing);
         // The copy takes the title's other bytes, and holds what goes back.
         // Without bytes saved, the runs are every byte that differs: the
         // others are the title's already (copying them cost a 64 KiB write
         // per page).
         let took = saved.is_some();
         if took {
+            #[cfg(feature = "diagnostics")]
+            let _taking = marked.then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedTakeUs));
             take_others(host, title, &runs);
         }
         Some((host, runs, took))
@@ -826,7 +841,11 @@ impl Shadow {
             if from >= to {
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let freshening = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedFreshenUs);
             self.freshen(from - start, to - start);
+            #[cfg(feature = "diagnostics")]
+            drop(freshening);
             let saved = t.saved(page / PAGE);
             if saved.is_none() && t.changed(page / PAGE) {
                 t.unarm(page / PAGE);
@@ -836,7 +855,7 @@ impl Shadow {
             }
             // A title write while the page is read saves its bytes from before.
             t.arm(from, to);
-            let back = self.compare(page, from, to, saved, title);
+            let back = self.compare(page, from, to, saved, title, true);
             compared.push(Compared { page, from, to, back });
         }
         let mut written = 0;
@@ -845,6 +864,8 @@ impl Shadow {
         // Title memory opened once for each stretch of pages with bytes to
         // write: never a page between them, which may be one that keeps the
         // shaders' bytes out of title memory.
+        #[cfg(feature = "diagnostics")]
+        let writing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedWriteUs);
         for stretch in compared.chunk_by(|a, b| a.to == b.from && a.writes() && b.writes()) {
             if !stretch[0].writes() {
                 continue;
@@ -856,7 +877,9 @@ impl Shadow {
             let opened = own.is_none().then(|| crate::watch::writing_ours(from, to - from));
             for c in stretch {
                 if let Some((host, runs, _)) = &c.back {
-                    write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);
+                    let _spans = write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::MarkedSpans, _spans as u64);
                     written += c.to - c.from;
                     if own.is_some() {
                         unseen.push(c.page);
@@ -865,6 +888,8 @@ impl Shadow {
             }
             drop(opened);
         }
+        #[cfg(feature = "diagnostics")]
+        drop(writing);
         // Equal to title memory now: taken, unless the copy holds the page in
         // part. A page neither we nor the title wrote meanwhile (a title write
         // marks it changed) is still taken and guarded, and the copy has
@@ -892,6 +917,8 @@ impl Shadow {
         }
         drop(compared);
         if !again.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let _retaking = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedRetakeUs);
             // Taken before they are read again, as in [`take_and_read`].
             t.taken(&again);
             for page in again {
@@ -1148,6 +1175,8 @@ impl Shadow {
     /// Title memory at offsets `[from, to)` into the copy in video memory
     /// only: the mirror is behind there until [`Shadow::freshen`].
     fn copy_video(&self, v: &Vram, from: usize, to: usize) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::VideoBytes, (to - from) as u64);
         // SAFETY: inside the video memory mapping (offsets within the copy).
         let at = unsafe { v.data.add(from) };
         crate::host::copy_mapped(
@@ -1557,12 +1586,16 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let held_by: std::collections::HashSet<(usize, usize)> =
         held.iter().map(|(copy, page)| (Arc::as_ptr(copy) as usize, *page)).collect();
     let pages: Vec<(Arc<Shadow>, usize)> = pages_of(marked);
+    #[cfg(feature = "diagnostics")]
+    let pulling = std::time::Instant::now();
     pull(
         &pages
             .iter()
             .map(|(copy, page)| (copy.clone(), *page, PAGE))
             .collect::<Vec<_>>(),
     );
+    #[cfg(feature = "diagnostics")]
+    let pulled = pulling.elapsed().as_micros() as u64;
     // What does not go back: a copy's page held back, or in a range of the
     // copy withheld.
     let kept = |copy: &Arc<Shadow>, page: usize| {
@@ -1578,6 +1611,8 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         .collect();
     dropped.sort_unstable();
     dropped.dedup();
+    #[cfg(feature = "diagnostics")]
+    let backing = std::time::Instant::now();
     for_each_by_page(pages, |copy, run| {
         let run: Vec<usize> = run.iter().copied().filter(|&page| !kept(copy, page)).collect();
         let written = copy.copy_back_run(&run);
@@ -1589,6 +1624,14 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     });
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let wall = backing.elapsed().as_micros() as u64;
+        add(C::MarkedPullUs, pulled);
+        add(C::MarkedBackWallUs, wall);
+        add(C::MarkedOverlapUs, pulled.min(wall));
+    }
     // After the copy-backs, so that none takes these pages as current again.
     for page in dropped {
         crate::memory::drop_withheld(page, PAGE);

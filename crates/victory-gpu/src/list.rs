@@ -613,6 +613,33 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Why the title's buffer barriers among `barriers` got a null UAV barrier:
+/// any that is neither of the two others; else any transition read to read
+/// (COMMON counts as a read); else begin halves only (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn buffer_barrier_cause(barriers: &[Barrier]) -> crate::copystat::C {
+    use crate::copystat::C;
+    // Vertex and constant, index, depth read, shader resources, indirect
+    // argument, copy source, resolve source.
+    const READS: u32 = 0x1 | 0x2 | 0x20 | 0x40 | 0x80 | 0x200 | 0x800 | 0x2000;
+    let mut cause = C::BarriersBeginOnly;
+    for b in barriers {
+        if b.kind == 1 || b.first.is_null() || crate::resource::buffer_bytes(b.first).is_none() {
+            continue;
+        }
+        if b.kind == 0 && b.flags & 1 != 0 {
+            continue;
+        }
+        let before = crate::host::pc_state((b.second >> 32) as u32);
+        let after = crate::host::pc_state(b.last as u32);
+        if b.kind != 0 || (before | after) & !READS != 0 {
+            return C::BarriersOther;
+        }
+        cause = C::BarriersReadRead;
+    }
+    cause
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -653,6 +680,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             if b.kind == 0 && b.flags & 1 == 0 && crate::resource::host_copy(b.first).is_some_and(|c| c.twin.get().is_some_and(Option::is_some)) {
                 emit(&mut host);
             }
+            #[cfg(feature = "diagnostics")]
+            if b.kind == 2 && b.first.is_null() {
+                crate::copystat::add(crate::copystat::C::BarriersTitle, 1);
+            }
             host.extend(host_barrier(list, b));
         }
         // Buffers have host copies, not resources the barrier can name:
@@ -661,6 +692,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(buffer_barrier_cause(barriers), 1);
         }
         emit(&mut host);
     }
@@ -2143,6 +2176,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BarriersGroups, 1);
     }
     #[cfg(not(windows))]
     let _ = (this, count);
