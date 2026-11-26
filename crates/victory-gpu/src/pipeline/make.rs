@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use super::Shader;
 use super::host::{GraphicsState, HostPipeline};
+use super::library::Save;
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
@@ -297,6 +298,7 @@ fn wait(p: &Pending, frame: u64) {
     let budget = if urgent { SCREEN_BUDGET } else { BUDGET };
     let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
+    WAITERS.fetch_add(1, Ordering::Relaxed);
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -306,7 +308,21 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
+    WAITERS.fetch_sub(1, Ordering::Relaxed);
     waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Title threads waiting for a pipeline now.
+static WAITERS: AtomicU64 = AtomicU64::new(0);
+
+/// Saves the cache if one is due ([`Save`]), unless a title thread waits
+/// for a pipeline: the next pipeline made, or the workers' idle check,
+/// tries again. With `VICTORY_PIPELINE_SAVE_EVERY_SECS`, by the timer and
+/// waits or not, as before.
+fn save(why: Save) {
+    if super::library::save_every().is_some() || WAITERS.load(Ordering::Relaxed) == 0 {
+        super::library::save(why);
+    }
 }
 
 /// Pipelines for the workers, by [`lane`].
@@ -380,7 +396,7 @@ fn work() {
                 queues = held;
                 if waited.timed_out() {
                     drop(queues);
-                    super::library::save(false);
+                    save(Save::Drained);
                     queues = lock.lock().unwrap_or_else(|e| e.into_inner());
                 }
             }
@@ -392,7 +408,7 @@ fn work() {
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
         } else {
-            super::library::save(false);
+            save(Save::Made);
         }
     }
 }
@@ -401,7 +417,7 @@ fn work() {
 static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// The workers ran out of work: logged after a batch of 10 or more, and
-/// the cache saved (at most every 20 s).
+/// the cache saved.
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
     if PEAK.swap(0, Ordering::Relaxed) >= 10 {
@@ -412,7 +428,7 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
+    save(Save::Drained);
 }
 
 #[cfg(test)]

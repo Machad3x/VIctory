@@ -680,7 +680,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 /// Saves the pipeline cache now if anything was added (at the end of a run).
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
-    library::save(true);
+    library::save(library::Save::Now);
 }
 
 /// The pre-build: a title pipeline made ahead of a run into the pipeline
@@ -754,7 +754,8 @@ impl Prebuild {
             // too; a run then makes it at first use.
             library::note_prebuilt(key);
         }
-        library::save(false);
+        // Every `SAVE_AFTER` pipelines; the pre-build saves at its end.
+        library::save(library::Save::Made);
         match made {
             Some(_) => Ok(()),
             None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {

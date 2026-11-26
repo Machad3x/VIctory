@@ -28,7 +28,9 @@
 //! Loaded one at a time, 650 pipelines kept the eight workers to one core
 //! for minutes, while each title frame could wait out its 500 ms for
 //! them (`make`). Stores and serialising keep the lock: the size asked for
-//! must still be right when the bytes are written. Loads take no lock at
+//! must still be right when the bytes are written; a pipeline made while a
+//! save holds the lock waits in a queue to be stored, not its worker, and
+//! is the caller's at once. Loads take no lock at
 //! all, since a load adds nothing to the library: a save holds the lock
 //! while it serialises the whole library (hundreds of megabytes in the
 //! world), and loads that waited on it stalled every worker for as long.
@@ -75,6 +77,9 @@ struct Shared {
     /// The same library as `state`'s, loaded from without its lock.
     loads: ID3D12PipelineLibrary1,
     state: Mutex<Library>,
+    /// Pipelines made while a save held `state`, stored by the next store
+    /// or save: a worker never waits out a save with a pipeline in hand.
+    queued: Mutex<Vec<(HSTRING, ID3D12PipelineState)>>,
 }
 
 // SAFETY: as for `Library`.
@@ -152,7 +157,11 @@ fn library() -> Option<&'static Shared> {
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
             }
-            library.map(|l| Shared { loads: l.library.clone(), state: Mutex::new(l) })
+            library.map(|l| Shared {
+                loads: l.library.clone(),
+                state: Mutex::new(l),
+                queued: Mutex::new(Vec::new()),
+            })
         })
         .as_ref()
 }
@@ -282,18 +291,100 @@ pub(crate) fn pipeline(
         LOADED.fetch_add(1, Ordering::Relaxed);
         return Ok(pso);
     }
+    // Made by another thread and not stored yet (a save held the library).
+    if let Some(pso) = library.queued(&wide) {
+        LOADED.fetch_add(1, Ordering::Relaxed);
+        return Ok(pso);
+    }
     // Compiled outside the lock: compiles take up to seconds.
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
+    UNSAVED.fetch_add(1, Ordering::Relaxed);
+    // Never waits out a save: the pipeline is the caller's at once, and
+    // stored by the next store or save.
+    match library.state.try_lock() {
+        Ok(mut l) => library.store(&mut l, Some((wide, pso.clone()))),
+        Err(std::sync::TryLockError::Poisoned(e)) => {
+            library.store(&mut e.into_inner(), Some((wide, pso.clone())))
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            library.queued.lock().unwrap_or_else(|e| e.into_inner()).push((wide, pso.clone()))
+        }
     }
     Ok(pso)
+}
+
+impl Shared {
+    /// The pipeline named `name` if it waits to be stored.
+    fn queued(&self, name: &HSTRING) -> Option<ID3D12PipelineState> {
+        let queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+        queued.iter().find(|(n, _)| n == name).map(|(_, p)| p.clone())
+    }
+
+    /// Stores the queued pipelines and `also`, with `state` held.
+    fn store(&self, l: &mut Library, also: Option<(HSTRING, ID3D12PipelineState)>) {
+        let mut queued = std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()));
+        queued.extend(also);
+        for (name, pso) in &queued {
+            // SAFETY: a live pipeline; a name already stored (a description
+            // that differs) is refused, which leaves the library as it was.
+            if unsafe { l.library.StorePipeline(PCWSTR(name.as_ptr()), pso) }.is_ok() {
+                l.added += 1;
+            }
+        }
+    }
+}
+
+/// Pipelines made since the last save began.
+static UNSAVED: AtomicU64 = AtomicU64::new(0);
+
+/// A save after this many pipelines made.
+const SAVE_AFTER: u64 = 512;
+
+/// Saves when the workers run out at most this often: each first use of a
+/// pipeline made before changes the early list, and runs out the workers
+/// again, but a save writes the whole library (1.7 GB on NVIDIA).
+const DRAINED_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Why a save is asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Save {
+    /// At the end (of a run, of the pre-build): always.
+    Now,
+    /// The workers ran out of pipelines.
+    Drained,
+    /// A pipeline was made.
+    Made,
+}
+
+/// `VICTORY_PIPELINE_SAVE_EVERY_SECS=<n>`: saves as before `Save`, at most
+/// every `n` seconds whenever a pipeline is made or the workers run out.
+pub(crate) fn save_every() -> Option<std::time::Duration> {
+    static EVERY: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let secs = std::env::var("VICTORY_PIPELINE_SAVE_EVERY_SECS").ok()?.trim().parse().ok()?;
+        Some(std::time::Duration::from_secs(secs))
+    })
+}
+
+/// Whether a save is due: `SAVE_AFTER` pipelines made since the last, or
+/// the workers ran out and `DRAINED_EVERY` passed; with `save_every`, its
+/// time passed.
+fn due(
+    why: Save,
+    unsaved: u64,
+    every: Option<std::time::Duration>,
+    since: Option<std::time::Duration>,
+) -> bool {
+    let passed = |every: std::time::Duration| since.is_none_or(|t| t >= every);
+    match (why, every) {
+        (Save::Now, _) => true,
+        (_, Some(every)) => passed(every),
+        (Save::Drained, None) => unsaved >= SAVE_AFTER || passed(DRAINED_EVERY),
+        (Save::Made, None) => unsaved >= SAVE_AFTER,
+    }
 }
 
 #[cfg(feature = "diagnostics")]
@@ -305,20 +396,22 @@ thread_local! {
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
-pub(crate) fn save(now: bool) {
+/// last save and one is [`due`].
+pub(crate) fn save(why: Save) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+        let since = last.map(|t| t.elapsed());
+        if !due(why, UNSAVED.load(Ordering::Relaxed), save_every(), since) {
             return;
         }
         *last = Some(std::time::Instant::now());
+        UNSAVED.store(0, Ordering::Relaxed);
     }
     let (blob, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
+        library.store(&mut l, None);
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
             return;
         }
@@ -335,10 +428,7 @@ pub(crate) fn save(now: bool) {
             Ok(bytes) => {
                 l.added = 0;
                 l.prebuilt_changed = false;
-                // Kept beside the bytes it holds for (also when a run adds
-                // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
-                (bytes, prebuilt)
+                (bytes, (!l.prebuilt.is_empty()).then(|| l.prebuilt.clone()))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -346,6 +436,10 @@ pub(crate) fn save(now: bool) {
             }
         }
     };
+    // Hashed outside the lock: the blob is the whole library (1.7 GB on
+    // NVIDIA). Kept beside the bytes it holds for (also when a run adds
+    // pipelines).
+    let prebuilt = prebuilt.map(|keys| list(&tag(&blob), &keys));
     let used = used().as_ref().map(Used::list).unwrap_or_default();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
@@ -511,6 +605,26 @@ mod tests {
     fn a_save_buffer_the_host_cannot_give_is_refused() {
         assert!(zeroed(usize::MAX / 2).is_none());
         assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    }
+
+    /// Saves come after `SAVE_AFTER` pipelines, when the workers run out
+    /// (not too often), and at the end; with the timer, by time only.
+    #[test]
+    fn saves_are_due_by_count_drain_or_the_timer() {
+        use std::time::Duration;
+        let (hour, zero) = (Some(Duration::from_secs(3600)), Some(Duration::ZERO));
+        assert!(!due(Save::Made, SAVE_AFTER - 1, None, hour));
+        assert!(due(Save::Made, SAVE_AFTER, None, zero));
+        assert!(due(Save::Drained, 1, None, Some(DRAINED_EVERY)));
+        assert!(due(Save::Drained, 0, None, None));
+        assert!(!due(Save::Drained, 1, None, zero));
+        assert!(due(Save::Drained, SAVE_AFTER, None, zero));
+        assert!(due(Save::Now, 0, None, zero));
+        let every = Some(Duration::from_secs(20));
+        assert!(due(Save::Made, 0, every, None));
+        assert!(!due(Save::Made, SAVE_AFTER, every, Some(Duration::from_secs(19))));
+        assert!(due(Save::Drained, 1, every, Some(Duration::from_secs(20))));
+        assert!(due(Save::Now, 0, every, zero));
     }
 
     #[test]
@@ -795,6 +909,9 @@ mod tests {
         unsafe impl Sync for Made {}
         impl Made {
             fn get(&self, made: bool) -> windows::core::Result<ID3D12PipelineState> {
+                self.named("test: a pipeline loads while a save holds the library", made)
+            }
+            fn named(&self, name: &str, made: bool) -> windows::core::Result<ID3D12PipelineState> {
                 let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     // SAFETY: a borrowed pointer the description never releases.
                     pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
@@ -805,7 +922,7 @@ mod tests {
                     ..Default::default()
                 };
                 pipeline(
-                    "test: a pipeline loads while a save holds the library",
+                    name,
                     // SAFETY: the description points at live data.
                     |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                     || match made {
@@ -824,9 +941,21 @@ mod tests {
             let made = &made;
             s.spawn(move || done.send(made.get(false).is_ok()));
             let loaded = loaded.recv_timeout(std::time::Duration::from_secs(30));
-            drop(saving);
             assert_eq!(loaded, Ok(true), "the load waited for the save");
+            // One made meanwhile is the caller's at once, and found again
+            // before it is stored.
+            let queued = "test: a pipeline made while a save holds the library";
+            let (done, made_now) = std::sync::mpsc::channel();
+            s.spawn(move || done.send(made.named(queued, true).is_ok()));
+            let made_now = made_now.recv_timeout(std::time::Duration::from_secs(30));
+            assert_eq!(made_now, Ok(true), "the store waited for the save");
+            assert!(made.named(queued, false).is_ok(), "a queued pipeline is found");
+            drop(saving);
         });
+        // The next store or save stores it.
+        library.store(&mut library.state.lock().unwrap_or_else(|e| e.into_inner()), None);
+        assert!(library.queued.lock().unwrap().is_empty());
+        assert!(made.named("test: a pipeline made while a save holds the library", false).is_ok());
     }
 
     #[test]
