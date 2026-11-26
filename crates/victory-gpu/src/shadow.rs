@@ -3267,6 +3267,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// byte there (no mark) is not put back. The bits are cleared.
     #[test]
     fn marked_pages_go_back_by_the_bytes_the_gpu_changed() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(3);
         let len = 3 * PAGE;
         register(p, p as u64, len as u64);
@@ -3432,6 +3434,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// marks of the same submission go back.
     #[test]
     fn marks_of_shaders_using_title_memory_are_held_back() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
