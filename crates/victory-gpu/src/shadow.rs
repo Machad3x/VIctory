@@ -60,6 +60,9 @@ pub(crate) struct Shadow {
     /// what the CPU writes goes on into video memory ([`Shadow::push`]), what
     /// the GPU wrote comes back before the CPU reads it ([`pull`]).
     vram: Option<Vram>,
+    /// The title released the buffer ([`unregister`]): nothing more goes into
+    /// title memory, which may hold something else by now.
+    gone: std::sync::atomic::AtomicBool,
 }
 
 /// The video memory side of a mirrored copy.
@@ -439,6 +442,9 @@ impl Shadow {
         saved: Option<Box<[u8]>>,
         title: &mut [u8],
     ) -> Back<'_> {
+        if self.gone.load(Ordering::Relaxed) {
+            return None;
+        }
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host =
@@ -508,6 +514,7 @@ impl Shadow {
             slice,
             upload: std::sync::atomic::AtomicBool::new(false),
             vram,
+            gone: std::sync::atomic::AtomicBool::new(false),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -663,6 +670,8 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        // Pending ranges and snapshots are still released below.
+        let back = back && !self.gone.load(Ordering::Relaxed);
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
         let mut written = 0;
@@ -766,6 +775,9 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_run(&self, pages: &[usize]) -> usize {
+        if self.gone.load(Ordering::Relaxed) {
+            return 0;
+        }
         RUN_TITLE.with(|title| {
             let title = &mut title.borrow_mut();
             pages.chunks(RUN_PAGES).map(|run| self.run_back(run, title)).sum()
@@ -1723,7 +1735,9 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = map.remove(&(start, resource));
     // Counted once the map has changed.
     OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
-    if removed.is_some_and(|e| e.shadow.is_some()) {
+    // shortcut: a release racing a copy-back already under way is not stopped, hold a per-copy lock if it shows.
+    if let Some(shadow) = removed.and_then(|e| e.shadow) {
+        shadow.gone.store(true, Ordering::Relaxed);
         changed();
     }
 }
@@ -3555,6 +3569,66 @@ void main(uint3 id : SV_DispatchThreadID) {
             assert_eq!((read_title(probe), read_title(probe + 1)), (0xaa, 0x33), "{label}: second");
             unregister(p, p as u64);
         }
+    }
+
+    /// FIND-14: a copy-back that is still pending when the title gives its
+    /// range back - and takes the same addresses again for something else -
+    /// must not put the submission's bytes into the new use of them.
+    #[test]
+    fn a_pending_copy_back_does_not_write_into_memory_the_title_took_back() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let len = PAGE;
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, len);
+        // The submission takes its snapshot, and a shader writes one byte.
+        copy.writing(p, 64, false);
+        copy.write_host(p as u64 + 24, &[0x99]);
+        // The title gives the range back before the copy-back has run...
+        unregister(p, p as u64);
+        // SAFETY: our own allocation, freed once.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // ...and takes the addresses again for something of its own.
+        // SAFETY: a fresh allocation of the same size, filled for the test.
+        let q = unsafe { VirtualAlloc(p as *const _, len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        if q != p {
+            eprintln!("the address {p:#x} was not free again; not observed");
+            return;
+        }
+        // SAFETY: the allocation above.
+        unsafe { std::ptr::write_bytes(q as *mut u8, 0xee, len) };
+        // The copy-back of the submission that is over runs now.
+        copy.copy_back(p, 64);
+        // SAFETY: the re-used allocation, still mapped.
+        let after = unsafe { (q as *const u8).add(24).read_volatile() };
+        // SAFETY: as above.
+        unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(
+            after, 0xee,
+            "a byte a shader wrote for a submission that is over landed in memory the title re-used"
+        );
+    }
+
+    /// The marked-pages path writes nothing for a released buffer either.
+    #[test]
+    fn a_released_copy_writes_no_marked_page_back() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let Some(copy) = find(p as u64, PAGE as u64) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        copy.update(p, PAGE);
+        copy.writing(p, 64, true);
+        copy.write_host(p as u64 + 24, &[0x99]);
+        unregister(p, p as u64);
+        assert_eq!(copy.copy_back_run(&[p]), 0);
+        // SAFETY: a byte of our pool.
+        assert_eq!(unsafe { ((p + 24) as *const u8).read_volatile() }, 0);
     }
 
     /// Mark bits are handed out in runs and come back joined.
