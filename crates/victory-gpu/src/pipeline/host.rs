@@ -945,8 +945,12 @@ static ROOTS: std::sync::Mutex<Option<Roots>> = std::sync::Mutex::new(None);
 
 /// The device's root signature for `blob`, made on its first use. A root
 /// signature holds its device, so a device address is never reused while
-/// it is a key.
+/// it is a key. `VICTORY_ROOT_SHARE=0` makes one per pipeline, as before.
 fn shared_root(device: &ID3D12Device, blob: &[u8]) -> windows::core::Result<ID3D12RootSignature> {
+    if !crate::switch::on_by_default("VICTORY_ROOT_SHARE") {
+        // SAFETY: a serialized root signature.
+        return unsafe { device.CreateRootSignature(0, blob) };
+    }
     let key = (device.as_raw() as usize, blob.to_vec());
     let mut roots = ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let roots = &mut roots.get_or_insert_with(|| Roots(Default::default())).0;
@@ -957,6 +961,18 @@ fn shared_root(device: &ID3D12Device, blob: &[u8]) -> windows::core::Result<ID3D
     let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, blob)? };
     roots.insert(key, root.clone());
     Ok(root)
+}
+
+/// Drops `device`'s shared root signatures, which otherwise keep it alive.
+// The host device is a process-lifetime static (`crate::host::host`): no
+// release path calls this yet; one that tears the device down must.
+#[allow(dead_code)]
+pub(crate) fn forget_device_roots(device: &ID3D12Device) {
+    let device = device.as_raw() as usize;
+    let mut roots = ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(roots) = roots.as_mut() {
+        roots.0.retain(|(d, _), _| *d != device);
+    }
 }
 
 #[cfg(test)]
