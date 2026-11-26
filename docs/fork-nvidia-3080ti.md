@@ -485,6 +485,31 @@ One run: marked pages have varied that much between runs of one binary, and an
 intermediate build without this change gave 64 ms. No draws dropped and no
 device removal.
 
+## Withheld ranges give up marked pages only
+
+A range withheld because a list read memory with no copy left the host copies
+whole, so all of it was copied from title memory again, about 148 MB a frame in
+the cell scene. A counting run showed every such range marking the pages its
+shaders write, with about 59 % of the pages unmarked. Only the marked pages are
+dropped now (`VICTORY_RETAKE_ALL=1` drops whole ranges). Review found that the
+marks in the last word of the bitmap were cleared unread; no copy gets bits
+there any more.
+
+Cell window, one run each, medians:
+
+| | Before (`gpu189`) | After (`gpu190`) |
+|---|---|---|
+| Copies | 397 MB, 59 ms | 232 MB, 43 ms |
+| Preparing | 147 ms | 129 ms |
+| Marked pages | 62 ms | 80 ms |
+| Copy-back | 70 ms | 89 ms |
+| Frame | 384 ms | 377 ms |
+
+The copies shrink as counted. The frame gain is within the noise: marked pages
+rose in this run, as they have between runs of one binary (61 to 119 ms), and
+whether the change adds to them is not settled. Image unchanged at the window,
+no draws dropped and no device removal.
+
 ## CPU clock and core parking
 
 On a Ryzen 7 5700X the busy logical processors ran at 4.59 GHz in the cell
