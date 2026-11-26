@@ -86,6 +86,45 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Copy regions (destination, offset, source, offset, bytes).
+type Regions = Vec<(ID3D12Resource, u64, ID3D12Resource, u64, u64)>;
+
+thread_local! {
+    /// While set, [`Host::copy_now`] adds its regions here instead of
+    /// copying ([`Host::pull_riding`]).
+    static RIDING: std::cell::RefCell<Option<Regions>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The list a submission's pull rides in ([`Host::pull_riding`]).
+struct PullList {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    /// Executed and not yet waited for.
+    busy: bool,
+}
+// SAFETY: D3D12 objects are free-threaded; used under its mutex only.
+unsafe impl Send for PullList {}
+
+/// A pull recorded to run after a submission's lists: the list (locked
+/// until the wait) and the buffers it copies between.
+struct Riding {
+    guard: std::sync::MutexGuard<'static, PullList>,
+    list: ID3D12CommandList,
+    _regions: Regions,
+}
+
+/// Whether a submission's pull runs right after its lists, under their
+/// fence wait (`VICTORY_PULL_SAME_EXECUTE=0`: in a submission and wait of
+/// its own after them).
+fn pull_same_execute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on_by_default("VICTORY_PULL_SAME_EXECUTE");
+        tracing::info!(on, "pulls ride their submission (VICTORY_PULL_SAME_EXECUTE)");
+        on
+    })
+}
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -518,6 +557,31 @@ pub(crate) mod tests {
             let legal = super::legal_for(flags, state);
             assert_eq!(super::legal_for(flags, legal), legal);
         }
+    }
+
+    /// While a pull rides a submission, a host copy is recorded for its
+    /// list and not run; after, copies run at once again.
+    #[test]
+    fn host_copies_are_recorded_while_a_pull_rides() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let (src, s) = host.shared_buffer(4).unwrap();
+        let (dst, d) = host.shared_buffer(4).unwrap();
+        // SAFETY: our mapped buffers, 4 bytes each.
+        unsafe {
+            std::ptr::write_bytes(s, 0xAB, 4);
+            std::ptr::write_bytes(d, 0, 4);
+        }
+        super::RIDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        host.copy_now(&[(&dst, 0, &src, 0, 4)]);
+        let recorded = super::RIDING.with(|r| r.borrow_mut().take()).unwrap();
+        assert_eq!(recorded.len(), 1);
+        // SAFETY: as above.
+        assert_eq!(unsafe { std::slice::from_raw_parts(d, 4) }, [0; 4], "not copied yet");
+        host.copy_now(&[(&dst, 0, &src, 0, 4)]);
+        // SAFETY: as above, the copy waited for.
+        assert_eq!(unsafe { std::slice::from_raw_parts(d, 4) }, [0xAB; 4]);
     }
 
     /// Keeps submissions off while held: for tests of what one takes from
@@ -1668,6 +1732,21 @@ impl Host {
         // Clear read marks of slots forgotten before this submission (placed
         // textures written or evicted) so reads in it are not wiped after it.
         crate::shadow::clear_forgotten_reads();
+        // What shaders write into copies in video memory comes back into
+        // their mirrors (`crate::shadow::pull`, for the copy-backs) in an
+        // ExecuteCommandLists of its own right after the lists': its end
+        // waits for their writes and leaves the buffers common, so the
+        // copies promote them as a submission of their own would; one
+        // fence wait covers both. Recorded now: the stale bits it clears
+        // are set again by any refresh after, and video memory written
+        // before is seen by the copies.
+        let mut riding = if pull_same_execute() && !snapshots.is_empty() {
+            self.pull_riding(&snapshots)
+        } else {
+            None
+        };
+        // The pull ran and was waited for with the last group.
+        let mut pulled = matches!(riding, Some(None));
         let mut removed_in = None;
         // A wait that failed: query results may not be resolved yet.
         let mut unwaited = false;
@@ -1685,9 +1764,14 @@ impl Host {
                 crate::copystat::flight_sent(&mut flight);
                 sent = Some(std::time::Instant::now());
             }
+            let last = i + 1 == groups.len();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
+                if last && let Some(Some(r)) = &mut riding {
+                    self.queue.ExecuteCommandLists(&[Some(r.list.clone())]);
+                    r.guard.busy = true;
+                }
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -1733,6 +1817,17 @@ impl Host {
                     runs.len(),
                     last_notes(runs)
                 )),
+            }
+            // `ended` stays `Done` when the wait could not be set up.
+            if last
+                && !unwaited
+                && matches!(ended, Waited::Done)
+                && let Some(Some(r)) = &mut riding
+            {
+                r.guard.busy = false;
+                pulled = true;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::PullsRiding, 1);
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1883,7 +1978,13 @@ impl Host {
         // What shaders wrote into copies in video memory, for the copy-backs
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
-        crate::shadow::pull(&snapshots);
+        // Done with the lists when it rode them (`riding`): what ran on the
+        // CPU since keeps video memory and the mirrors alike, or marks the
+        // pages stale.
+        drop(riding);
+        if !pulled {
+            crate::shadow::pull(&snapshots);
+        }
         static RETAKE_ALL: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RETAKE_ALL").is_some_and(|v| v != "0"));
         for (shadow, address, len, goes_back, marked) in &back {
@@ -4681,6 +4782,16 @@ impl Host {
         if regions.is_empty() {
             return;
         }
+        // A pull riding a submission ([`Host::pull_riding`]): its copies run
+        // after the submission's lists, under their fence wait.
+        let recorded = RIDING.with(|r| {
+            r.borrow_mut().as_mut().map(|v| {
+                v.extend(regions.iter().map(|&(d, da, s, sa, n)| (d.clone(), da, s.clone(), sa, n)));
+            })
+        });
+        if recorded.is_some() {
+            return;
+        }
         struct Copier {
             allocator: ID3D12CommandAllocator,
             list: ID3D12GraphicsCommandList,
@@ -4754,6 +4865,61 @@ impl Host {
                  GPU has most likely faulted or hung"
             )),
             Err(e) => tracing::warn!(error = %e, "a host copy did not run"),
+        }
+    }
+
+    /// Before a submission runs: `crate::shadow::pull(snapshots)` with its
+    /// copies recorded into a list for the submission to run right after its
+    /// own lists, under the same fence wait, instead of a submission and a
+    /// wait of their own after it. `Some(None)`: nothing to copy. `None`:
+    /// the pull is still due after the wait (no list, or the last one's run
+    /// was not waited for); the stale bits it cleared stay cleared, and it
+    /// copies its ranges whole again.
+    fn pull_riding(&self, snapshots: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> Option<Option<Riding>> {
+        static LIST: OnceLock<Option<Mutex<PullList>>> = OnceLock::new();
+        let list = LIST.get_or_init(|| {
+            // SAFETY: plain creation; the list is closed until used.
+            let made = unsafe {
+                (|| -> windows::core::Result<PullList> {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    Ok(PullList { allocator, list, busy: false })
+                })()
+            };
+            made.inspect_err(|e| tracing::warn!(error = %e, "no pull list: pulls wait on their own")).ok().map(Mutex::new)
+        });
+        let guard = list.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        // Its last run was not waited for: the allocator may be in use.
+        if guard.busy {
+            return None;
+        }
+        RIDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        crate::shadow::pull(snapshots);
+        let regions = RIDING.with(|r| r.borrow_mut().take()).unwrap_or_default();
+        if regions.is_empty() {
+            return Some(None);
+        }
+        // SAFETY: the allocator's last list was waited for (`busy`); the
+        // buffers are live (held in `regions`) and the ranges inside them.
+        let recorded = unsafe {
+            guard.allocator.Reset().and_then(|()| {
+                guard.list.Reset(&guard.allocator, None)?;
+                for (dst, dst_at, src, src_at, bytes) in &regions {
+                    guard.list.CopyBufferRegion(dst, *dst_at, src, *src_at, *bytes);
+                }
+                guard.list.Close()?;
+                guard.list.cast::<ID3D12CommandList>()
+            })
+        };
+        match recorded {
+            Ok(list) => Some(Some(Riding { guard, list, _regions: regions })),
+            Err(e) => {
+                tracing::warn!(error = %e, "pull list not recorded: the pull waits on its own");
+                None
+            }
         }
     }
 
