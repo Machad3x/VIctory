@@ -1065,6 +1065,10 @@ impl State {
                     return false;
                 };
                 crate::memory::note_use(&p.name);
+                #[cfg(feature = "diagnostics")]
+                if let Some((_, map)) = &self.memory {
+                    map.program(&stage.shader.hash);
+                }
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {

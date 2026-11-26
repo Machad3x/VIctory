@@ -33,7 +33,9 @@
 //!
 //! Memory no copy holds reads 0 and takes no writes (null views,
 //! bounds-checked); shaders mark such pages (or 256 MiB regions with no
-//! block) in the bitmap and [`log_frame`] counts them.
+//! block) in the bitmap and [`log_frame`] counts them. With diagnostics, a
+//! marked region gets a block of null entries, so that later submissions mark
+//! its pages, and [`log_frame`] reports which pages stay missed.
 //! shortcut: a page two copies share without either holding all of it is
 //! the larger one's.
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
@@ -86,9 +88,21 @@ pub(crate) struct Map {
     /// Ranges that go back byte for byte instead (root UAVs, see
     /// [`Map::precise`]).
     precise: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Hashes of the shaders that use title memory in the list.
+    #[cfg(feature = "diagnostics")]
+    programs: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl Map {
+    /// The shader `hash` uses title memory in the list.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn program(&self, hash: &str) {
+        let mut programs = self.programs.lock().unwrap_or_else(|e| e.into_inner());
+        if !programs.contains(hash) {
+            programs.insert(hash.to_owned());
+        }
+    }
+
     /// Shaders write `[address, address + len)` through a root UAV, which
     /// goes back by its bytes before and after the run
     /// ([`Shadow::gpu_writes`]): the marked pages it touches are left to
@@ -131,6 +145,9 @@ struct Shared {
     pairs: fx::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
+    /// The number of [`WANTED`] regions it was written with.
+    #[cfg(feature = "diagnostics")]
+    wanted: usize,
     layout: Arc<Layout>,
 }
 
@@ -304,6 +321,18 @@ pub(crate) fn log_frame() {
         s.missed_regions,
         missed.join(" ")
     );
+    #[cfg(feature = "diagnostics")]
+    if let Some(m) = MISSES_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let (new, now) = (std::mem::take(&mut m.new), std::mem::take(&mut m.persistent_now));
+        tracing::info!(
+            "title memory misses: {} distinct pages so far ({new} new this frame), {} committed and {} with \
+             nothing there when first missed, {} ever missed in {PERSISTENT}+ frames in a row ({now} this frame)",
+            m.pages.len(),
+            m.committed,
+            m.pages.len() as u64 - m.committed,
+            m.persistent
+        );
+    }
 }
 
 /// What the title has at memory shaders read with no copy (diagnostics),
@@ -353,8 +382,9 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// The page table for host copies of title memory `copies` (start,
 /// bytes), copy k's view pair at heap index `pairs[k]`, `null` the null
 /// pair: the table's dwords, the level-1 index of each block, and the copy
-/// each entry names. At most [`CAPACITY`] blocks besides the null one.
-fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
+/// each entry names. At most [`CAPACITY`] blocks besides the null one;
+/// regions in `wanted` get one too while there is room, after the copies'.
+fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32, wanted: &[usize]) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
     let mut level1 = vec![0u32; LEVEL1];
@@ -385,6 +415,13 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32) -> (Vec<u32>, Vec<usiz
             if whole || owner[entry].is_none() {
                 owner[entry] = Some((k, whole));
             }
+        }
+    }
+    for &l1 in wanted {
+        if level1[l1] == 0 && blocks.len() <= CAPACITY {
+            level1[l1] = blocks.len() as u32;
+            blocks.push(l1);
+            owner.resize(owner.len() + BLOCK, None);
         }
     }
     if full {
@@ -421,6 +458,8 @@ impl Shared {
             null,
             pairs: fx::Map::default(),
             generation: u64::MAX,
+            #[cfg(feature = "diagnostics")]
+            wanted: 0,
             layout: Arc::default(),
         })
     }
@@ -460,7 +499,15 @@ impl Shared {
             slots.push(slot);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null);
+        #[cfg(feature = "diagnostics")]
+        let wanted: Vec<usize> = wanted().iter().copied().collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            self.wanted = wanted.len();
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let wanted: Vec<usize> = Vec::new();
+        let (dwords, blocks, owner) = table(&ranges, &slots, self.null, &wanted);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
@@ -476,6 +523,127 @@ impl Shared {
         crate::host::release_later(Box::new(std::mem::replace(&mut self.layout, layout)));
         self.generation = now;
         stats(|s| s.tables += 1);
+    }
+}
+
+/// Level-1 indices of the 256 MiB regions with no copy that shaders marked.
+#[cfg(feature = "diagnostics")]
+static WANTED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(feature = "diagnostics")]
+fn wanted() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    WANTED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Frames in a row from which a missed page counts as persistent.
+#[cfg(feature = "diagnostics")]
+const PERSISTENT: u32 = 8;
+
+/// A missed page: the last frame it was, and the frames in a row up to it.
+#[cfg(feature = "diagnostics")]
+struct Missed {
+    last: u64,
+    run: u32,
+    persisted: bool,
+}
+
+/// Every page missed so far. `new` and `persistent_now` count since the last
+/// report, the rest since the start.
+// shortcut: never trimmed (a few MB per 100,000 pages).
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Misses {
+    pages: fx::Map<u64, Missed>,
+    new: u64,
+    committed: u64,
+    persistent: u64,
+    persistent_now: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+impl Misses {
+    /// The page at `at` was missed in `frame`; `committed` is asked only the
+    /// first time.
+    fn note(&mut self, at: u64, frame: u64, committed: impl FnOnce() -> bool) {
+        let page = match self.pages.entry(at) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.new += 1;
+                self.committed += u64::from(committed());
+                e.insert(Missed { last: frame, run: 1, persisted: false });
+                return;
+            }
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        };
+        if page.last == frame {
+            return;
+        }
+        page.run = if page.last.checked_add(1) == Some(frame) { page.run.saturating_add(1) } else { 1 };
+        page.last = frame;
+        if page.run >= PERSISTENT {
+            self.persistent_now += 1;
+            if !page.persisted {
+                page.persisted = true;
+                self.persistent += 1;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static MISSES_SEEN: Mutex<Option<Misses>> = Mutex::new(None);
+
+/// Whether any of the 64 KiB at `at` is committed (private or mapped).
+#[cfg(feature = "diagnostics")]
+fn committed(at: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (mut p, end) = (at, at + (1 << 16));
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        p = (info.BaseAddress as u64 + info.RegionSize as u64).max(p + 0x1000);
+    }
+    false
+}
+
+/// A list run missed `pages` and `regions` (256 MiB, no block yet): counts
+/// the pages, asks for blocks for the regions, and logs, once per shader and
+/// region, the shaders of the list. The bitmap is per list, so each of
+/// `programs` is only a candidate unless it is the only one.
+#[cfg(feature = "diagnostics")]
+fn measure_misses(pages: &[u64], regions: &[usize], programs: &std::collections::BTreeSet<String>) {
+    wanted().extend(regions);
+    if !pages.is_empty() {
+        let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        let mut misses = MISSES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let misses = misses.get_or_insert_default();
+        for &at in pages {
+            misses.note(at, frame, || committed(at));
+        }
+    }
+    let missed: std::collections::BTreeSet<u64> =
+        pages.iter().map(|&at| at >> 28).chain(regions.iter().map(|&r| r as u64)).collect();
+    static LOGGED: Mutex<Option<fx::Map<u64, fx::Set<String>>>> = Mutex::new(None);
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    let logged = logged.get_or_insert_default();
+    for region in missed {
+        let seen = logged.entry(region).or_default();
+        for hash in programs {
+            if !seen.contains(hash) {
+                seen.insert(hash.clone());
+                tracing::info!(
+                    "title memory missed in region {:#x}: program {hash}, one of {} in the list",
+                    region << 28,
+                    programs.len()
+                );
+            }
+        }
     }
 }
 
@@ -499,7 +667,10 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
-        if s.generation != now {
+        let stale = s.generation != now;
+        #[cfg(feature = "diagnostics")]
+        let stale = stale || s.wanted != wanted().len();
+        if stale {
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -565,6 +736,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     list.defer_memory(key);
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
+    #[cfg(feature = "diagnostics")]
+    let programs: Arc<Mutex<std::collections::BTreeSet<String>>> = Arc::default();
+    #[cfg(feature = "diagnostics")]
+    let users = programs.clone();
     let data = data as usize;
     list.defer_missed(move || {
         let l = layout(key);
@@ -589,6 +764,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut missed_at, mut missed_in) = (Vec::new(), Vec::new());
         for (w, &mark) in marks.iter().enumerate() {
             let mut bits = mark;
             while bits != 0 {
@@ -601,6 +778,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     #[cfg(feature = "diagnostics")]
                     describe_miss((entry as u64) << 28, 1 << 28);
                     missed.push((entry as u64) << 28);
+                    // An entry of block 0 is its region's level-1 index.
+                    #[cfg(feature = "diagnostics")]
+                    if block == 0 {
+                        missed_in.push(entry);
+                    }
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
@@ -611,11 +793,15 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                         pages += 1;
                         #[cfg(feature = "diagnostics")]
                         describe_miss(at, 1 << 16);
+                        #[cfg(feature = "diagnostics")]
+                        missed_at.push(at);
                         missed.push(at);
                     }
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        measure_misses(&missed_at, &missed_in, &users.lock().unwrap_or_else(|e| e.into_inner()));
         // What shaders computed from memory with no copy (read as zeros) is
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
@@ -657,6 +843,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         table,
         dirty,
         precise,
+        #[cfg(feature = "diagnostics")]
+        programs,
     })
 }
 
@@ -688,6 +876,31 @@ mod tests {
         assert!(!withheld_in(9, 7));
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_page_persists_after_eight_frames_in_a_row() {
+        let mut m = Misses::default();
+        for frame in 0..7 {
+            m.note(0x10000, frame, || frame == 0);
+            m.note(0x10000, frame, || panic!("asked once"));
+        }
+        assert_eq!((m.new, m.committed, m.persistent), (1, 1, 0));
+        m.note(0x10000, 7, || false);
+        m.note(0x10000, 7, || false);
+        assert_eq!((m.persistent, m.persistent_now), (1, 1), "the eighth frame, once");
+        m.note(0x10000, 8, || false);
+        assert_eq!((m.persistent, m.persistent_now), (1, 2));
+        // A frame without it starts over.
+        for frame in 10..17 {
+            m.note(0x10000, frame, || false);
+        }
+        assert_eq!(m.persistent_now, 2);
+        m.note(0x10000, 17, || false);
+        assert_eq!((m.persistent, m.persistent_now), (1, 3));
+        m.note(0x20000, 17, || false);
+        assert_eq!((m.pages.len(), m.new, m.committed), (2, 2, 1));
+    }
+
     /// The shader's lookup (`victory_shader` lowering) over a table's
     /// dwords: the view index and the byte offset in that view.
     fn look_up(dwords: &[u32], address: u64) -> (u32, u32) {
@@ -709,7 +922,7 @@ mod tests {
             (0x41_8000, 0x3_0000),
             (0xd_1234_0000, 0x2_0000),
         ];
-        let (dwords, blocks, owner) = table(&copies, &[102, 104, 106], 100);
+        let (dwords, blocks, owner) = table(&copies, &[102, 104, 106], 100, &[]);
         // Window, whole pages of the inner buffer, the high buffer.
         assert_eq!(look_up(&dwords, 0x40_0010), (102, 0x10));
         assert_eq!(look_up(&dwords, 0x42_0004), (104, 0x8004));
@@ -734,7 +947,7 @@ mod tests {
     fn a_full_table_names_the_largest_copies() {
         let copies: Vec<(u64, u64)> = (0..CAPACITY as u64 + 2).map(|k| (k << 28, 0x1_0000 + k)).collect();
         let pairs: Vec<u32> = (0..copies.len() as u32).map(|k| 10 + 2 * k).collect();
-        let (dwords, blocks, _) = table(&copies, &pairs, 4);
+        let (dwords, blocks, _) = table(&copies, &pairs, 4, &[]);
         assert_eq!(blocks.len(), CAPACITY + 1);
         assert_eq!(dwords.len(), LEVEL1 + (CAPACITY + 1) * BLOCK * 2);
         assert_eq!(look_up(&dwords, (CAPACITY as u64 + 1) << 28).0, pairs[CAPACITY + 1]);
