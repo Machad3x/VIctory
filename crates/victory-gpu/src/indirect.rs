@@ -396,17 +396,20 @@ RWByteAddressBuffer fresh_budget : register(u1);
 void main() {
     for (uint r = 0; r < records; r++) {
         uint base = 4 * r * stride;
-        bool same = true;
-        for (uint i = 0; i < per; i++) {
+        bool rest_same = true;
+        for (uint i = 1; i < per; i++) {
             if (window_record.Load(base + 4 * i) != fresh_record.Load(base + 4 * i)) {
-                same = false;
+                rest_same = false;
             }
         }
-        if (same) {
+        uint w0 = window_record.Load(base);
+        uint f0 = fresh_record.Load(base);
+        if (rest_same && w0 == f0) {
             continue;
         }
         uint before;
-        if (window_record.Load(base) == 0 && fresh_record.Load(base) != 0) {
+        // A cut zeroes only the first dword; any other change is a race.
+        if (rest_same && w0 == 0 && f0 != 0) {
             results.InterlockedAdd(72, 1, before);
             continue;
         }
@@ -557,6 +560,11 @@ pub(crate) fn check_hit(
         1 => 5,
         _ => 3,
     };
+    // Overlapping records: a clamp of one rewrites its neighbour, so the
+    // window and a fresh clamp legitimately differ; not checked.
+    if stride / 4 < per {
+        return false;
+    }
     let compared = [per, stride / 4, records];
     let common = D3D12_RESOURCE_STATE_COMMON;
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -773,6 +781,16 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// The window check's compare compiles too.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn window_check_builds() {
+        if super::host().is_none() {
+            return; // no host GPU here
+        }
+        assert!(super::compare().is_some());
     }
 
     /// Clamps `records` records of `kind`, filled by repeating `words`,
