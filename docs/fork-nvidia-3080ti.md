@@ -238,6 +238,8 @@ refused for a partial-channel image store (#332 addresses that), and a
 1920x1080 target in format 67 with no host texture (#2832 addresses that;
 not ported, it overlaps #2626 here).
 
+The format 67 target is now handled by a stand-in; see "Series S profile" below.
+
 ## Thread-count dispatches and placed texture writes
 
 | Change | What it addresses |
