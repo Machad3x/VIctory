@@ -125,9 +125,16 @@ static SAVE_POOL: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
 /// Buffers kept at most: 16 MiB, so a burst of saves is not held forever.
 const SAVE_POOL_MAX: usize = 256;
 
+#[cfg(test)]
+thread_local! {
+    static LAST_BUFFER_POOLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A PAGE buffer holding any bytes: the caller overwrites them all.
 fn page_buffer() -> Box<[u8]> {
     let pooled = SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    #[cfg(test)]
+    LAST_BUFFER_POOLED.set(pooled.is_some());
     pooled.unwrap_or_else(|| vec![0u8; PAGE].into_boxed_slice())
 }
 
@@ -1803,7 +1810,9 @@ pub(crate) mod tests {
         for _ in 0..4 {
             recycle(vec![0xAA; PAGE].into_boxed_slice());
         }
+        LAST_BUFFER_POOLED.set(false);
         unsafe { ((p + 8) as *mut u8).write_volatile(0xEE) };
+        assert!(LAST_BUFFER_POOLED.get(), "the save took a pooled buffer");
         let saved = t.saved(p / PAGE).expect("armed page is saved");
         assert!(saved.iter().enumerate().all(|(i, &b)| b == fill(i)), "saved bytes are the page's");
         t.disarm();
