@@ -2842,7 +2842,7 @@ impl<'a> Lower<'a> {
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let selected = Self::sdwa_src(inst, k);
-        let mut f = match op {
+        let f = match op {
             _ if selected.is_some() => {
                 let (sel, sext) = selected.expect("checked");
                 let x = self.operand(inst, &op)?;
