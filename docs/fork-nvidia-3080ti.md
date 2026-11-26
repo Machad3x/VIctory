@@ -837,6 +837,16 @@ of the last 20 reports against `gpu224`: comparing 20 ms of thread time
 against 133, marked-page wall time 33 ms against 50, copy-back 49 ms against
 92, frame 379 ms against 436 (one run each).
 
+Demand copies now go in 64 KiB windows asked for at the frame's end, and
+`VICTORY_CLAMP_WINDOW=1` joins indirect draws that do not store into one
+argument clamp pass (up to 64 records from one source buffer); both are off
+by default. Diagnostics builds also time each GPU command (`VICTORY_GPU_TIMING`)
+and report how long the GPU was busy around title submissions. `gpu228`
+(both switches off, lit): no errors, frames 338 to 469 ms (about 370 typical),
+GPU busy 172.7 ms per frame in timestamps around 31 submissions (177.9 ms of
+wall time), preparing 111 to 214 ms, copy-back 47 to 71 ms; no regression
+against `gpu225`.
+
 ## Rectangles, 16-bit and typed loads, root UAV pages
 
 Runs `gpu220` to `gpu222` had these: no errors, `gpu221` at 345 to 354 ms per
