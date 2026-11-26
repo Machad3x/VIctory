@@ -464,9 +464,10 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
-    // Below the title's threads and the GPU submission: streaming takes idle
-    // CPU only, and no read is dropped. VICTORY_DSTORAGE_PRIORITY=0 keeps normal.
-    if std::env::var("VICTORY_DSTORAGE_PRIORITY").as_deref() != Ok("0") {
+    // Normal by default: below normal risks inversion, a title thread waiting
+    // on a read starved by its own busy threads. VICTORY_DSTORAGE_PRIORITY=1
+    // opts in to below normal (streaming takes idle CPU only).
+    if std::env::var("VICTORY_DSTORAGE_PRIORITY").as_deref() == Ok("1") {
         use windows_sys::Win32::System::Threading::{
             GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
         };
