@@ -4291,12 +4291,26 @@ impl Host {
                 self.queue.ExecuteCommandLists(&[Some(c.list.cast()?)]);
                 self.queue.Signal(&c.fence, value)?;
                 c.fence.SetEventOnCompletion(value, c.event)?;
-                WaitForSingleObject(c.event, windows::Win32::System::Threading::INFINITE);
-                Ok(())
+                Ok(wait_for_submission(
+                    || {
+                        WaitForSingleObject(c.event, WAIT_SLICE_MS) != WAIT_TIMEOUT
+                            && c.fence.GetCompletedValue() >= value
+                    },
+                    || self.device.GetDeviceRemovedReason().is_err(),
+                    |secs| tracing::warn!(secs, "host copy still on the GPU"),
+                ))
             })
         };
-        if let Err(e) = ran {
-            tracing::warn!(error = %e, "a host copy did not run");
+        // The failure report must not find the copier locked.
+        drop(c);
+        match ran {
+            Ok(Waited::Done) => {}
+            Ok(Waited::Removed) => fail(format_args!("host GPU device removed during a host copy")),
+            Ok(Waited::Stalled) => fail(format_args!(
+                "host GPU has not finished a host copy in {STALL_SECS} s and reports no removal: the \
+                 GPU has most likely faulted or hung"
+            )),
+            Err(e) => tracing::warn!(error = %e, "a host copy did not run"),
         }
     }
 
