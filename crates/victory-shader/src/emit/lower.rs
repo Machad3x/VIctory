@@ -5229,25 +5229,41 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, empty, l1, entry)
     }
 
-    /// Sets bit `n` in the title-memory dirty bitmap `bitmap`.
+    /// Sets bit `n` in the title-memory dirty bitmap `bitmap`, as
+    /// [`Self::mark_view_write`] does: one lane per distinct bit in the wave
+    /// ([`Self::mark_lead`]), and the atomic only where the bit reads clear.
+    /// Bits are only set while a list runs (the host clears the bitmap by a
+    /// copy where the list starts), so a stale clear read costs one atomic
+    /// more and a set bit never goes missing. May end in a new block.
     fn mark_memory_bit(&mut self, bitmap: V, n: V) {
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k5, k31, k2, one) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        // Byte offset of the bitmap dword; operation 2 is OR.
+        let (k5, k31, k2, one, zero) = (k(self, 5), k(self, 31), k(self, 2), k(self, 1), k(self, 0));
+        // Byte offset of the bitmap dword.
         let word = self.s.m.bin(c, Bin::LShr, n, k5);
         let word = self.s.m.bin(c, Bin::Shl, word, k2);
         let bit = self.s.m.bin(c, Bin::And, n, k31);
         let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+        let lead = self.mark_lead(n);
+        let led = self.begin_guarded(lead);
+        let c = self.cur;
+        // Most writes find their page marked: a load, not an atomic.
+        let old = self.raw_dword(bitmap, word);
+        let set = self.s.m.bin(c, Bin::And, old, bit);
+        let clear = self.s.m.cmp(c, pred::EQ, set, zero);
+        let inner = self.begin_guarded(Some(clear));
+        let iu = self.s.m.undef(self.s.t.i32);
+        // Operation 2 is OR.
         self.s.op(
-            c,
+            self.cur,
             "atomicBinOp.i32",
             Attr::NoUnwind,
             self.s.t.i32,
             78,
             &[bitmap, k2, word, iu, iu, bit],
         );
+        self.end_guarded(inner, &[]);
+        self.end_guarded(led, &[]);
     }
 
     /// The level-2 page-table index, block, and level-1 index of title

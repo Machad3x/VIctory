@@ -20,7 +20,8 @@
 //! The bitmap lives in video memory: the list clears it where it starts
 //! using title memory and copies it into a read-back buffer at its end.
 //! Every write marks a bit atomically, and the lanes of a pass writing one
-//! output region all mark the same few dwords. In system memory (where
+//! output region all mark the same few dwords (so one lane per bit in a
+//! wave marks, and only after a load finds the bit clear). In system memory (where
 //! the bitmap was) those atomics crossed the bus one after another: lists
 //! of the title's acceleration-structure builds ran for over 2 s, and the
 //! host removed the device.
