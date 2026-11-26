@@ -2681,6 +2681,8 @@ pub(crate) mod tests {
     /// memory's bytes.
     #[test]
     fn marked_pages_leave_video_memory_equal_to_title_memory() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         if !rerun_with_gpu_upload(
             "shadow::tests::marked_pages_leave_video_memory_equal_to_title_memory",
             true,
@@ -3317,6 +3319,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// refresh does not copy it again).
     #[test]
     fn a_marked_page_the_shaders_left_alone_stays_taken() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(1);
         register(p, p as u64, PAGE as u64);
         let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
@@ -3341,6 +3345,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// alone leave the copy: the others hold nothing the shaders wrote.
     #[test]
     fn a_withheld_marking_range_gives_up_only_its_marked_pages() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -3390,6 +3396,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// it), and the copy has it too.
     #[test]
     fn a_copy_back_puts_back_only_the_bytes_the_gpu_changed() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         let p = crate::watch::tests::pool(2);
         let len = 2 * PAGE;
         register(p, p as u64, len as u64);
@@ -3563,6 +3571,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// one placed inside it): every shader write reaches title memory.
     #[test]
     fn many_marked_pages_all_go_back() {
+        // No submission takes the marks set below meanwhile.
+        let _quiet = crate::host::tests::no_submissions();
         const PAGES: usize = 96;
         let p = crate::watch::tests::pool(PAGES);
         let len = PAGES * PAGE;
