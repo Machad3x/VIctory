@@ -1468,29 +1468,38 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MarkedUs);
     marked.sort_unstable();
     marked.dedup();
-    let page_of = |m: &Marks, n: u32| {
-        let (&base, copy) = m.owners.range(..=n).next_back()?;
-        let copy = copy.upgrade()?;
-        let k = n - base;
-        (k < pages(copy.start, copy.len)).then(|| {
-            let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
-            (copy, page)
-        })
+    // The copy and title page of each mark. The copies are taken under the
+    // marks lock and looked at after it: another thread may drop the other
+    // references meanwhile, and a copy dropped here takes that lock.
+    let pages_of = |bits: Vec<u32>| -> Vec<(Arc<Shadow>, usize)> {
+        let owned: Vec<(Arc<Shadow>, u32)> = {
+            let m = marks();
+            let owner = |n: u32| {
+                let (&base, copy) = m.owners.range(..=n).next_back()?;
+                Some((copy.upgrade()?, n - base))
+            };
+            bits.into_iter().filter_map(owner).collect()
+        };
+        owned
+            .into_iter()
+            .filter_map(|(copy, k)| {
+                (k < pages(copy.start, copy.len)).then(|| {
+                    let page = (((copy.start >> 16) + u64::from(k)) << 16) as usize;
+                    (copy, page)
+                })
+            })
+            .collect()
     };
     // Held back: dropped from the copies (`crate::memory::drop_withheld`).
     if !held.is_empty() {
-        let m = marks();
-        for (_, page) in held.into_iter().filter_map(|n| page_of(&m, n)) {
+        for (_, page) in pages_of(held) {
             crate::memory::drop_withheld(page, PAGE);
         }
     }
     if marked.is_empty() {
         return;
     }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
-        let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
-    };
+    let pages: Vec<(Arc<Shadow>, usize)> = pages_of(marked);
     pull(
         &pages
             .iter()
