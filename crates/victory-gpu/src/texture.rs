@@ -33,6 +33,41 @@ macro_rules! once {
     }};
 }
 
+/// shortcut: GPU copies between different packed layouts need a conversion pass.
+pub(crate) fn incompatible_copy(src: Option<u32>, dst: Option<u32>) -> bool {
+    if src == dst {
+        return false;
+    }
+    once!(?src, ?dst, "GPU texture copy or resolve skipped: packed stand-in layouts differ");
+    true
+}
+
+/// Converts one row from the title's little-endian BGRA bits to host RGBA8.
+pub(crate) fn expand_row(format: u32, packed: &[u8], rgba: &mut [u8]) {
+    for (p, c) in packed.as_chunks::<2>().0.iter().zip(rgba.as_chunks_mut::<4>().0.iter_mut()) {
+        let bits = u16::from_le_bytes(*p);
+        let channel = |shift: u32, max: u16| (((bits >> shift & max) * 255 + max / 2) / max) as u8;
+        let color = match format {
+            86 => [channel(10, 31), channel(5, 31), channel(0, 31), channel(15, 1)],
+            115 => [channel(8, 15), channel(4, 15), channel(0, 15), channel(12, 15)],
+            _ => unreachable!(),
+        };
+        *c = color;
+    }
+}
+
+pub(crate) fn pack_row(format: u32, rgba: &[u8], packed: &mut [u8]) {
+    for (c, p) in rgba.as_chunks::<4>().0.iter().zip(packed.as_chunks_mut::<2>().0.iter_mut()) {
+        let channel = |i: usize, max: u16| (u16::from(c[i]) * max + 127) / 255;
+        let bits = match format {
+            86 => channel(3, 1) << 15 | channel(0, 31) << 10 | channel(1, 31) << 5 | channel(2, 31),
+            115 => channel(3, 15) << 12 | channel(0, 15) << 8 | channel(1, 15) << 4 | channel(2, 15),
+            _ => unreachable!(),
+        };
+        *p = bits.to_le_bytes();
+    }
+}
+
 /// A texture's upload state: how a staging buffer lays out the host
 /// texture's subresources, and what was last detiled. The buffer itself is
 /// taken for each upload from a small pool shared by all textures
@@ -42,6 +77,7 @@ macro_rules! once {
 pub(crate) struct Staging {
     /// A staging buffer's bytes.
     size: u64,
+    packed: Option<u32>,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -212,6 +248,62 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
+/// RAII pin keeping a destination `HostTexture` alive against eviction while
+/// a recorded list holds a pending `host_writes` mark for it. Dropping without
+/// [`PendingHostWrite::record`] releases the pin without marking `host_written`.
+pub(crate) struct PendingHostWrite(Arc<crate::resource::HostTexture>);
+
+impl PendingHostWrite {
+    /// The pinned host `ID3D12Resource`, guaranteed to match the pinned copy.
+    pub(crate) fn resource(&self) -> &ID3D12Resource {
+        &self.0.texture
+    }
+
+    /// Transfers this pin to `list`'s deferred step so `host_written` is set on
+    /// submission and the pin is released when `list` resets or drops.
+    pub(crate) fn record(self, list: &HostList) {
+        use std::sync::atomic::Ordering::Release;
+        let guard = self;
+        list.defer_host(move || {
+            guard
+                .0
+                .pending_host_writes
+                .fetch_or(crate::resource::HOST_WRITTEN, Release);
+            guard.0.host_written.store(true, Release);
+        });
+    }
+}
+
+impl Drop for PendingHostWrite {
+    fn drop(&mut self) {
+        self.0
+            .pending_host_writes
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Atomically acquires `resource`'s current host texture and pins it against
+/// concurrent eviction before any GPU write is recorded into it. If eviction
+/// already claimed the copy with `EVICTED`, detaches it and acquires a fresh
+/// replacement.
+pub(crate) fn prepare_host_write(resource: This) -> Option<PendingHostWrite> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    for _ in 0..16 {
+        let copy = crate::resource::host_copy(resource)?;
+        if copy
+            .pending_host_writes
+            .fetch_update(AcqRel, Acquire, |cur| {
+                (cur & crate::resource::EVICTED == 0).then_some(cur + 1)
+            })
+            .is_ok()
+        {
+            return Some(PendingHostWrite(copy));
+        }
+        crate::resource::detach_if_same(resource, &copy);
+    }
+    None
+}
+
 /// A host copy or resolve that `list` records writes `resource`: from the
 /// submission that runs `list` on, its host texture's contents are the
 /// host's, not title memory's, which stays as it was. Marked when that
@@ -220,15 +312,16 @@ unsafe impl Sync for Staging {}
 /// (submissions run in the order they are made, which need not be the
 /// order their lists were recorded in), and one run before it must still
 /// get its upload.
+#[cfg(test)]
 pub(crate) fn host_writes(list: &HostList, resource: This) {
-    if let Some(copy) = crate::resource::host_copy(resource) {
-        list.defer_host(move || copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed));
+    if let Some(write) = prepare_host_write(resource) {
+        write.record(list);
     }
 }
 
 fn is_host_written(resource: This) -> bool {
     crate::resource::host_copy(resource)
-        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Relaxed))
+        .is_some_and(|c| c.host_written.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -253,13 +346,17 @@ pub(crate) static ALIAS_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
-    let (Some(a), Some(b), Some(host)) = (
+    let (Some(a), Some(to_write), Some(host)) = (
         crate::resource::host_resource(from),
-        crate::resource::host_resource(to),
+        prepare_host_write(to),
         host(),
     ) else {
         return;
     };
+    let b = to_write.resource().clone();
+    if incompatible_copy(crate::resource::packed_format(from), crate::resource::packed_format(to)) {
+        return;
+    }
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
@@ -300,7 +397,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     }
     let Some(buffer) = host.default_buffer(total) else { return };
     list.keep(&buffer);
-    crate::texture::host_writes(list, to);
+    to_write.record(list);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
     let place = |r: &ID3D12Resource, f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
@@ -487,30 +584,227 @@ fn copies(
 /// and the subresources detiled into it.
 pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
+struct Job {
+    call: fn(*const (), usize),
+    data: *const (),
+    n: usize,
+    next: std::sync::atomic::AtomicUsize,
+    panicked: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+}
+
+// SAFETY: `Job` is shared across worker threads only while the caller's
+// `WaitGuard` keeps the caller's stack frame alive until `remaining == 0`,
+// and `data` points to an `F: Fn(usize) + Sync`.
+unsafe impl Sync for Job {}
+
+struct PoolState {
+    job: *const Job,
+    generation: u64,
+    wanted: usize,
+    claimed: usize,
+    remaining: usize,
+    shutdown: bool,
+}
+
+// SAFETY: `job` points to a `Sync` `Job` pinned on the caller's stack for the
+// duration of the batch (`remaining > 0`).
+unsafe impl Send for PoolState {}
+
+/// Persistent worker pool for [`in_parallel`]: worker threads stay alive
+/// across submissions so each thread keeps its `thread_local!` [`Scratch`]
+/// buffer warm instead of re-faulting and zero-filling it on every call.
+struct ParallelPool {
+    workers: usize,
+    run_lock: Mutex<()>,
+    state: Arc<(Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar)>,
+    #[cfg(test)]
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl ParallelPool {
+    fn new(workers: usize) -> Self {
+        let state = Arc::new((
+            Mutex::new(PoolState {
+                job: std::ptr::null(),
+                generation: 0,
+                wanted: 0,
+                claimed: 0,
+                remaining: 0,
+                shutdown: false,
+            }),
+            std::sync::Condvar::new(),
+            std::sync::Condvar::new(),
+        ));
+        let mut live_workers = 0usize;
+        #[cfg(test)]
+        let mut handles = Vec::with_capacity(workers);
+        for idx in 0..workers {
+            let shared = Arc::clone(&state);
+            let builder = std::thread::Builder::new().name(format!("victory-tex-{idx}"));
+            if let Ok(h) = builder.spawn(move || {
+                let (lock, work_cv, done_cv) = &*shared;
+                let mut my_gen = 0u64;
+                loop {
+                    let job_ptr = {
+                        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        while !st.shutdown && st.generation == my_gen {
+                            st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                        if st.shutdown {
+                            break;
+                        }
+                        my_gen = st.generation;
+                        if st.claimed >= st.wanted {
+                            continue;
+                        }
+                        st.claimed += 1;
+                        st.job
+                    };
+                    // SAFETY: `job_ptr` is non-null and valid until this worker
+                    // decrements `st.remaining` below.
+                    run_job(unsafe { &*job_ptr });
+                    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    st.remaining -= 1;
+                    if st.remaining == 0 {
+                        st.job = std::ptr::null();
+                        done_cv.notify_one();
+                    }
+                }
+            }) {
+                live_workers += 1;
+                #[cfg(test)]
+                handles.push(h);
+                #[cfg(not(test))]
+                drop(h);
+            }
+        }
+        Self {
+            workers: live_workers,
+            run_lock: Mutex::new(()),
+            state,
+            #[cfg(test)]
+            handles,
+        }
+    }
+
+    fn run<F: Fn(usize) + Sync>(&self, threads: usize, n: usize, f: F) {
+        use std::sync::atomic::AtomicUsize;
+
+        let workers = threads.saturating_sub(1).min(self.workers);
+        if workers == 0 || n < 2 {
+            (0..n).for_each(f);
+            return;
+        }
+        // Contended or re-entrant call: run inline instead of blocking or
+        // deadlocking against an outer `in_parallel` holding `run_lock`.
+        let Ok(_run) = self.run_lock.try_lock() else {
+            (0..n).for_each(f);
+            return;
+        };
+
+        fn invoke<F: Fn(usize) + Sync>(data: *const (), i: usize) {
+            // SAFETY: `data` points to `f: F` on `run`'s stack for the batch.
+            unsafe { (&*data.cast::<F>())(i) };
+        }
+
+        let job = Job {
+            call: invoke::<F>,
+            data: (&raw const f).cast(),
+            n,
+            next: AtomicUsize::new(0),
+            panicked: Mutex::new(None),
+        };
+
+        struct WaitGuard<'a> {
+            state: &'a (Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar),
+        }
+        impl Drop for WaitGuard<'_> {
+            fn drop(&mut self) {
+                let (lock, _, done_cv) = self.state;
+                let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while st.remaining > 0 {
+                    st = done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                st.job = std::ptr::null();
+            }
+        }
+
+        {
+            let (lock, work_cv, _) = &*self.state;
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.job = &raw const job;
+            st.wanted = workers;
+            st.claimed = 0;
+            st.remaining = workers;
+            st.generation = st.generation.wrapping_add(1);
+            drop(st);
+            work_cv.notify_all();
+        }
+        let guard = WaitGuard { state: &self.state };
+        run_job(&job);
+        drop(guard);
+        drop(_run);
+
+        if let Some(payload) = job.panicked.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ParallelPool {
+    fn drop(&mut self) {
+        let (lock, work_cv, _) = &*self.state;
+        {
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.shutdown = true;
+        }
+        work_cv.notify_all();
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+fn run_job(job: &Job) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    loop {
+        let i = job.next.fetch_add(1, Relaxed);
+        if i >= job.n {
+            break;
+        }
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| (job.call)(job.data, i))) {
+            let mut slot = job.panicked.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = Some(payload);
+            }
+            job.next.store(job.n, Relaxed);
+            break;
+        }
+    }
+}
+
+fn max_parallel_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get() / 4)
+        .clamp(1, 4)
+}
+
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
 /// fewer than two.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
+    static POOL: std::sync::OnceLock<ParallelPool> = std::sync::OnceLock::new();
+    let max = max_parallel_threads();
+    let threads = max.min(n);
     if threads < 2 {
         (0..n).for_each(f);
         return;
     }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    f(i);
-                }
-            });
-        }
-    });
+    let pool = POOL.get_or_init(|| ParallelPool::new(max - 1));
+    pool.run(threads, n, f);
 }
 
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
@@ -535,7 +829,9 @@ impl Staging {
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        // After initialization a writable stand-in keeps the GPU's contents.
+        (self.packed.is_none() || self.uploads.load(std::sync::atomic::Ordering::Relaxed) == 0)
+            && self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -586,15 +882,18 @@ impl Staging {
             // are written, and only they are hashed and detiled.
             let mut scratch = Scratch::take(size);
             let read = &mut scratch.0[..size];
+            let mut spans: Vec<(usize, usize)> = touched.iter().map(|&i| span(i)).collect();
+            merge_spans(&mut spans);
             let mut bytes = 0;
-            let mut done: Vec<(usize, usize)> = Vec::new();
-            for &i in &touched {
-                let (a, b) = span(i);
-                if !done.contains(&(a, b)) {
-                    // SAFETY: inside the buffer of the texture's size.
-                    crate::host::copy_mapped(unsafe { read.as_mut_ptr().add(a) }, self.memory.wrapping_add(a), b - a, false);
-                    (bytes, _) = (bytes + b - a, done.push((a, b)));
-                }
+            for (a, b) in spans {
+                // SAFETY: inside the buffer of the texture's size.
+                crate::host::copy_mapped(
+                    unsafe { read.as_mut_ptr().add(a) },
+                    self.memory.wrapping_add(a),
+                    b - a,
+                    false,
+                );
+                bytes += b - a;
             }
             // A changed page that holds only the subresource's bytes says it
             // changed. Pages it shares with other data the title writes
@@ -693,16 +992,46 @@ impl Staging {
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
             let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let detile = |dst: &mut [u8], pitch| self.layout.detile(tiled, mip, slice, dst, pitch, pitch * rows as usize);
+            let result = if let Some(format) = self.packed {
+                let row = f.Width as usize * 2;
+                let mut packed = vec![0; row * rows as usize * f.Depth as usize];
+                detile(&mut packed, row).map(|()| {
+                    for (src, dst) in packed.chunks_exact(row).zip(linear.chunks_mut(pitch)) {
+                        expand_row(format, src, dst);
+                    }
+                })
+            } else {
+                detile(linear, pitch)
+            };
+            if let Err(e) = result {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return None;
             }
         }
         Some((buffer, at))
     }
+}
+
+/// Sorts `[a, b)` byte spans and merges overlapping or adjacent intervals
+/// (dropping empty spans) so each covered byte is read once.
+fn merge_spans(spans: &mut Vec<(usize, usize)>) {
+    spans.retain(|&(a, b)| a < b);
+    if spans.len() <= 1 {
+        return;
+    }
+    spans.sort_unstable();
+    let mut write = 0;
+    for read in 1..spans.len() {
+        let (a, b) = spans[read];
+        if a <= spans[write].1 {
+            spans[write].1 = spans[write].1.max(b);
+        } else {
+            write += 1;
+            spans[write] = (a, b);
+        }
+    }
+    spans.truncate(write + 1);
 }
 
 /// A buffer for the title memory a refresh reads, kept by the thread for
@@ -826,6 +1155,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     let spans = spans(&layout, count, u32::from(d.MipLevels));
     let s = Arc::new(Staging {
         size: total,
+        packed: copy.packed(),
         footprints,
         rows,
         layout,
@@ -844,6 +1174,29 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_colors_round_trip_with_their_alpha() {
+        for (format, word, expected) in [
+            (86, 0x8443u16, [8, 16, 25, 255]),
+            (115, 0xa123, [17, 34, 51, 170]),
+        ] {
+            let mut rgba = [0; 4];
+            let mut packed = [0; 2];
+            expand_row(format, &word.to_le_bytes(), &mut rgba);
+            assert_eq!(rgba, expected);
+            for word in 0..=u16::MAX {
+                expand_row(format, &word.to_le_bytes(), &mut rgba);
+                pack_row(format, &rgba, &mut packed);
+                assert_eq!(u16::from_le_bytes(packed), word);
+            }
+        }
+        for (alpha, high) in [(127, 0), (128, 0x80)] {
+            let mut packed = [0; 2];
+            pack_row(86, &[0, 0, 0, alpha], &mut packed);
+            assert_eq!(packed, [0, high]);
+        }
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
@@ -877,5 +1230,371 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(test)]
+    struct HeldCom(This);
+    #[cfg(test)]
+    impl Drop for HeldCom {
+        fn drop(&mut self) {
+            crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+        }
+    }
+
+    #[cfg(test)]
+    fn test_title_texture(addr: u64, fill: u8) -> HeldCom {
+        const SIDE: usize = 64;
+        const BYTES: usize = SIDE * SIDE * 4;
+        // SAFETY: `pool(1)` provides a 64 KiB RW page for each 64x64 RGBA8 linear texture.
+        unsafe { std::ptr::write_bytes(addr as *mut u8, fill, BYTES) };
+        let words: [u32; 14] = [3, 0, 0, 0, SIDE as u32, 0, SIDE as u32, 1 | (1 << 16), 28, 1, 0, 0x100, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut out = std::ptr::null();
+        let hr = crate::resource::create_at_address(std::ptr::null(), addr, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut out);
+        assert_eq!(hr, crate::object::S_OK);
+        HeldCom(out)
+    }
+
+    #[cfg(test)]
+    fn seed_title_texture(host: &crate::host::Host, tex: This) {
+        let seed_list = host.new_list().unwrap();
+        let host_tex = crate::resource::host_resource(tex).unwrap();
+        upload(&seed_list, tex, &host_tex);
+        seed_list.close();
+        host.execute(&[&seed_list]);
+    }
+
+    #[cfg(test)]
+    fn readback_first_texel(host: &crate::host::Host, tex: This) -> [u8; 4] {
+        let read_list = host.new_list().unwrap();
+        let tex_after = crate::resource::host_resource(tex).unwrap();
+        upload(&read_list, tex, &tex_after);
+        crate::list::ensure_state(&read_list, tex, 0x800);
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: live host texture; outputs for subresource 0.
+        unsafe {
+            host.device.GetCopyableFootprints(&tex_after.GetDesc(), 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+        }
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation and copy recording.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: total,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for recording only.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+        };
+        let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for recording only.
+            pResource: unsafe { std::mem::transmute_copy(&tex_after) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: open host command list and live resources in copy states.
+        unsafe {
+            read_list.list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+        }
+        read_list.close();
+        host.execute(&[&read_list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: synchronous execution finished; `readback` covers all rows.
+        unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let first = mapped.cast::<u8>().add(footprint.Offset as usize).cast::<[u8; 4]>().read();
+            readback.Unmap(0, None);
+            first
+        }
+    }
+
+    /// A texture fed from title memory cannot be evicted while a recorded list
+    /// holds a pending `host_writes` mark for it; resetting/dropping an
+    /// unexecuted list releases that pin, while executing the list keeps the
+    /// copied GPU texels over stale title memory.
+    #[test]
+    fn pending_host_write_pins_texture_until_executed_and_unpins_on_reset() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let dst_mem = crate::watch::tests::pool(1);
+        let src_mem = crate::watch::tests::pool(1);
+        let dst = test_title_texture(dst_mem as u64, 0x40);
+        let src = test_title_texture(src_mem as u64, 0xAA);
+
+        let null = std::ptr::null();
+        let (mut alloc, mut list_drop, mut list_exec) = (null, null, null);
+        let alloc_iid = crate::object::guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = crate::object::guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc), crate::object::S_OK);
+        let _alloc = HeldCom(alloc);
+        assert_eq!(crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list_drop), crate::object::S_OK);
+        let _l_drop = HeldCom(list_drop);
+        assert_eq!(crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list_exec), crate::object::S_OK);
+        let _l_exec = HeldCom(list_exec);
+
+        type CloseFn = extern "system" fn(This) -> crate::object::HRESULT;
+        type ResetFn = extern "system" fn(This, This, This) -> crate::object::HRESULT;
+        type CopyResourceFn = extern "system" fn(This, This, This);
+        let close_drop = crate::object::slot::<CloseFn>(list_drop, 0x48);
+        let reset_drop = crate::object::slot::<ResetFn>(list_drop, 0x50);
+        let copy_drop = crate::object::slot::<CopyResourceFn>(list_drop, 0x88);
+        let close_exec = crate::object::slot::<CloseFn>(list_exec, 0x48);
+        let reset_exec = crate::object::slot::<ResetFn>(list_exec, 0x50);
+        let copy_exec = crate::object::slot::<CopyResourceFn>(list_exec, 0x88);
+
+        seed_title_texture(host, dst.0);
+
+        copy_drop(list_drop, dst.0, src.0);
+        assert!(!crate::resource::give_up_now(dst.0), "pending CopyResource must pin dst against eviction");
+        assert_eq!(close_drop(list_drop), crate::object::S_OK);
+        assert_eq!(reset_drop(list_drop, alloc, null), crate::object::S_OK);
+        assert!(crate::resource::give_up_now(dst.0), "resetting unexecuted list must allow eviction again");
+
+        seed_title_texture(host, dst.0);
+
+        copy_exec(list_exec, dst.0, src.0);
+        assert_eq!(close_exec(list_exec), crate::object::S_OK);
+        assert!(!crate::resource::give_up_now(dst.0), "pending L1 CopyResource must block eviction before L1 runs");
+
+        let recorded = crate::list::host_list(list_exec).unwrap();
+        host.execute(&[recorded]);
+        assert_eq!(reset_exec(list_exec, alloc, null), crate::object::S_OK);
+        assert!(!crate::resource::give_up_now(dst.0), "executed host write must keep dst un-evictable after list reset");
+
+        assert_eq!(readback_first_texel(host, dst.0), [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    /// Window 2: an eviction candidate snapshot taken before a list pins `dst`
+    /// must not evict `dst` in `give_up`, and the recorded copy must keep its
+    /// host texels on subsequent reads.
+    #[test]
+    fn stale_eviction_snapshot_skips_texture_pinned_after_candidates() {
+        use std::sync::atomic::Ordering::Acquire;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let dst_mem = crate::watch::tests::pool(1);
+        let src_mem = crate::watch::tests::pool(1);
+        let dst = test_title_texture(dst_mem as u64, 0x40);
+        let src = test_title_texture(src_mem as u64, 0xAA);
+
+        let null = std::ptr::null();
+        let (mut alloc, mut list) = (null, null);
+        let alloc_iid = crate::object::guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]);
+        let list_iid = crate::object::guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut alloc), crate::object::S_OK);
+        let _alloc = HeldCom(alloc);
+        assert_eq!(crate::list::create_list(null, 0, 0, alloc, null, &list_iid, &mut list), crate::object::S_OK);
+        let _list = HeldCom(list);
+
+        type CloseFn = extern "system" fn(This) -> crate::object::HRESULT;
+        type ResetFn = extern "system" fn(This, This, This) -> crate::object::HRESULT;
+        type CopyResourceFn = extern "system" fn(This, This, This);
+        let close = crate::object::slot::<CloseFn>(list, 0x48);
+        let reset = crate::object::slot::<ResetFn>(list, 0x50);
+        let copy = crate::object::slot::<CopyResourceFn>(list, 0x88);
+
+        seed_title_texture(host, dst.0);
+        let snap = crate::resource::owned(dst.0).expect("unpinned texture is an eviction candidate");
+
+        // Record after `candidates()` snapshot was taken.
+        copy(list, dst.0, src.0);
+        let pinned = crate::resource::made_copy(dst.0).unwrap();
+        assert_eq!(crate::resource::give_up_snapshot(&[snap]), (0, 0));
+
+        let still = crate::resource::made_copy(dst.0).expect("stale snapshot must not evict pinned copy");
+        assert!(Arc::ptr_eq(&pinned, &still));
+        assert_eq!(still.pending_host_writes.load(Acquire) & crate::resource::EVICTED, 0);
+
+        assert_eq!(close(list), crate::object::S_OK);
+        let recorded = crate::list::host_list(list).unwrap();
+        host.execute(&[recorded]);
+        assert_eq!(reset(list, alloc, null), crate::object::S_OK);
+        assert_eq!(readback_first_texel(host, dst.0), [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    /// Window 1: when `give_up` has already claimed `old` with `EVICTED`
+    /// before clearing `resource(dst).host`, `prepare_host_write` must never
+    /// return `old`; it detaches `old` and atomically acquires + pins a fresh
+    /// replacement `HostTexture`.
+    #[test]
+    fn prepare_host_write_detaches_claimed_evicted_copy_and_pins_replacement() {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        use windows::core::Interface;
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let dst_mem = crate::watch::tests::pool(1);
+        let dst = test_title_texture(dst_mem as u64, 0x40);
+        let old = crate::resource::host_copy(dst.0).unwrap();
+
+        // Simulate `give_up` claiming `old` via CAS before clearing `resource.host`.
+        assert_eq!(
+            old.pending_host_writes.compare_exchange(0, crate::resource::EVICTED, AcqRel, Acquire),
+            Ok(0)
+        );
+
+        let guard = prepare_host_write(dst.0).expect("must detach EVICTED copy and acquire replacement");
+        assert_ne!(guard.resource().as_raw(), old.texture.as_raw());
+        let current = crate::resource::made_copy(dst.0).unwrap();
+        assert!(!Arc::ptr_eq(&current, &old));
+        assert!(!crate::resource::give_up_now(dst.0), "replacement must be pinned while guard lives");
+
+        drop(guard);
+        assert!(crate::resource::give_up_now(dst.0), "dropping unrecorded guard must unpin replacement");
+    }
+
+    #[test]
+    fn merge_spans_coalesces_overlapping_and_adjacent_intervals() {
+        let mut s = vec![
+            (100, 200),
+            (50, 50),
+            (0, 64),
+            (64, 100),
+            (300, 400),
+            (350, 380),
+            (380, 450),
+            (0, 64),
+        ];
+        merge_spans(&mut s);
+        assert_eq!(s, vec![(0, 200), (300, 450)]);
+
+        let mut empty = vec![(10, 10), (20, 10)];
+        merge_spans(&mut empty);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn parallel_pool_reuses_worker_scratch_and_handles_reentrancy_and_panics() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = ParallelPool::new(3);
+        let sum = AtomicUsize::new(0);
+        let first_ptrs: Mutex<HashSet<usize>> = Mutex::new(HashSet::new());
+        pool.run(4, 64, |i| {
+            let s = Scratch::take(64 * 1024);
+            first_ptrs.lock().unwrap().insert(s.0.as_ptr() as usize);
+            sum.fetch_add(i + 1, Ordering::Relaxed);
+        });
+        assert_eq!(sum.load(Ordering::Relaxed), 64 * 65 / 2);
+
+        // Second batch reuses the already-allocated thread_local Scratch buffers.
+        let mut second_ptrs = HashSet::new();
+        let second_lock: Mutex<&mut HashSet<usize>> = Mutex::new(&mut second_ptrs);
+        pool.run(4, 64, |_| {
+            let s = Scratch::take(64 * 1024);
+            second_lock.lock().unwrap().insert(s.0.as_ptr() as usize);
+        });
+        let first_ptrs = first_ptrs.into_inner().unwrap();
+        assert!(
+            second_ptrs.iter().any(|p| first_ptrs.contains(p)),
+            "expected persistent worker Scratch pointer reuse across batches: first={first_ptrs:?} second={second_ptrs:?}"
+        );
+
+        // Nested call runs inline without deadlocking.
+        let nested = AtomicUsize::new(0);
+        pool.run(4, 8, |_| {
+            pool.run(4, 4, |_| {
+                nested.fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(nested.load(Ordering::Relaxed), 32);
+
+        // Panic propagates cleanly and leaves pool reusable afterward.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.run(4, 16, |i| {
+                assert_ne!(i, 5, "boom");
+            });
+        }));
+        assert!(caught.is_err());
+
+        let after = AtomicUsize::new(0);
+        pool.run(4, 16, |_| {
+            after.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(after.load(Ordering::Relaxed), 16);
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_in_parallel_scratch_reuse() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        const BATCHES: usize = 40;
+        const ITEMS: usize = 8;
+        const BYTES: usize = 2 << 20; // 2 MiB texture read buffer
+
+        let run_scoped = || {
+            let t0 = std::time::Instant::now();
+            for _ in 0..BATCHES {
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        scope.spawn(|| loop {
+                            let i = next.fetch_add(1, Relaxed);
+                            if i >= ITEMS {
+                                break;
+                            }
+                            let mut s = Scratch::take(BYTES);
+                            // Touch one byte per 4 KiB page (as copy_mapped writes into read).
+                            for p in (0..BYTES).step_by(4096) {
+                                s.0[p] = (i as u8).wrapping_add(1);
+                            }
+                            std::hint::black_box(s.0[0]);
+                        });
+                    }
+                });
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / BATCHES as f64
+        };
+
+        let pool = ParallelPool::new(3);
+        let run_pooled = || {
+            // Warm once (simulating steady-state submissions after frame 1).
+            pool.run(4, ITEMS, |_| {
+                let _ = Scratch::take(BYTES);
+            });
+            let t0 = std::time::Instant::now();
+            for _ in 0..BATCHES {
+                pool.run(4, ITEMS, |i| {
+                    let mut s = Scratch::take(BYTES);
+                    for p in (0..BYTES).step_by(4096) {
+                        s.0[p] = (i as u8).wrapping_add(1);
+                    }
+                    std::hint::black_box(s.0[0]);
+                });
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / BATCHES as f64
+        };
+
+        let scoped_ms = run_scoped();
+        let pooled_ms = run_pooled();
+        eprintln!(
+            "in_parallel (4 threads, {ITEMS}x 2 MiB Scratch): scoped={scoped_ms:.3} ms/batch, pooled={pooled_ms:.3} ms/batch ({:.2}x)",
+            scoped_ms / pooled_ms
+        );
     }
 }

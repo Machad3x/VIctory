@@ -150,6 +150,9 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })?;
 
@@ -1721,6 +1724,9 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");
@@ -2178,6 +2184,166 @@ fn packed_fmac_accumulates_each_half() {
     );
 }
 
+/// `v_pk_fmac_f16_dpp` (VOP2 + DPP16): `src0` comes from the DPP-selected
+/// lane in both packed f16 halves, not the executing lane's own VGPR.
+#[test]
+fn packed_fmac_dpp_reads_the_swizzled_lane() {
+    use super::bitcode::{Attr, Term};
+    use super::container::{self, SigElement};
+    use super::host::Draw;
+    use super::shader::Shader;
+    use crate::dxbc::{Container, FourCC};
+    use crate::native::StageIo;
+
+    // Pixel shader on a 2x2 quad: v0 = SV_Position.x (0.5 / 1.5), v1 = y.
+    // v2 = pack_f16(lo = x + 2y, hi = x + 4y):
+    //   (0,0): (1.5, 2.5)  (1,0): (2.5, 3.5)
+    //   (0,1): (3.5, 6.5)  (1,1): (4.5, 7.5)
+    // quad_perm:[1,0,3,2] swaps horizontal neighbours before multiplying by
+    // (lo = 4.0, hi = 2.0) and adding (lo = 0.5, hi = 1.0).
+    let words: [u32; 16] = [
+        0x08 << 25 | 2 << 17 | 1 << 9 | 244,  // v_mul_f32 v2, 2.0, v1
+        0x03 << 25 | 2 << 17 | 2 << 9 | 256,  // v_add_f32 v2, v0, v2
+        0x08 << 25 | 3 << 17 | 1 << 9 | 246,  // v_mul_f32 v3, 4.0, v1
+        0x03 << 25 | 3 << 17 | 3 << 9 | 256,  // v_add_f32 v3, v0, v3
+        0x2F << 25 | 2 << 17 | 3 << 9 | 258,  // v_cvt_pkrtz_f16_f32 v2, v2, v3
+        0x7E06_02FF,                          // v_mov_b32 v3, 0x4000_4400
+        0x4000_4400,                          //   (hi = 2.0, lo = 4.0)
+        0x7E08_02FF,                          // v_mov_b32 v4, 0x3C00_3800
+        0x3C00_3800,                          //   (hi = 1.0, lo = 0.5)
+        0x3C << 25 | 4 << 17 | 3 << 9 | 0xFA, // v_pk_fmac_f16_dpp v4, v2, v3
+        0xFF00_B102,                          //   quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf
+        vop1(0x00B, 5, vgpr(4)),              // v_cvt_f32_f16 v5, v4 (low half)
+        0x16 << 25 | 6 << 17 | 4 << 9 | 144,  // v_lshrrev_b32 v6, 16, v4
+        vop1(0x00B, 6, vgpr(6)),              // v_cvt_f32_f16 v6, v6 (high half)
+        0xF800_180F,                          // exp mrt0 v5, v6, v5, v6 done vm
+        0x0605_0605,
+    ];
+    let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    code.extend_from_slice(&S_ENDPGM.to_le_bytes());
+
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: (1 << 8) | (1 << 9),
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code,
+    };
+    let sig_el = |name: &str, kind, interp| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp: 9,
+        interp,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    };
+    let isg1 = container::signature(&[sig_el("SV_Position", 3, 4)], false);
+    let osg1 = container::signature(&[sig_el("SV_Target", 16, 0)], false);
+    let container_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&container_bytes).expect("parse container");
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io");
+    let ps = super::emit(&c, &native, &p, &st, &io, &res, super::Target::ANY).expect("emit");
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    for col in 0..4u8 {
+        let load_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+        let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &load_args);
+        let store_args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+        s.op(
+            b,
+            "storeOutput.f32",
+            Attr::NoUnwind,
+            s.t.void,
+            5,
+            &store_args,
+        );
+    }
+    s.inputs = vec![sig_el("POSITION", 0, 0)];
+    s.outputs = vec![sig_el("SV_Position", 3, 0)];
+    s.m.terminate(b, Term::Ret);
+    let vs = HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        memory: false,
+        memory_writes: false,
+        view_addresses: false,
+        heap: false,
+        heap_writes: false,
+        view_marks: false,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut vs.dxil.clone())
+            .expect("VS DXIL validation failed");
+        v.validate(&mut ps.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+
+    let vertices = [
+        -1.0f32, -1.0, 0.5, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, //
+        3.0, -1.0, 0.5, 1.0,
+    ];
+    let want = [
+        [10.5f32, 8.0, 10.5, 8.0], // (0,0) reads (1,0): (2.5*4+0.5, 3.5*2+1)
+        [6.5, 6.0, 6.5, 6.0],      // (1,0) reads (0,0): (1.5*4+0.5, 2.5*2+1)
+        [18.5, 16.0, 18.5, 16.0],  // (0,1) reads (1,1): (4.5*4+0.5, 7.5*2+1)
+        [14.5, 14.0, 14.5, 14.0],  // (1,1) reads (0,1): (3.5*4+0.5, 6.5*2+1)
+    ];
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 {label} device ({e}); skipped");
+                continue;
+            }
+        };
+        let (root, pso) = host
+            .pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
+        let texels = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (2, 2),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
+        assert_eq!(
+            texels, want,
+            "{label}: v_pk_fmac_f16_dpp quad_perm:[1,0,3,2]"
+        );
+    }
+}
+
 /// `src_scc` reads SCC as 0 or 1, in scalar and vector instructions.
 #[test]
 fn src_scc_reads_as_zero_or_one() {
@@ -2194,6 +2360,27 @@ fn src_scc_reads_as_zero_or_one() {
             assert_eq!(got, 2 * want, "{backend}");
         });
     }
+}
+
+/// A register that holds a lane mask on one path and a number on the
+/// other, read as a number after the join (a traversal keeps lane masks as
+/// numbers on its LDS stack): the mask is the console's, lane 0's bit here.
+#[test]
+fn a_lane_mask_joined_with_a_number_reads_as_the_mask() {
+    let shader = build_valu_cs(&[
+        0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003, // s_cbranch_scc1 mask
+        s_mov_b32(12, 255),
+        0x55, // s_mov_b32 s12, 0x55
+        0xBF82_0001, // s_branch join
+        s_mov_b32(12, 106), // mask: s_mov_b32 s12, vcc_lo
+        vop1(0x001, 0, sgpr(12)), // join: v_mov_b32 v0, s12
+    ]);
+    run_cases(&shader, &[[0; 4], [1, 0, 0, 0]], |backend, _, inputs, got| {
+        let want = if inputs[0] == 0 { 1 } else { 0x55 };
+        assert_eq!(got, want, "{backend}");
+    });
 }
 
 /// A register array indexed through M0 whose upper registers hold
@@ -2247,6 +2434,36 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
+}
+
+/// `v_cvt_f32_f64`: the pair v1:v2 read as binary64, truncated to f32 bits
+/// in v0 with MODE's default round mode (nearest even). The host does the
+/// conversion with `fptrunc`, so Rust's `as f32` is the expectation.
+#[test]
+fn a_64_bit_value_converts_to_f32_round_to_nearest() {
+    let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    let cases = [
+        [0x0000_0000, 0x3FF0_0000, 0, 0], // 1.0
+        [0x0000_0000, 0xC004_0000, 0, 0], // -2.5
+        [0x9999_999A, 0x3FB9_9999, 0, 0], // 0.1
+        [0x1000_0000, 0x3FF0_0000, 0, 0], // 1 + 2^-24: a tie, to even (1.0)
+        [0x0000_0001, 0x0000_0000, 0, 0], // the smallest subnormal: 0
+        [0xFFFF_FFFF, 0x000F_FFFF, 0, 0], // just below f32's smallest: 0
+        [0xFFFF_FFFF, 0x7FEF_FFFF, 0, 0], // f64 max: inf
+        [0x0000_0000, 0x7FF0_0000, 0, 0], // +inf
+        [0x0000_0000, 0xFFF0_0000, 0, 0], // -inf
+        [0x0000_0000, 0x7FF8_0000, 0, 0], // a quiet NaN
+    ];
+    run_cases(&shader, &cases, |backend, i, [lo, hi, _, _], got| {
+        let v = f64::from_bits(u64::from(hi) << 32 | u64::from(lo));
+        let want = v as f32;
+        if want.is_nan() {
+            assert_eq!(got & 0x7F80_0000, 0x7F80_0000, "{backend}: case {i} is a NaN");
+            assert_ne!(got & 0x007F_FFFF, 0, "{backend}: case {i} keeps a payload");
+        } else {
+            assert_eq!(got, want.to_bits(), "{backend}: case {i} {v:e}");
+        }
+    });
 }
 
 #[test]

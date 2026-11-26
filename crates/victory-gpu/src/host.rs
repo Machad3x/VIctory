@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::{
     D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob,
@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
@@ -124,6 +124,71 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
+    }
+}
+
+/// How a wait for a submission ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Waited {
+    /// The host signalled the submission's fence.
+    Done,
+    /// The device was removed while the submission ran.
+    Removed,
+    /// Neither after [`STALL_SECS`]: the GPU has faulted or hung and the
+    /// host has not said so.
+    Stalled,
+}
+
+/// How long one wait for a submission lasts before the device is asked
+/// whether it is still there.
+const WAIT_SLICE_MS: u32 = 250;
+
+/// A submission still running after this many seconds is said so, and again
+/// each time that time has doubled.
+const LONG_WAIT_SECS: u64 = 10;
+
+/// A submission still running after this many seconds is given up. A host
+/// whose GPU faults may neither finish the work nor report the device
+/// removed: vkd3d-proton waits on the driver without an end unless
+/// `VKD3D_CONFIG=fault` or `breadcrumbs` is set, and says itself that such
+/// a wait of over 5 s is a lost device. Windows resets a device whose
+/// submission runs for about 2 s. The title ends its own run when its main
+/// thread has waited 30 s for the render thread, which a submission that
+/// never finishes brings about; this is below that, so the run ends with
+/// our report of the cause and not with the title's.
+const STALL_SECS: u64 = 25;
+
+/// Waits for a submission: `signalled` waits one slice ([`WAIT_SLICE_MS`])
+/// for its fence and says whether it came. Between slices `removed` asks
+/// the device whether it was removed, because a host that loses its device
+/// need not signal the fences of the work it dropped (vkd3d-proton after a
+/// GPU fault does not), and a wait without an end then holds the title's
+/// submit thread until the title ends the run, with no report of ours.
+/// `long` is told the seconds waited so far, at [`LONG_WAIT_SECS`] and each
+/// doubling of it; at [`STALL_SECS`] the wait is given up.
+fn wait_for_submission(
+    mut signalled: impl FnMut() -> bool,
+    mut removed: impl FnMut() -> bool,
+    mut long: impl FnMut(u64),
+) -> Waited {
+    let mut slices = 0u64;
+    let mut report_at = LONG_WAIT_SECS;
+    loop {
+        if signalled() {
+            return Waited::Done;
+        }
+        if removed() {
+            return Waited::Removed;
+        }
+        slices += 1;
+        let secs = slices * u64::from(WAIT_SLICE_MS) / 1000;
+        if secs >= STALL_SECS {
+            return Waited::Stalled;
+        }
+        if secs >= report_at {
+            long(secs);
+            report_at *= 2;
+        }
     }
 }
 
@@ -428,6 +493,70 @@ pub(crate) mod tests {
         assert_eq!(retry.attempt(recovered, || Ok::<_, ()>(43)), Some(Ok(43)));
     }
 
+    /// A submission's wait ends when its fence comes, or when the device is
+    /// gone and the fence never will.
+    #[test]
+    fn a_wait_for_a_submission_ends_when_the_device_is_removed() {
+        use super::{LONG_WAIT_SECS, STALL_SECS, WAIT_SLICE_MS, Waited, wait_for_submission};
+        let slices_per_sec = 1000 / u64::from(WAIT_SLICE_MS);
+        // The fence comes in the third slice: the device is asked twice.
+        let (mut waits, mut asked) = (0, 0);
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits == 3
+            },
+            || {
+                asked += 1;
+                false
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((done, waits, asked), (Waited::Done, 3, 2));
+        // The fence never comes and the device is removed in the fifth slice.
+        let mut asked = 0;
+        let lost = wait_for_submission(
+            || false,
+            || {
+                asked += 1;
+                asked == 5
+            },
+            |_| panic!("not a long wait"),
+        );
+        assert_eq!((lost, asked), (Waited::Removed, 5));
+        // A fence signalled together with the removal is a finished wait:
+        // the caller's check after the submission reports the removal.
+        assert_eq!(wait_for_submission(|| true, || true, |_| ()), Waited::Done);
+        // A long submission on a live device is waited for, and said so at
+        // 10 s and 20 s.
+        let (mut waits, mut said) = (0, Vec::new());
+        let done = wait_for_submission(
+            || {
+                waits += 1;
+                waits > 22 * slices_per_sec
+            },
+            || false,
+            |secs| said.push(secs),
+        );
+        assert_eq!(done, Waited::Done);
+        assert_eq!(said, [LONG_WAIT_SECS, 2 * LONG_WAIT_SECS]);
+        // One that neither finishes nor loses its device is given up, after
+        // every slice of the time allowed and no sooner.
+        let mut waits = 0;
+        let stalled = wait_for_submission(
+            || {
+                waits += 1;
+                false
+            },
+            || false,
+            |_| (),
+        );
+        assert_eq!(
+            (stalled, waits),
+            (Waited::Stalled, STALL_SECS * slices_per_sec)
+        );
+    }
+
     use super::*;
 
     /// Shaders that use title memory mark their reads in their own bitmap:
@@ -450,6 +579,51 @@ pub(crate) mod tests {
         assert!(!crate::shadow::take_reads().contains(&memory), "forgotten: its mark cleared");
         crate::shadow::tests::mark_read(true, memory);
         assert!(crate::shadow::take_reads().contains(&memory), "read again after it was forgotten");
+    }
+
+    /// A slot left null (a placed texture written into the heap, or one given
+    /// up) has its forgotten mark cleared before the next submission runs, so
+    /// a read in that very submission makes the texture instead of having its
+    /// mark wiped out after it.
+    #[test]
+    fn forgotten_slot_read_in_the_next_submission_is_made() {
+        let Some(host) = host() else { return };
+        let (null, mut heap) = (std::ptr::null(), std::ptr::null());
+        let desc: [u32; 8] = [0, 800, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let hr = crate::descriptor::create_heap(null, desc.as_ptr().cast(), &iid, &mut heap);
+        assert_eq!(hr, 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let (slot, memory) = (768u32, vec![0u8; 1 << 16]);
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        let at = title_heap.start + u64::from(slot) * 32;
+        crate::descriptor::create_placed_srv(null, &words, &view, at);
+        let heap_host = title_heap.host().expect("a host view heap");
+        assert!(!heap_host.kept(slot), "placed texture left null until read");
+        let list = host.new_list().unwrap();
+        crate::shadow::tests::record_mark_read(&list, false, slot);
+        list.close();
+        host.execute(&[&list]);
+        assert!(heap_host.kept(slot), "made after its first read");
+        let texture = crate::resource::texture_at(address, &words).expect("its resource");
+        assert!(crate::resource::give_up_now(texture));
+        assert!(!heap_host.kept(slot), "given up");
+        list.reset();
+        crate::shadow::tests::record_mark_read(&list, false, slot);
+        list.close();
+        host.execute(&[&list]);
+        assert!(heap_host.kept(slot), "made again after its first read");
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        assert_eq!(crate::object::slot::<Release>(heap, 0x10)(heap), 0);
     }
 
     /// The textures shaders read through the heap since the last eviction
@@ -1011,9 +1185,9 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fx::Set<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1030,6 +1204,9 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Buffers shaders wrote, copied at the list's end into read-back
+    /// buffers (from, to, bytes; [`HostList::read_back_at_close`]).
+    read_backs: Vec<(ID3D12Resource, ID3D12Resource, u64)>,
 }
 
 impl Host {
@@ -1065,6 +1242,47 @@ impl Host {
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
             tracing::info!(mesh, "host mesh shader support");
             mesh
+        })
+    }
+
+    /// The wave sizes the host runs (D3D12 options 1), which translated
+    /// compute shaders that declare the console's wave size must fit;
+    /// logged once. Unknown (the query fails): any.
+    pub(crate) fn target(&self) -> victory_shader::emit::Target {
+        static TARGET: OnceLock<victory_shader::emit::Target> = OnceLock::new();
+        *TARGET.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+            // SAFETY: the query writes the structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS1,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let target = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMin > 0 {
+                victory_shader::emit::Target {
+                    lanes_min: options.WaveLaneCountMin,
+                    lanes_max: options.WaveLaneCountMax,
+                }
+            } else {
+                victory_shader::emit::Target::ANY
+            };
+            tracing::info!(
+                lanes_min = target.lanes_min,
+                lanes_max = target.lanes_max,
+                "host wave sizes"
+            );
+            if !target.runs(64) {
+                tracing::warn!(
+                    "the host has no 64-lane waves: console wave64 compute programs that need \
+                     their whole wave run as two 32-lane waves where there is a form for \
+                     them; the rest do not translate, and their dispatches are dropped"
+                );
+            }
+            target
         })
     }
 
@@ -1237,6 +1455,24 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Snapshots of copies in video memory read their mirrors: brought up
+        // to date at once, and kept so until the copy-backs.
+        let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
+            .iter()
+            .flat_map(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .filter_map(|s| match s {
+                        Step::GpuWrite(shadow, address, len, false, _) => {
+                            Some((shadow.clone(), *address, *len))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -1265,9 +1501,13 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        // Clear read marks of slots forgotten before this submission (placed
+        // textures written or evicted) so reads in it are not wiped after it.
+        crate::shadow::clear_forgotten_reads();
         let mut removed_in = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            let mut ended = Waited::Done;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
@@ -1280,10 +1520,37 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        ended = wait_for_submission(
+                            || WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT,
+                            || self.device.GetDeviceRemovedReason().is_err(),
+                            |secs| {
+                                tracing::warn!(
+                                    secs,
+                                    lists = runs.len(),
+                                    "host submission still on the GPU"
+                                );
+                            },
+                        );
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
+            }
+            match ended {
+                Waited::Done => {}
+                // Nothing more runs on a removed device; reported below.
+                Waited::Removed => {
+                    if groups.len() > 1 && removed_in.is_none() {
+                        removed_in = Some(i);
+                    }
+                    break;
+                }
+                Waited::Stalled => fail(format_args!(
+                    "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
+                     no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
+                     names a fault){}",
+                    runs.len(),
+                    last_notes(runs)
+                )),
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
@@ -1399,6 +1666,10 @@ impl Host {
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        // What shaders wrote into copies in video memory, for the copy-backs
+        // below to read from their mirrors: in the ranges with snapshots
+        // (marked ones compare nothing; `copy_back_marks` pulled their pages).
+        crate::shadow::pull(&snapshots);
         for (shadow, address, len, goes_back) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -1410,6 +1681,7 @@ impl Host {
                 crate::memory::drop_withheld(address, len);
             }
         }
+        crate::shadow::snapshots_done(&snapshots);
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -1761,6 +2033,17 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        for (from, to, bytes) in &self.deferred().read_backs {
+            // SAFETY: an open list; buffers of ours it holds.
+            unsafe {
+                self.list.ResourceBarrier(&[transition(
+                    from,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                self.list.CopyBufferRegion(to, 0, from, 0, *bytes);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1820,6 +2103,9 @@ impl HostList {
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
         let texture = copy.texture.clone();
+        if copy.packed().is_some() {
+            crate::texture::upload(self, resource, &texture);
+        }
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)
         {
@@ -2123,6 +2409,19 @@ impl HostList {
         self.deferred().missed.push(Box::new(check));
     }
 
+    /// At the list's end (when it is closed), `bytes` of `from` (in the
+    /// unordered-access state) are copied into the read-back buffer `to`.
+    pub(crate) fn read_back_at_close(
+        &self,
+        from: &ID3D12Resource,
+        to: &ID3D12Resource,
+        bytes: u64,
+    ) {
+        self.deferred()
+            .read_backs
+            .push((from.clone(), to.clone(), bytes));
+    }
+
     /// Runs `work` once the list has run (each submission), before its
     /// bottom-of-pipe writes.
     pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
@@ -2396,14 +2695,19 @@ impl HostList {
 /// title memory asks for every copy whole. What the title's threads write
 /// meanwhile is for later submissions (on the console it would race the
 /// GPU).
+///
+/// A copy none of whose pages changed since it took them is not asked for
+/// at all ([`crate::shadow::Shadow::clean`]): lists using title memory
+/// ask for every copy there is, a few thousand in the world, of which a
+/// submission's writes touch a few.
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Where each copy's refresh is in `refreshes`, by copy.
-    pending: std::collections::HashMap<usize, usize>,
+    pending: crate::fx::Map<usize, usize>,
     /// The range of each copy brought up to date since the last title
     /// write, by copy (held, so that its address names no other).
-    current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    current: crate::fx::Map<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -2411,6 +2715,11 @@ impl Batch {
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
             return;
         }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
@@ -2436,19 +2745,30 @@ impl Batch {
         self.current.clear();
     }
 
-    /// Does the refreshes; returns the bytes copied.
+    /// Does the refreshes; returns the bytes copied. Their copies of pages
+    /// no shader writes are made together at the end, on several threads
+    /// ([`crate::copy_pool`]); the time per range counts only finding them.
     fn flush(&mut self) -> usize {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let started = std::time::Instant::now();
+        let (total, pieces) = crate::copy_pool::queued(|| self.update_all());
+        crate::copy_pool::run(pieces);
+        PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        total
+    }
+
+    /// [`Batch::flush`]'s updates, one per copy.
+    fn update_all(&mut self) -> usize {
         let mut total = 0;
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
+            crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = started;
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
             total += copied;
             // Kept: the union with what was current if they touch, else
@@ -2757,6 +3077,83 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer in video memory shaders may write (unordered access), in
+    /// the common state.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.buffer_in(
+            D3D12_HEAP_TYPE_DEFAULT,
+            size,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    }
+
+    /// A buffer in the read-back heap, mapped for reading (what the GPU
+    /// copied there, once the submission that copies it has run).
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *const u8)> {
+        let buffer = self.buffer_in(
+            D3D12_HEAP_TYPE_READBACK,
+            size,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )?;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a read-back buffer of ours, mapped whole.
+        match unsafe { buffer.Map(0, None, Some(&mut data)) } {
+            Ok(()) => Some((buffer, data.cast_const().cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no read-back buffer");
+                None
+            }
+        }
+    }
+
+    fn buffer_in(
+        &self,
+        heap: D3D12_HEAP_TYPE,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: heap,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                state,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, heap = heap.Type.0, "no buffer");
                 None
             }
         }
@@ -3584,6 +3981,33 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// Bytes of host copies in GPU upload heaps now ([`Host::gpu_upload_buffer`]):
+/// charged when one is made, given back when D3D12 destroys it
+/// ([`give_back_upload`]).
+static UPLOAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called by D3D12 when a host copy in a GPU upload heap is destroyed (its
+/// last reference gone: the copy's, lists', and descriptor tables' clones
+/// of the resource): its `size` (the callback's data) leaves
+/// [`UPLOAD_BYTES`]. Counted for the whole run, the budget ran out after
+/// enough buffers came and went and every later copy stayed in system
+/// memory (64 copies of 32 MiB on an RTX 3050 Laptop, #2120).
+unsafe extern "system" fn give_back_upload(size: *mut std::ffi::c_void) {
+    UPLOAD_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
+}
+
+/// [`UPLOAD_BYTES`], for tests.
+#[cfg(test)]
+pub(crate) fn upload_bytes() -> u64 {
+    UPLOAD_BYTES.load(Ordering::Relaxed)
+}
+
+/// Video memory host copies may take in GPU upload heaps; the rest stay in
+/// system memory.
+/// shortcut: a fixed amount; ask DXGI for the adapter's budget if 8 GB
+/// cards run short.
+const UPLOAD_BUDGET: u64 = 2 << 30;
+
 impl Host {
     /// Diagnostics, `VICTORY_COPIES_IN_VIDEO_MEMORY`: [`Host::shared_buffer`]s
     /// (host copies of title memory among them) in video memory the CPU maps
@@ -3618,11 +4042,188 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
+        self.shared_mapped_buffer(size, false)
+    }
+
+    /// A buffer in video memory that the CPU maps through the PCI BAR (a
+    /// GPU upload heap, `D3D12_OPTIONS16`): shaders read it as fast as any
+    /// video memory (on an RTX 5070 Ti ~720 GB/s against ~23 GB/s from
+    /// system memory), the CPU writes it about as fast as system memory,
+    /// and reading it from the CPU is very slow (~50 MB/s). For host copies
+    /// of title memory that shaders only read. None when the host has no
+    /// such heaps (no resizable BAR, older runtimes), `VICTORY_GPU_UPLOAD`
+    /// is off, or the copies there would pass [`UPLOAD_BUDGET`].
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.gpu_upload() {
+            return None;
+        }
+        let size = size.max(1);
+        if UPLOAD_BYTES.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_BUDGET {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static FULL: std::sync::Once = std::sync::Once::new();
+            FULL.call_once(|| {
+                tracing::info!("host copies past the GPU upload budget go to system memory")
+            });
+            return None;
+        }
+        let Some((buffer, data)) = self.shared_mapped_buffer(size, true) else {
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            return None;
+        };
+        // The charge goes back when the buffer is destroyed, not when the
+        // copy drops: lists and descriptor tables may hold it longer.
+        // SAFETY: a live buffer; the callback's data is the size alone.
+        let watched = unsafe {
+            buffer
+                .cast::<windows::Win32::Graphics::Direct3D::ID3DDestructionNotifier>()
+                .and_then(|n| {
+                    n.RegisterDestructionCallback(Some(give_back_upload), size as *const _)
+                })
+        };
+        if watched.is_err() {
+            // Not given back when destroyed, it would count for good.
+            drop(buffer);
+            UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            static UNWATCHED: std::sync::Once = std::sync::Once::new();
+            UNWATCHED.call_once(|| {
+                tracing::info!(
+                    "no destruction callback on this host: host copies stay in system memory"
+                )
+            });
+            return None;
+        }
+        Some((buffer, data))
+    }
+
+    /// Whether host copies that shaders only read go to GPU upload heaps:
+    /// `VICTORY_GPU_UPLOAD=1` (a prototype, off by default) and a host that
+    /// has them. Asked once.
+    pub(crate) fn gpu_upload(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            if !crate::switch::on("VICTORY_GPU_UPLOAD") {
+                return false;
+            }
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: a feature query writing the structure of its size.
+            let known = unsafe {
+                self.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS16,
+                    (&raw mut o).cast(),
+                    size_of_val(&o) as u32,
+                )
+            }
+            .is_ok();
+            let on = known && o.GPUUploadHeapSupported.as_bool();
+            tracing::info!(
+                on,
+                "host copies that shaders only read in GPU upload heaps (VICTORY_GPU_UPLOAD)"
+            );
+            on
+        })
+    }
+
+    /// Whether host copies that shaders write go to GPU upload heaps too,
+    /// with a system memory mirror for the CPU (`crate::shadow`):
+    /// `VICTORY_GPU_UPLOAD_WRITES=1` with [`Host::gpu_upload`] on. Asked once.
+    pub(crate) fn gpu_upload_writes(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = self.gpu_upload() && crate::switch::on("VICTORY_GPU_UPLOAD_WRITES");
+            tracing::info!(
+                on,
+                "host copies that shaders write in GPU upload heaps (VICTORY_GPU_UPLOAD_WRITES)"
+            );
+            on
+        })
+    }
+
+    /// Copies `regions` (destination, its offset, source, its offset,
+    /// bytes) between buffers on the GPU, now, and waits: for the GPU's
+    /// writes into copies in video memory to reach their system memory
+    /// mirrors before the CPU reads them (`crate::shadow::pull`). Runs in a
+    /// list of its own after whatever the queue holds; callable from inside
+    /// a submission's copy-back. Buffers start and end in the common state
+    /// (buffers enter and leave the copy states implicitly).
+    pub(crate) fn copy_now(&self, regions: &[(&ID3D12Resource, u64, &ID3D12Resource, u64, u64)]) {
+        if regions.is_empty() {
+            return;
+        }
+        struct Copier {
+            allocator: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            value: u64,
+        }
+        // SAFETY: D3D12 objects are free-threaded; the event is waited on
+        // under the mutex only.
+        unsafe impl Send for Copier {}
+        static COPIER: OnceLock<Option<Mutex<Copier>>> = OnceLock::new();
+        let copier = COPIER.get_or_init(|| {
+            // SAFETY: plain creation; the list is closed until used.
+            let made = unsafe {
+                (|| -> windows::core::Result<Copier> {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    Ok(Copier { allocator, list, fence, event, value: 0 })
+                })()
+            };
+            match made {
+                Ok(c) => Some(Mutex::new(c)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no host copier: copies in video memory are not read back");
+                    None
+                }
+            }
+        });
+        let Some(copier) = copier else {
+            return;
+        };
+        let mut c = copier.lock().unwrap_or_else(|e| e.into_inner());
+        c.value += 1;
+        let value = c.value;
+        // SAFETY: the allocator's last list finished (each call waits); the
+        // buffers are live and their ranges inside them (the caller's).
+        let ran = unsafe {
+            c.allocator.Reset().and_then(|()| {
+                c.list.Reset(&c.allocator, None)?;
+                for &(dst, dst_at, src, src_at, bytes) in regions {
+                    c.list.CopyBufferRegion(dst, dst_at, src, src_at, bytes);
+                }
+                c.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(c.list.cast()?)]);
+                self.queue.Signal(&c.fence, value)?;
+                c.fence.SetEventOnCompletion(value, c.event)?;
+                WaitForSingleObject(c.event, windows::Win32::System::Threading::INFINITE);
+                Ok(())
+            })
+        };
+        if let Err(e) = ran {
+            tracing::warn!(error = %e, "a host copy did not run");
+        }
+    }
+
+    /// A [`Host::shared_buffer`] in system memory, or (`upload`) in a GPU
+    /// upload heap ([`Host::gpu_upload_buffer`]).
+    fn shared_mapped_buffer(&self, size: u64, upload: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        let heap = if upload {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+                ..Default::default()
+            }
+        } else {
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            }
         };
         #[cfg(feature = "diagnostics")]
         let heap = if self.copies_in_video_memory() {
@@ -3665,7 +4266,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                tracing::warn!(error = %e, size, upload, "no shared buffer");
                 None
             }
         }
@@ -3962,8 +4563,163 @@ mod batch {   // `mod tests` is already taken at the top of this file
         drop(copy);
         crate::watch::tests::free(p);
     }
-}
 
+    /// A copy whose memory nothing wrote since it was taken is left out of
+    /// the batch (no refresh queued, none remembered); a write the guard
+    /// takes or one that is reported brings it back, for the pages written.
+    #[test]
+    fn a_copy_nothing_wrote_is_not_asked_for() {
+        use crate::watch::PAGE;
+        let p = crate::watch::tests::pool(4);
+        let len = 4 * PAGE;
+        crate::shadow::register(p, p as u64, len as u64);
+        let Some(copy) = crate::shadow::find(p as u64, len as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, len);
+        assert_eq!((batch.refreshes.len(), batch.flush()), (1, len), "all of it at first");
+        // Later lists and submissions: nothing queued, nothing kept.
+        batch.add(&copy, p, len);
+        batch.title_written();
+        batch.add(&copy, p + PAGE, 100);
+        let mut next = Batch::default();
+        next.add(&copy, p, len);
+        assert!(batch.refreshes.is_empty() && next.refreshes.is_empty());
+        assert_eq!(next.flush(), 0);
+        // SAFETY: our pool, guarded since the copy took it.
+        unsafe { ((p + 2 * PAGE + 8) as *mut u8).write_volatile(7) };
+        next.add(&copy, p, len);
+        assert_eq!((next.refreshes.len(), next.flush()), (1, PAGE), "the page written");
+        assert_eq!(copy.read_host((p + 2 * PAGE + 8) as u64, 1)[0], 7);
+        // A write of our own or the kernel's, reported.
+        drop(crate::watch::writing(p + 3 * PAGE, 16));
+        next.title_written();
+        next.add(&copy, p, len);
+        assert_eq!(next.flush(), PAGE, "the page reported");
+        next.add(&copy, p, len);
+        assert!(next.refreshes.is_empty());
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+
+
+    /// A world frame's refreshes, on a made-up heap shaped like the world's
+    /// (#400): 36 submissions, each after the title wrote 256 scattered
+    /// pages of a 174 MB tracked heap, each declaring 24 ranges of it (of
+    /// 64 views) as written by marking shaders, refreshed through `Batch`
+    /// as `Host::execute` does (ranges armed, then one flush). Times the
+    /// flushes with the copies on one thread and on the workers
+    /// (`crate::copy_pool`), and checks every title write reached the copy.
+    /// Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture world_frame_refreshes`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn world_frame_refreshes() {
+        use crate::watch::PAGE;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        const HEAP: usize = 174 << 20;
+        const SUBMISSIONS: usize = 36;
+        const DECLARED: usize = 24;
+        const VIEWS: usize = 64;
+        const TITLE_PAGES: usize = 256;
+        const FRAMES: usize = 6;
+        let p = crate::watch::tests::pool(HEAP / PAGE);
+        crate::shadow::register(p, p as u64, HEAP as u64);
+        let Some(copy) = crate::shadow::find(p as u64, HEAP as u64) else {
+            crate::shadow::unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        // Views of the heap: 256-byte aligned, 64 KiB to 32 MiB.
+        let views: Vec<(usize, usize)> = (0..VIEWS)
+            .map(|_| {
+                let len = (64 << 10) << next(10);
+                let at = next((HEAP - len) / 256) * 256;
+                (p + at, len)
+            })
+            .collect();
+        let mut batch = Batch::default();
+        batch.add(&copy, p, HEAP);
+        batch.flush();
+        let mut stamp = 1u64;
+        let mut frame = |serial: bool| -> (Duration, usize) {
+            crate::copy_pool::SERIAL.store(serial, Ordering::Relaxed);
+            let (mut took, mut copied) = (Duration::ZERO, 0);
+            for _ in 0..SUBMISSIONS {
+                let writes: Vec<usize> = (0..TITLE_PAGES)
+                    .map(|_| p + next(HEAP / PAGE) * PAGE + next(PAGE / 8) * 8)
+                    .collect();
+                for &at in &writes {
+                    // SAFETY: 8 aligned bytes of our pool.
+                    unsafe { (at as *mut u64).write_volatile(stamp) };
+                    stamp += 1;
+                }
+                let declared: Vec<(usize, usize)> =
+                    (0..DECLARED).map(|_| views[next(VIEWS)]).collect();
+                let mut batch = Batch::default();
+                for &(at, len) in &declared {
+                    batch.add(&copy, at, len);
+                    copy.writing(at, len, true);
+                }
+                let started = Instant::now();
+                copied += batch.flush();
+                took += started.elapsed();
+                // Every title write inside a declared range is in the copy.
+                for &at in &writes {
+                    if declared.iter().any(|&(a, n)| a <= at && at + 8 <= a + n) {
+                        // SAFETY: 8 aligned bytes of our pool.
+                        let title = unsafe { (at as *const u64).read_volatile() };
+                        let host = copy.read_host(at as u64, 2);
+                        assert_eq!(
+                            u64::from(host[0]) | u64::from(host[1]) << 32,
+                            title,
+                            "{at:#x}"
+                        );
+                    }
+                }
+                for &(at, len) in &declared {
+                    copy.copy_back(at, len);
+                }
+            }
+            (took, copied)
+        };
+        let mut report = |serial: bool| {
+            frame(serial);
+            let mut ms: Vec<f64> = (0..FRAMES)
+                .map(|_| {
+                    let (took, copied) = frame(serial);
+                    println!(
+                        "  {}: {:.1} ms, {} MB copied",
+                        if serial { "one thread" } else { "workers" },
+                        took.as_secs_f64() * 1e3,
+                        copied >> 20
+                    );
+                    took.as_secs_f64() * 1e3
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            ms[FRAMES / 2]
+        };
+        let serial = report(true);
+        let workers = report(false);
+        println!("refresh per frame, median: one thread {serial:.1} ms, workers {workers:.1} ms");
+        crate::copy_pool::SERIAL.store(false, Ordering::Relaxed);
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
+    }
+}
 
 #[cfg(test)]
 mod withholding {
@@ -3980,6 +4736,7 @@ mod withholding {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        let _alone = crate::memory::without_a_miss();
         let pools = [crate::watch::tests::pool(1), crate::watch::tests::pool(1)];
         for &p in &pools {
             // SAFETY: our pool, not guarded yet.

@@ -2,7 +2,7 @@
 //!
 //! The console's lists wait on memory values (`Wait32BitValueX`,
 //! `Wait64BitValueX`) that lists on other queues write at their end
-//! (`Write32/64BitValueBottomOfPipeX`): Grand Theft Auto VI's four compute
+//! (`Write32/64BitValueBottomOfPipeX`): the title's four compute
 //! queues start each list with a wait for the frame's value of a word that
 //! a graphics list writes, and some lists wait again after their first
 //! commands. Our submissions run to completion when the title makes them,
@@ -141,6 +141,11 @@ impl<S> Held<S> {
                     let ready = match items.front_mut() {
                         None => false,
                         Some((Item::Segment(_, waits), since, fresh)) => {
+                            // Apply the preceding segments' writes before reading their values.
+                            if !waits.is_empty() && !piece.is_empty() {
+                                (w.run)(*queue, std::mem::take(&mut piece));
+                                done.pieces += 1;
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -327,6 +332,42 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: a b"], "one piece");
         assert_eq!((p.pieces, p.waited.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_wait_for_the_value_overwritten_by_its_queue_stays_held() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.memory.insert(0x100, 7);
+            f.writes.insert("write", vec![(0x100, 8)]);
+        }
+        let old = ValueWait { address: 0x100, bytes: 8, comparison: EQUAL, reference: 7, mask: u64::MAX };
+        let mut held = Held::default();
+        held.push(2, Item::Segment("write", vec![]));
+        held.push(2, Item::Segment("after", vec![old]));
+
+        let p = pump(&mut held, &fake);
+
+        assert_eq!(fake.borrow().log, ["q2: write"]);
+        assert_eq!((p.pieces, p.segments), (1, 1));
+        assert!(held.holds_work(2));
+    }
+
+    #[test]
+    fn a_wait_for_its_queues_write_holds_on_the_first_check() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("write", vec![(0x100, 8)]);
+        let mut held = Held::default();
+        held.push(2, Item::Segment("write", vec![]));
+        held.push(2, Item::Segment("after", vec![ge(0x100, 8)]));
+
+        let p = pump(&mut held, &fake);
+
+        assert_eq!(fake.borrow().log, ["q2: write", "q2: after"]);
+        assert_eq!((p.pieces, p.segments), (2, 2));
+        assert!(p.waited.is_empty());
+        assert!(held.is_empty());
     }
 
     /// A list's second segment waits for a value the other queue writes

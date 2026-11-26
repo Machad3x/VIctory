@@ -457,6 +457,9 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Lane masks not derived from EXEC or VALU results (constants, opaque
     /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
+    /// In the console flow, also what a mask join takes on an edge such a
+    /// value arrives by: a loop's exit mask starts as a constant 0 before
+    /// lanes are added.
     pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
@@ -466,6 +469,16 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block and instruction: the lane's EXEC bit at each vector
+    /// instruction, whatever path the lane took (`None` for scalar ones).
+    /// What a program run as the console runs it, every lane through every
+    /// block, guards its vector instructions with ([`structure_console`]).
+    pub execs: Vec<Vec<Option<Bool>>>,
+    /// The high dword read with each low dword of a wave64 mask in
+    /// [`Self::masks`] or [`Self::other`], where the two are different
+    /// values: the halves of a mask held as a number need not come from
+    /// one instruction.
+    pub pairs: HashMap<Value, Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
     pub restored: HashMap<Value, Value>,
@@ -486,7 +499,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -494,16 +507,33 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+/// The same for a program run as the console runs it: every lane of the
+/// console wave through every block, the branches taken wave-wide. Masks
+/// joined at a block are never resolved from what the lanes arriving there
+/// know, since lanes outside EXEC arrive too: each join that differs
+/// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
+/// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, true, true)
+}
+
+fn structure_as(
+    program: &Program,
+    helpers: bool,
+    console: bool,
+) -> Result<Structured, ShaderError> {
+    let mut l = Lanes::new(program, console)?;
     if !helpers {
         l.kills.clear();
     }
     loop {
         let execs = l.masks_in_order();
+        while let Some(key) = l.console_pending.pop() {
+            l.mask(key);
+        }
         let cond = l.paths()?;
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
@@ -520,6 +550,9 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`structure_console`].
+    console: bool,
+    console_pending: Vec<Key>,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -576,7 +609,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -601,6 +634,8 @@ impl<'a> Lanes<'a> {
         }
         let mut l = Lanes {
             p,
+            console,
+            console_pending: Vec::new(),
             order,
             index,
             incoming,
@@ -880,7 +915,6 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -891,6 +925,15 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            execs: execs.to_vec(),
+            pairs: self
+                .masks
+                .keys()
+                .chain(self.other.keys())
+                .filter(|(lo, hi)| lo != hi)
+                .copied()
+                .collect(),
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             reach: cond.to_vec(),
         })
     }
@@ -927,6 +970,19 @@ impl<'a> Lanes<'a> {
         }
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
+        }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words
+        // still come from the same known mask, in their original order.
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
         }
         let p = self.p;
         let restored = (
@@ -970,6 +1026,21 @@ impl<'a> Lanes<'a> {
         (m, derived)
     }
 
+    /// The value `value` was copied from through a chain of `s_mov_b32`.
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
+    }
+
     /// A mask joined by phis at a block entry, and whether a mask coming in
     /// on a forward edge derives from EXEC or a VALU result. Where every
     /// lane arriving so far has the incoming mask set (or clear), the join
@@ -1008,7 +1079,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -1026,6 +1097,9 @@ impl<'a> Lanes<'a> {
                     return Some((m, derived));
                 }
             }
+        }
+        if self.console {
+            self.console_pending.extend(args);
         }
         let born = self.index[block];
         Some((self.b.atom(Atom::Phi(id), born), derived))
@@ -1576,6 +1650,32 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
+    }
+
+    #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
     }
 
     #[test]

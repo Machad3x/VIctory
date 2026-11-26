@@ -178,8 +178,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). Grand Theft Auto
-        // VI keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB). The
+        // title keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -242,6 +242,61 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The uses the host device supports for a format.
+#[cfg(windows)]
+pub(crate) fn format_support(format: u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, D3D12_FORMAT_SUPPORT1)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, flags)) = known.iter().find(|(f, _)| *f == format) {
+        return flags;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = crate::host::host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+    });
+    let flags = if ok { support.Support1 } else { D3D12_FORMAT_SUPPORT1_NONE };
+    known.push((format, flags));
+    flags
+}
+
+/// Packed colour targets use RGBA8 when the device lacks either writable use.
+#[cfg(windows)]
+pub(crate) fn target_format(format: u32) -> u32 {
+    packed_target_format(format, format_support)
+}
+
+#[cfg(windows)]
+fn packed_target_format(
+    format: u32,
+    support: impl FnOnce(u32) -> windows::Win32::Graphics::Direct3D12::D3D12_FORMAT_SUPPORT1,
+) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let both = D3D12_FORMAT_SUPPORT1_RENDER_TARGET | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+    if matches!(format, 86 | 115) && !support(format).contains(both) {
+        28
+    } else {
+        format
+    }
+}
+
+/// Whether the host texture contains expanded texels for this packed format.
+fn stand_in_format(guest: u32, host: u32) -> bool {
+    matches!(guest, 86 | 115) && host == 28
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -285,11 +340,17 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    (format != own && !stand_in_format(own, format)).then_some(own)
+}
+
+/// The packed format of a live expanded texture.
+#[cfg(windows)]
+pub(crate) fn packed_format(this: This) -> Option<u32> {
+    made_copy(this)?.packed()
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -601,7 +662,7 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
+/// memory themselves (the title places its back buffers in a
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
@@ -797,6 +858,19 @@ struct Resource {
 /// One per texture memory (decision 0007, "One host texture per texture
 /// memory"): title textures at the same address with the same shape and
 /// element size share it, each viewing it in its own format.
+/// High bit of [`HostTexture::pending_host_writes`]: claimed by `give_up`
+/// during eviction so concurrent `prepare_host_write` callers detach and
+/// recreate the host texture rather than pinning an evicted copy.
+#[cfg(windows)]
+pub(crate) const EVICTED: usize = 1 << (usize::BITS - 1);
+
+/// Sticky bit of [`HostTexture::pending_host_writes`]: set when a deferred
+/// `host_writes` mark commits, preventing `pending_host_writes` from ever
+/// returning to zero so `give_up`'s CAS cannot transiently claim a
+/// `host_written` texture.
+#[cfg(windows)]
+pub(crate) const HOST_WRITTEN: usize = 1 << (usize::BITS - 2);
+
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -807,6 +881,9 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// Recorded lists holding a pending `host_writes` mark not yet retired
+    /// (dropped on list reset/drop after `host_written` is stored on run).
+    pub(crate) pending_host_writes: std::sync::atomic::AtomicUsize,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -830,6 +907,13 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    /// The guest format when this texture holds expanded RGBA8 texels.
+    pub(crate) fn packed(&self) -> Option<u32> {
+        let format = self.key?.packed?;
+        // SAFETY: a live texture.
+        (unsafe { self.texture.GetDesc() }.Format.0 == 28).then_some(format)
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -847,6 +931,7 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            pending_host_writes: 0.into(),
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -1091,6 +1176,20 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.lock().unwrap_or_else(|e| e.into_inner()).clone().flatten()
 }
 
+/// Detaches `copy` from `this` if `this` still holds it (used when a
+/// concurrent `give_up` claimed `copy` with [`EVICTED`] before clearing
+/// `resource(this).host`).
+#[cfg(windows)]
+pub(crate) fn detach_if_same(this: This, copy: &std::sync::Arc<HostTexture>) {
+    if this.is_null() {
+        return;
+    }
+    let mut h = resource(this).host.lock().unwrap_or_else(|e| e.into_inner());
+    if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, copy)) {
+        *h = None;
+    }
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -1113,13 +1212,16 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     d.alignment = 0;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps and material depth ask
+    // allows both; the title's shadow maps and material depth ask
     // for it): unordered views of such a texture write its twin
     // (`crate::twin`).
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    if d.flags & (TARGET | UNORDERED) != 0 {
+        d.format = target_format(d.format);
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1134,6 +1236,8 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
+#[cfg(windows)]
+const TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -1157,6 +1261,8 @@ pub(crate) struct MemoryKey {
     swizzle: u32,
     element: (u64, u64),
     depth: bool,
+    #[cfg(windows)]
+    packed: Option<u32>,
 }
 
 /// The texture memory `desc` describes at `address`; `None` for buffers
@@ -1176,6 +1282,9 @@ pub(crate) fn memory_key(address: u64, desc: &ResourceDesc) -> Option<MemoryKey>
         swizzle: texture_layout(desc).map_or(desc.layout, |t| t.planes[0].layout.desc.swizzle.0),
         element: element(desc.format)?,
         depth: desc.flags & DEPTH != 0,
+        // A read-only alias can inherit writable uses later.
+        #[cfg(windows)]
+        packed: (target_format(desc.format) != desc.format).then_some(desc.format),
     })
 }
 
@@ -1217,7 +1326,9 @@ fn shared_texture(
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
-    let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let live = key
+        .and_then(|k| map.get(&k)?.upgrade())
+        .filter(|t| t.pending_host_writes.load(std::sync::atomic::Ordering::Acquire) & EVICTED == 0);
     if let Some(t) = &live
         && takes(t, &d)
     {
@@ -1246,6 +1357,10 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
+    // A read-only alias can acquire writable uses from another title texture.
+    if d.flags & (TARGET | UNORDERED) != 0 {
+        d.format = target_format(d.format);
+    }
     let mut t = make_texture(&d, state, clear)?;
     t.key = key;
     let t = std::sync::Arc::new(t);
@@ -1273,6 +1388,7 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
+            || (stand_in_format(d.format, own) && target_format(d.format) == own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
 }
 
@@ -1306,6 +1422,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        if stand_in_format(value[0], d.format) {
+            value[0] = d.format;
+        }
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -1578,7 +1697,11 @@ fn remade(k: &MemoryKey) {
 /// or resolve wrote it), so a texture made again has them back.
 #[cfg(windows)]
 fn evictable(t: &HostTexture) -> bool {
-    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+    use std::sync::atomic::Ordering::Acquire;
+    t.key.is_some()
+        && crate::texture::title_written(&t.texture)
+        && t.pending_host_writes.load(Acquire) == 0
+        && !t.host_written.load(Acquire)
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a
@@ -1685,13 +1808,33 @@ fn choose(uses: &[(u64, u64, u64)], frame: u64, now: u64, over: u64) -> Vec<usiz
 /// gives up only textures unused for a while, or the least recently used.
 #[cfg(windows)]
 fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
     if gone.is_empty() {
+        return (0, 0);
+    }
+    let mut claimed: Vec<&Owned> = Vec::with_capacity(gone.len());
+    for entry in gone {
+        let t = &entry.0;
+        if !crate::texture::title_written(&t.texture) || t.host_written.load(Acquire) {
+            continue;
+        }
+        if t.pending_host_writes
+            .compare_exchange(0, EVICTED, AcqRel, Acquire)
+            .is_err()
+        {
+            continue;
+        }
+        claimed.push(entry);
+    }
+    if claimed.is_empty() {
         return (0, 0);
     }
     {
         use windows::core::Interface;
-        let raws = gone.iter().map(|(t, _)| t.texture.as_raw() as usize).collect();
+        let raws = claimed
+            .iter()
+            .map(|(t, _)| t.texture.as_raw() as usize)
+            .collect();
         crate::descriptor::evict(&raws);
     }
     let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1699,8 +1842,8 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
     let mut given = GIVEN_UP.lock().unwrap_or_else(|e| e.into_inner());
     let given = given.get_or_insert_with(Default::default);
     given.retain(|_, &mut f| frame.saturating_sub(f) <= SOON_FRAMES);
-    let bytes = gone.iter().map(|(t, _)| t.bytes).sum();
-    for (t, owners) in gone {
+    let bytes = claimed.iter().map(|(t, _)| t.bytes).sum();
+    for (t, owners) in &claimed {
         for &r in owners.iter().filter(|r| live.contains(r)) {
             let mut h = resource(r as This).host.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(&*h, Some(Some(x)) if std::sync::Arc::ptr_eq(x, t)) {
@@ -1711,9 +1854,15 @@ fn give_up(gone: &[Owned], frame: u64) -> (u64, u64) {
             given.insert(k, frame);
         }
     }
-    EVICTIONS[0].fetch_add(gone.len() as u64, Relaxed);
+    EVICTIONS[0].fetch_add(claimed.len() as u64, Relaxed);
     EVICTIONS[1].fetch_add(bytes, Relaxed);
-    (gone.len() as u64, bytes)
+    (claimed.len() as u64, bytes)
+}
+
+/// Runs [`give_up`] on a pre-collected candidate snapshot (tests).
+#[cfg(all(windows, test))]
+pub(crate) fn give_up_snapshot(gone: &[Owned]) -> (u64, u64) {
+    give_up(gone, crate::queue::presented())
 }
 
 /// Gives up `this`'s host texture as [`evict`] would (tests); false if it
@@ -1762,7 +1911,12 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        const ALLOW_UNORDERED_ACCESS: u32 = 0x4;
+        if desc.flags & ALLOW_UNORDERED_ACCESS == 0 {
+            crate::shadow::register_read_only(at, resource.data() as u64, desc.width);
+        } else {
+            crate::shadow::register(at, resource.data() as u64, desc.width);
+        }
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1791,7 +1945,7 @@ static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>
 #[cfg(windows)]
 pub(crate) fn alias_source(placed: This) -> Option<This> {
     const WRITTEN: u32 = 0x7; // render target, depth, unordered access
-    // A shader view of no resource (a null view) has no memory.
+    // A null view names no resource.
     if placed.is_null() {
         return None;
     }
@@ -1803,17 +1957,22 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
         let rows = u64::from(d.height).div_ceil(block);
         Some((d.dimension, d.width.div_ceil(block) * size, rows, d.depth_or_array_size, d.sample_count, swizzle))
     };
-    let want = bytes(&b.desc)?;
-    map.get(&(b.data() as u64))?
+    // Asked for every placed view a draw reads: the cheap tests first, the
+    // layouts (a mip chain each) only for textures the GPU writes there.
+    let mut written = map
+        .get(&(b.data() as u64))?
         .iter()
         .map(|&r| r as This)
-        .filter(|&r| r != placed)
-        .find(|&r| {
+        .filter(|&r| {
             let a = resource(r);
-            a.desc.flags & WRITTEN != 0
-                && bytes(&a.desc) == Some(want)
+            r != placed
+                && a.desc.flags & WRITTEN != 0
                 && matches!((made(a), made(b)), (Some(x), Some(y)) if !std::sync::Arc::ptr_eq(&x, &y))
         })
+        .peekable();
+    written.peek()?;
+    let want = bytes(&b.desc)?;
+    written.find(|&r| bytes(&resource(r).desc) == Some(want))
 }
 
 #[cfg(windows)]
@@ -1900,7 +2059,7 @@ pub(crate) extern "system" fn create_committed(
     )
 }
 
-/// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
+/// Device method 0x3f8, inferred from the title's calls
 /// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
 /// committed resource creation of the enhanced-barrier interfaces,
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
@@ -1963,7 +2122,7 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 }
 
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
-/// additions. From Grand Theft Auto VI's call: a resource at a virtual
+/// additions. From the title's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
 /// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
@@ -2013,7 +2172,7 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
+/// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
 /// shortcut: never released (one host texture per distinct address and
@@ -2292,6 +2451,56 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_targets_require_both_writable_uses() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET;
+        let uav = D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW;
+        for format in [86, 115] {
+            for support in [D3D12_FORMAT_SUPPORT1_NONE, rt, uav] {
+                assert_eq!(packed_target_format(format, |_| support), 28);
+            }
+            assert_eq!(packed_target_format(format, |_| rt | uav), format);
+        }
+        for format in [28, 85, 87] {
+            assert_eq!(packed_target_format(format, |_| unreachable!()), format);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_textures_keep_the_guest_layout_until_writable() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        for format in [86, 115] {
+            let guest = texture(16, 16, format, 1);
+            assert_eq!(host_desc(&guest).unwrap().format, format);
+            for flags in [TARGET, UNORDERED, TARGET | UNORDERED] {
+                let d = host_desc(&ResourceDesc { flags, ..guest }).unwrap();
+                assert_eq!(d.format, target_format(format));
+                let clear = [format, 0, 0, 0, 0];
+                let clear = if flags & TARGET != 0 { clear.as_ptr().cast() } else { std::ptr::null() };
+                let host = make_texture(&d, 0, clear).expect("a writable host texture");
+                // SAFETY: a live texture.
+                let made = unsafe { host.texture.GetDesc() };
+                assert_eq!(made.Format.0 as u32, d.format);
+                assert_eq!(made.Flags.0 as u32 & flags, flags);
+            }
+        }
+    }
+
+    #[test]
+    fn only_expanded_packed_texels_use_the_stand_in() {
+        for format in [86, 115] {
+            assert!(stand_in_format(format, 28));
+            assert!(!stand_in_format(format, format));
+        }
+        assert!(!stand_in_format(28, 28));
+        assert!(!stand_in_format(29, 27));
+    }
 
     #[cfg(windows)]
     #[test]
@@ -2577,7 +2786,7 @@ mod tests {
         slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
         assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
 
-        // 0x428: a buffer over memory the title owns, as GTA VI asks.
+        // 0x428: a buffer over memory the title owns, as the title asks.
         type At = extern "system" fn(
             This,
             u64,
@@ -3021,7 +3230,7 @@ mod tests {
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
     }
 
-    /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
+    /// Two queues, as the title's: a compute list copies a buffer,
     /// then waits for a value a graphics list writes at its end, then reads
     /// back the texture that graphics list fills. Submitted first, its first
     /// part runs at once and the rest waits for the graphics list, then

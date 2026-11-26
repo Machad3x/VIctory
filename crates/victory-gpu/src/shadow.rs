@@ -17,51 +17,13 @@
 //! (`crate::bindless`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
-
-fn merge_writeback(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
-    let mut changed = 0;
-    for ((title_byte, host_byte), old_byte) in title.iter_mut().zip(host).zip(old) {
-        let mask = 0u8.wrapping_sub(u8::from(*host_byte != *old_byte));
-        let delta = (*title_byte ^ *host_byte) & mask;
-        *title_byte ^= delta;
-        *host_byte = *title_byte;
-        changed |= delta;
-    }
-    changed != 0
-}
-
-#[test]
-fn writeback_merge_matches_bytewise_oracle() {
-    for len in [0, 1, 63, 64, 65, 193, 65_536] {
-        let old = vec![0x11; len];
-        for stride in [1, 5, 67, len + 1] {
-            let mut title = old.clone();
-            let mut host = old.clone();
-            for index in (0..len).step_by(3) {
-                title[index] = 0x22;
-            }
-            for index in (0..len).step_by(stride) {
-                host[index] = if index % 2 == 0 { 0x22 } else { 0x33 };
-            }
-            let expected: Vec<_> = host
-                .iter()
-                .zip(&old)
-                .zip(&title)
-                .map(|((&gpu, &previous), &cpu)| if gpu == previous { cpu } else { gpu })
-                .collect();
-            let changed = expected != title;
-            assert_eq!(merge_writeback(&mut title, &mut host, &old), changed);
-            assert_eq!(title, expected);
-            assert_eq!(host, expected);
-        }
-    }
-}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -76,7 +38,7 @@ pub(crate) struct Shadow {
     tracked: Option<crate::watch::Tracked>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
-    pending: Mutex<std::collections::HashSet<(usize, usize)>>,
+    pending: Mutex<crate::fx::Set<(usize, usize)>>,
     /// The copy's bytes before the submission ran where its shaders write:
     /// what the GPU wrote differs. Disjoint segments (offset, bytes) in
     /// order, and the 64 KiB pieces (by title address) already compared.
@@ -90,10 +52,34 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// In a GPU upload heap ([`register_read_only`]): the CPU must not read
+    /// it back.
+    pub(crate) upload: std::sync::atomic::AtomicBool,
+    /// A copy shaders may write, in a GPU upload heap (`buffer`, `gpu`), with
+    /// `data` its mirror in system memory, where the CPU reads and writes:
+    /// what the CPU writes goes on into video memory ([`Shadow::push`]), what
+    /// the GPU wrote comes back before the CPU reads it ([`pull`]).
+    vram: Option<Vram>,
+}
+
+/// The video memory side of a mirrored copy.
+struct Vram {
+    /// The mirror's buffer (system memory), where [`pull`] copies to.
+    mirror: ID3D12Resource,
+    /// The copy in video memory, mapped (written, never read).
+    data: *mut u8,
+    /// A bit per [`PAGE`] of the copy (by offset) whose mirror is behind
+    /// video memory: refreshes write video memory only, and the mirror
+    /// catches up when the CPU reads it ([`Shadow::freshen`]).
+    stale: Mutex<Vec<u64>>,
+    /// Offsets (whole pages, sorted, apart) a submission takes snapshots of
+    /// ([`snapshots_ahead`]): refreshes there write the mirror too, so that
+    /// the snapshots need no copy back from video memory.
+    ahead: Mutex<Vec<(usize, usize)>>,
 }
 
 /// Snapshot segments (offset, bytes) and the pieces compared.
-type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
+type Snapshot = (Vec<(usize, Vec<u8>)>, crate::fx::Set<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -132,6 +118,102 @@ fn give_back(v: Vec<u8>) {
 /// Snapshot memory kept for reuse.
 const POOL_BYTES: usize = 512 << 20;
 
+/// The runs `[start, end)` of bytes where the copy differs from title
+/// memory (`host`, `title`: the same bytes of each) and `gpu(i)` says the
+/// GPU wrote byte `i`: what a copy-back puts into title memory.
+///
+/// Equal stretches (most of a page) are skipped a block at a time, then a
+/// line at a time inside a block that differs: one comparison per 8 bytes
+/// cost ~30 us per 64 KiB page, ~70 ms per world frame of marked pages.
+fn differing(host: &[u8], title: &[u8], gpu: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    const BLOCK: usize = 1 << 10;
+    const LINE: usize = 32;
+    let n = host.len().min(title.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut block = 0;
+    while block < n {
+        let block_end = (block + BLOCK).min(n);
+        if host[block..block_end] != title[block..block_end] {
+            let mut line = block;
+            while line < block_end {
+                let line_end = (line + LINE).min(block_end);
+                if host[line..line_end] != title[line..line_end] {
+                    for i in line..line_end {
+                        if host[i] != title[i] && gpu(i) {
+                            match runs.last_mut() {
+                                Some((_, end)) if *end == i => *end = i + 1,
+                                _ => runs.push((i, i + 1)),
+                            }
+                        }
+                    }
+                }
+                line = line_end;
+            }
+        }
+        block = block_end;
+    }
+    runs
+}
+
+/// Runs of a copy-back closer than this go into title memory as one span,
+/// with title memory's bytes between them as the copy-back read them: a
+/// kernel copy per run cost over 1 ms per page in the world, where shaders
+/// change many scattered words of a page.
+const SPAN_GAP: usize = 256;
+
+/// Writes the runs `[start, end)` of `merged` (title memory as read, with
+/// the shaders' bytes in the runs) into title memory at `at`, and nothing
+/// far from them: the title's threads write the same pages while a
+/// copy-back runs, and a byte they wrote after the copy-back read the page
+/// must stay. (Putting back the whole page undid those writes.) True if a
+/// run was written.
+fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
+    if runs.is_empty() {
+        return false;
+    }
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
+    for &(start, end) in runs {
+        match spans.last_mut() {
+            Some((_, last)) if start - *last < SPAN_GAP => *last = end,
+            _ => spans.push((start, end)),
+        }
+    }
+    let _writing = crate::watch::writing(at, merged.len());
+    for (start, end) in spans {
+        crate::host::write_mapped((at + start) as *mut u8, merged[start..].as_ptr(), end - start);
+    }
+    true
+}
+
+/// Outside `runs`, the copy takes title memory's bytes (`title`, read at the
+/// copy-back).
+fn take_others(host: &mut [u8], title: &[u8], runs: &[(usize, usize)]) {
+    let mut at = 0;
+    for &(start, end) in runs {
+        host[at..start].copy_from_slice(&title[at..start]);
+        at = end;
+    }
+    host[at..].copy_from_slice(&title[at..]);
+}
+
+/// After a copy-back: the page at `page` is taken, then the copy's bytes
+/// `host` (from title address `from`) are read from title memory again. The
+/// title writes the page while it goes back, so bytes read before the guard
+/// is back may be old: a title write that lands before the guard is in this
+/// read, and one after it faults and marks the page changed. (Taking the
+/// page with the bytes read earlier lost such writes from the copy, and a
+/// later copy-back of the page put the copy's older bytes over them.)
+fn take_and_read(t: &crate::watch::Tracked, page: usize, from: usize, host: &mut [u8]) {
+    t.taken(&[page / PAGE]);
+    crate::host::read_into(from as *const u8, host);
+}
+
+thread_local! {
+    /// Title memory as a copy-back reads it, a page at most: a fresh zeroed
+    /// buffer cost a page's memset per page, thousands per world frame.
+    static TITLE: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; PAGE]);
+}
+
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
@@ -154,6 +236,7 @@ impl Shadow {
     pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
         let at = (address - self.start) as usize;
         assert!(at + 4 * n <= self.len as usize);
+        self.freshen(at, at + 4 * n);
         // SAFETY: inside the mapping (checked); the GPU is done with it.
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
     }
@@ -166,6 +249,34 @@ impl Shadow {
         assert!(at + bytes.len() <= self.len as usize);
         // SAFETY: inside the mapping (checked).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+        // As written on the GPU and pulled back.
+        self.push(at, bytes.len());
+    }
+
+    /// Whether it is in video memory with a mirror ([`Shadow::push`]).
+    #[cfg(test)]
+    pub(crate) fn mirrored(&self) -> bool {
+        self.vram.is_some()
+    }
+
+    /// The pages (by index in the copy) its mirror is behind on.
+    #[cfg(test)]
+    fn stale_pages(&self) -> Vec<usize> {
+        self.stale_runs(0, self.len as usize)
+            .into_iter()
+            .flat_map(|(_, at, n)| at / PAGE..(at + n).div_ceil(PAGE))
+            .collect()
+    }
+
+    /// The CPU wrote `[at, at + len)` (offsets) of the mirror: the same
+    /// bytes into the copy in video memory.
+    fn push(&self, at: usize, len: usize) {
+        if let Some(v) = &self.vram {
+            let len = len.min((self.len as usize).saturating_sub(at));
+            // SAFETY: inside both mappings (cut to the copy); the mirror is
+            // system memory, the video memory is only written.
+            unsafe { std::ptr::copy_nonoverlapping(self.data.add(at), v.data.add(at), len) };
+        }
     }
 
     /// Up to 64 bytes of the copy at title address `address`, as floats, and
@@ -174,6 +285,7 @@ impl Shadow {
     pub(crate) fn peek(&self, address: u64, len: u64) -> String {
         let at = address.saturating_sub(self.start) as usize;
         let n = (len.min(64) as usize).min((self.len as usize).saturating_sub(at)) / 4;
+        self.freshen(at, at + 4 * n);
         // SAFETY: inside the mapping (checked); a racing GPU write only makes
         // the logged value stale.
         let v = unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<f32>(), n) };
@@ -218,22 +330,79 @@ impl Shadow {
             });
             return 0;
         }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
+        self.freshen(from - start, to - start);
+        // A title write while the page is read saves its bytes from before.
+        if let Some(t) = &self.tracked {
+            t.arm(from, to);
+        }
+        if !self.put_back(page, from, to, None) {
             return 0;
         }
-        {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
-        }
-        // Our write is not the title's: the copy holds the page as it is.
+        // Our write is not the title's: the copy takes the page as it is.
         if let Some(t) = &self.tracked {
-            t.taken(&[page / PAGE]);
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host =
+                unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            take_and_read(t, page, from, host);
+            self.push(from - start, to - from);
         }
-        n
+        to - from
+    }
+
+    /// The copy-back of `[from, to)` in the page at `page`: the bytes the
+    /// shaders changed go into title memory, and no others (the title's
+    /// threads write the page meanwhile: a whole page put back undid their
+    /// writes since it was read), and the copy takes the title's others.
+    /// What the shaders changed differs from the copy's bytes before the
+    /// submission: `saved`, or what the page held when a title write landed
+    /// while it was read (saved by the guard while the page is armed), else
+    /// title memory. True if bytes were written.
+    fn put_back(&self, page: usize, from: usize, to: usize, saved: Option<Box<[u8]>>) -> bool {
+        TITLE.with(|title| self.put_back_with(page, from, to, saved, &mut title.borrow_mut()))
+    }
+
+    fn put_back_with(
+        &self,
+        page: usize,
+        from: usize,
+        to: usize,
+        saved: Option<Box<[u8]>>,
+        title: &mut [u8],
+    ) -> bool {
+        let n = to - from;
+        // SAFETY: inside the mapping; only the submitting thread writes it.
+        let host =
+            unsafe { std::slice::from_raw_parts_mut(self.data.add(from - self.start as usize), n) };
+        let title = &mut title[..n];
+        let read = crate::host::read_into(from as *const u8, title);
+        #[cfg(test)]
+        tests::after_read();
+        // Our own write below must not save the page for this copy again.
+        let saved = match &self.tracked {
+            Some(t) => {
+                t.unarm(page / PAGE);
+                saved.or_else(|| t.saved(page / PAGE))
+            }
+            None => saved,
+        };
+        if !read {
+            return false;
+        }
+        let runs = match &saved {
+            None => differing(host, title, |_| true),
+            Some(before) => {
+                let before = &before[from - page..to - page];
+                differing(host, title, |i| host[i] != before[i])
+            }
+        };
+        // The copy takes the title's other bytes, and holds what goes back.
+        // Without bytes saved, the runs are every byte that differs: the
+        // others are the title's already (copying them cost a 64 KiB write
+        // per page).
+        if saved.is_some() {
+            take_others(host, title, &runs);
+        }
+        write_runs(from, host, &runs)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -244,12 +413,21 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
-        Shadow::new_at(buffer, data, gpu, start, len, None)
+        Shadow::new_at(buffer, data, gpu, start, len, None, None)
     }
 
     /// [`Shadow::new`] of a copy in a run of a shared buffer (`data` and
-    /// `gpu` are the run's).
-    fn new_at(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64, slice: Option<Slice>) -> Arc<Shadow> {
+    /// `gpu` are the run's), or of one in video memory with `data` its
+    /// mirror (`vram`).
+    fn new_at(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        slice: Option<Slice>,
+        vram: Option<Vram>,
+    ) -> Arc<Shadow> {
         let tracked = crate::watch::track_copy(start as usize, len as usize, true);
         let marks = tracked.as_ref().and_then(|_| marks().take(pages(start, len)));
         let shadow = Arc::new(Shadow {
@@ -264,6 +442,8 @@ impl Shadow {
             marks,
             base: slice.map_or(0, |s| s.offset),
             slice,
+            upload: std::sync::atomic::AtomicBool::new(false),
+            vram,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -308,6 +488,18 @@ impl Shadow {
     /// views (`victory_shader::emit`, "Write marks"): no snapshot then, only
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if self.upload.load(std::sync::atomic::Ordering::Relaxed) {
+            // A view of the memory that writes (through another resource,
+            // or a placed view) found this read-only buffer's copy: right,
+            // but its copy-back reads video memory at ~50 MB/s.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    start = format_args!("{:#x}", self.start),
+                    "shaders write the copy of a buffer made without unordered access, in upload memory: slow copy-back"
+                );
+            });
+        }
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
@@ -336,6 +528,7 @@ impl Shadow {
         if from >= to {
             return;
         }
+        self.freshen(from, to);
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -416,6 +609,9 @@ impl Shadow {
             && from < to
         {
             let before = &before[from - taken..to - taken];
+            // The mirror is read below (with snapshots ahead, its pages are
+            // current already).
+            self.freshen(from, to);
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
             // By 64 KiB piece: the copy compared with its bytes before the
@@ -441,14 +637,17 @@ impl Shadow {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    if merge_writeback(title, host, old) {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    // The GPU's bytes go into title memory, and no others:
+                    // the title writes the piece meanwhile.
+                    let runs = differing(host, title, |i| host[i] != old[i]);
+                    // The copy takes the title's bytes in turn.
+                    take_others(host, title, &runs);
+                    if write_runs(start + at, host, &runs) {
                         written += n;
                     }
-                    synced.push((start + at) / PAGE);
+                    // The copy took the title's bytes: so does video memory.
+                    self.push(at, n);
+                    synced.push((start + at, n));
                 }
                 at += n;
             }
@@ -457,8 +656,16 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if let Some(t) = &self.tracked {
-                let whole: Vec<usize> = synced.into_iter().filter(|p| (first..last).contains(p)).collect();
-                t.taken(&whole);
+                for (address, n) in synced {
+                    if (first..last).contains(&(address / PAGE)) {
+                        // SAFETY: inside the mapping, as above.
+                        let host = unsafe {
+                            std::slice::from_raw_parts_mut(self.data.add(address - start), n)
+                        };
+                        take_and_read(t, address, address, host);
+                        self.push(address - start, n);
+                    }
+                }
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -497,39 +704,32 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        // Our own write below must not save the page for this copy again.
-        t.unarm(page / PAGE);
+        self.freshen(from - start, to - start);
         let saved = t.saved(page / PAGE);
         if saved.is_none() && t.changed(page / PAGE) {
+            t.unarm(page / PAGE);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::MarkedKept, 1);
             return 0;
         }
-        let n = to - from;
-        // SAFETY: inside the mapping; only the submitting thread writes it.
-        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                merge_writeback(&mut title, host, before).then_some(title.as_ptr())
-            }
-        };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
+        // A title write while the page is read saves its bytes from before.
+        t.arm(from, to);
+        let written = self.put_back(page, from, to, saved);
+        // The copy took the title's bytes: so does video memory.
+        self.push(from - start, to - from);
         // Equal to title memory now: taken, unless it holds the page in part.
-        if from == page && to == page + PAGE {
-            t.taken(&[page / PAGE]);
+        // A page neither we nor the title wrote meanwhile (a title write
+        // marks it changed) is still taken and guarded, and the copy has
+        // title memory's bytes: nothing to read again. (A third of the
+        // world's marked pages hold no changed byte.)
+        if from == page && to == page + PAGE && (written || t.changed(page / PAGE)) {
+            // SAFETY: inside the mapping; only the submitting thread writes it.
+            let host =
+                unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            take_and_read(t, page, from, host);
+            self.push(from - start, to - from);
         }
-        written.map_or(0, |_| n)
+        if written { to - from } else { 0 }
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -564,10 +764,11 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
-        if self.tracked.is_some() {
-            return self.update_tracked(from, to, !busy.is_empty());
-        }
-        if !busy.is_empty() {
+        // Tracked memory takes the range in one call, so that a page wholly
+        // in it is guarded even where shaders write part of it (split at
+        // those ranges it stayed changed, and `copy_back_marked` dropped
+        // what they wrote, #2172).
+        if self.tracked.is_none() && !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame). Under them nothing: what the
@@ -577,24 +778,47 @@ impl Shadow {
             for (a, e) in busy {
                 let (a, e) = (a.max(from), e.min(to));
                 if a > at {
-                    bytes += self.update_untracked(at, a);
+                    bytes += self.update_free(at, a, false);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_untracked(at, to);
+                bytes += self.update_free(at, to, false);
             }
             return bytes;
         }
-        self.update_untracked(from, to)
+        self.update_free(from, to, !busy.is_empty())
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
-    /// memory is tracked: the pages the title wrote since they were taken,
-    /// in one [`crate::watch::Tracked::take`], so that a page wholly in the
-    /// range is guarded even where shaders write part of it (split at those
-    /// ranges it stayed changed, and [`Shadow::copy_back_marked`] dropped
-    /// what they wrote).
+    /// A refresh of `[from, to)` (inside the buffer) where shaders may
+    /// write: the snapshots over it take the copied bytes at once; with none
+    /// there (marked ranges keep none) the copy may be queued.
+    fn copy_under_writes(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
+        let (a, b) = (from - start, to - start);
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if !before.0.iter().any(|(at, bytes)| *at < b && a < *at + bytes.len()) {
+            return self.copy_queued(from, to);
+        }
+        let copied = self.copy(from, to);
+        for (at, bytes) in before.0.iter_mut() {
+            let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+            if s < e {
+                // The mirror too (with no snapshot ahead, a refresh wrote
+                // video memory only).
+                if self.vram.is_some() {
+                    self.copy_both(s, e);
+                }
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                bytes[s - *at..e - *at].copy_from_slice(host);
+            }
+        }
+        copied
+    }
+
+    /// [`Shadow::update`] of `[from, to)` (inside the buffer): the pages
+    /// changed since taken, or all of it where the memory is not tracked.
     ///
     /// `busy`: a list submitted earlier declared that shaders write in the
     /// range. A submission waits for the one before it, so none of this
@@ -604,69 +828,61 @@ impl Shadow {
     /// and looped until the device was removed). The same bytes go into the
     /// snapshot `writing` took, so copy-back neither takes them for the
     /// GPU's nor puts them back over a later title write.
-    fn update_tracked(&self, from: usize, to: usize, busy: bool) -> usize {
-        let Some(t) = &self.tracked else {
-            return 0;
-        };
-        #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
-        let (runs, unmapped) = t.take_split(from, to);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
-        let start = self.start as usize;
-        let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut sync_before = |a: usize, b: usize| {
-            let Some(before) = &mut before else { return };
-            let (a, b) = (a - start, b - start);
-            for (at, bytes) in before.0.iter_mut() {
-                let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
-                if s < e {
-                    // SAFETY: inside the mapping.
-                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
-                    bytes[s - *at..e - *at].copy_from_slice(host);
-                }
-            }
-        };
-        let mut copied = 0;
-        for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
-        }
-        for (a, b) in unmapped {
-            // SAFETY: inside the mapping (`take_split` cuts to the buffer).
-            unsafe { self.data.add(a - start).write_bytes(0, b - a) };
-            sync_before(a, b);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
-        }
-        // Parts on memory that is not the runtime's: whole, as below.
-        for (a, b) in t.untracked(from, to) {
+    fn update_free(&self, from: usize, to: usize, busy: bool) -> usize {
+        if let Some(t) = &self.tracked {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            let (runs, unmapped) = t.take_split(from, to);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
+            // Cut to the range: next to it shaders may be writing the copy.
+            let mut copied: usize = runs
+                .into_iter()
+                .map(|(a, b)| if busy { self.copy_under_writes(a, b) } else { self.copy_queued(a, b) })
+                .sum();
+            for (a, b) in unmapped {
+                // SAFETY: inside the mapping (`take_split` cuts to the buffer).
+                unsafe { self.data.add(a - self.start as usize).write_bytes(0, b - a) };
+                // Saved bytes of armed pages take the zeros too.
+                // SAFETY: the bytes just zeroed.
+                t.refreshed(a, unsafe { std::slice::from_raw_parts(self.data.add(a - self.start as usize), b - a) });
+                self.push(a - self.start as usize, b - a);
+                if busy {
+                    let (a, b) = (a - self.start as usize, b - self.start as usize);
+                    for (at, bytes) in self.before.lock().unwrap_or_else(|e| e.into_inner()).0.iter_mut() {
+                        let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+                        if s < e {
+                            bytes[s - *at..e - *at].fill(0);
+                        }
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
+            }
+            // Parts on memory that is not the runtime's: whole, as below.
+            for (a, b) in t.untracked(from, to) {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                copied += self.copy_queued(a, b);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::WholeBytes, (b - a) as u64);
+                    add(C::WholeUs, started.elapsed().as_micros() as u64);
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
-                add(C::WholeBytes, (b - a) as u64);
-                add(C::WholeUs, started.elapsed().as_micros() as u64);
+                add(C::Watches, 1);
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
             }
+            return copied;
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::Checked, (to - from) as u64);
-            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-        }
-        copied
-    }
-
-    /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
-    fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy_queued(from, to);
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -676,18 +892,137 @@ impl Shadow {
         to - from
     }
 
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// As [`Shadow::copy`], queued where the caller collects a
+    /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
+    /// nothing reads back before they are made. A mirrored copy, and a
+    /// range with bytes saved for a copy-back, are copied at once.
+    fn copy_queued(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        if self.vram.is_some() || self.tracked.as_ref().is_some_and(|t| t.has_saved(from, to)) {
+            return self.copy(from, to);
+        }
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let at = unsafe { self.data.add(from - start) };
+        crate::copy_pool::copy(at, from as *const u8, to - from);
+        to - from
+    }
+
+    /// Copies title memory `[from, to)`, cut to the buffer, into the copy:
+    /// into video memory alone for a mirrored copy, whose mirror catches up
+    /// when the CPU reads it ([`Shadow::freshen`]; writing it too cost a
+    /// second copy of everything refreshed).
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if from >= to {
+            return 0;
+        }
+        // A range with bytes saved for a copy-back goes through the mirror,
+        // which brings them up to date.
+        if let Some(v) = &self.vram
+            && !self.tracked.as_ref().is_some_and(|t| t.has_saved(from, to))
+        {
+            let (a, b) = (from - start, to - start);
+            let ahead = v.ahead.lock().unwrap_or_else(|e| e.into_inner());
+            let mut at = a;
+            for &(s, e) in ahead.iter() {
+                if e <= at {
+                    continue;
+                }
+                if s >= b {
+                    break;
+                }
+                if at < s {
+                    self.copy_video(v, at, s);
+                }
+                let e = e.min(b);
+                self.copy_both(at.max(s), e);
+                at = e;
+            }
+            if at < b {
+                self.copy_video(v, at, b);
+            }
+            return to - from;
+        }
+        self.copy_both(from - start, to - start);
+        to - from
+    }
+
+    /// Title memory at offsets `[from, to)` into the copy in video memory
+    /// only: the mirror is behind there until [`Shadow::freshen`].
+    fn copy_video(&self, v: &Vram, from: usize, to: usize) {
+        // SAFETY: inside the video memory mapping (offsets within the copy).
+        let at = unsafe { v.data.add(from) };
+        crate::host::copy_mapped(
+            at,
+            (self.start as usize + from) as *const u8,
+            to - from,
+            false,
+        );
+        self.stale(from, to);
+    }
+
+    /// Title memory at offsets `[from, to)` into the copy (the mirror, and
+    /// video memory after it).
+    fn copy_both(&self, from: usize, to: usize) {
+        // SAFETY: inside the mapping (offsets within the copy).
+        let at = unsafe { self.data.add(from) };
+        crate::host::copy_mapped(
+            at,
+            (self.start as usize + from) as *const u8,
+            to - from,
+            false,
+        );
         if let Some(t) = &self.tracked {
             // SAFETY: `to - from` bytes inside the mapping, just copied.
-            t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
+            t.refreshed(self.start as usize + from, unsafe {
+                std::slice::from_raw_parts(at, to - from)
+            });
         }
-        to - from
+        self.push(from, to - from);
+    }
+
+    /// The mirror is behind video memory over offsets `[from, to)`.
+    fn stale(&self, from: usize, to: usize) {
+        let Some(v) = &self.vram else { return };
+        let mut bits = v.stale.lock().unwrap_or_else(|e| e.into_inner());
+        for k in from / PAGE..to.div_ceil(PAGE) {
+            bits[k / 64] |= 1 << (k % 64);
+        }
+    }
+
+    /// Before the CPU reads offsets `[from, to)` of a mirrored copy: the
+    /// pages there the mirror is behind on come from video memory (one GPU
+    /// copy; nothing when none is).
+    fn freshen(&self, from: usize, to: usize) {
+        let mut runs = self.stale_runs(from, to);
+        bring_back(&mut runs);
+    }
+
+    /// The pages over offsets `[from, to)` the mirror is behind on, as runs
+    /// `(copy, offset, len)` (whole pages, or to the copy's end).
+    fn stale_runs(&self, from: usize, to: usize) -> Vec<(&Shadow, usize, usize)> {
+        let Some(v) = &self.vram else {
+            return Vec::new();
+        };
+        let len = self.len as usize;
+        let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
+        let bits = v.stale.lock().unwrap_or_else(|e| e.into_inner());
+        for k in from / PAGE..to.div_ceil(PAGE).min(len.div_ceil(PAGE)) {
+            if bits[k / 64] >> (k % 64) & 1 == 0 {
+                continue;
+            }
+            let (a, b) = (k * PAGE, ((k + 1) * PAGE).min(len));
+            match runs.last_mut() {
+                Some(r) if r.1 + r.2 == a => r.2 = b - r.1,
+                _ => runs.push((self, a, b - a)),
+            }
+        }
+        runs
     }
 }
 
@@ -815,28 +1150,26 @@ pub(crate) fn view_writes(memory: bool) -> Option<u64> {
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
 /// slot's stays set in the bitmap until [`forget_read`]), and the slots to
-/// clear at the next [`take_reads`].
+/// clear before the next submission runs ([`clear_forgotten_reads`]).
 static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()));
 
-/// After a submission: the heap slots its shaders first read texture views
-/// at (`victory_shader::emit`, "Read marks"), each once until
-/// [`forget_read`]. Clears the slots forgotten since first.
-pub(crate) fn take_reads() -> Vec<u32> {
+/// The read marks of both bitmaps (shaders that use title memory mark their
+/// reads in theirs), when no submission runs.
+fn read_marks() -> Vec<&'static mut [u32]> {
     let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
-    // Both bitmaps: shaders that use title memory mark their reads in theirs.
-    let mut maps: Vec<&mut [u32]> = [false, true]
+    [false, true]
         .into_iter()
         .filter_map(bitmap)
         // SAFETY: the mapped bitmap's read marks; the GPU is done with them
         // (one submission runs at a time).
         .map(|b| unsafe { std::slice::from_raw_parts_mut((b.data as *mut u32).add(first), words) })
-        .collect();
-    if maps.is_empty() {
-        return Vec::new();
-    }
-    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
-    let (seen, forgotten) = &mut *reads;
+        .collect()
+}
+
+/// The marks of slots forgotten since go, from the bitmaps and the seen.
+fn clear_forgotten(maps: &mut [&mut [u32]], (seen, forgotten): &mut (Vec<u32>, Vec<u32>)) {
+    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
     seen.resize(words, 0);
     for slot in forgotten.drain(..) {
         let (w, bit) = ((slot / 32) as usize, 1u32 << (slot % 32));
@@ -845,8 +1178,31 @@ pub(crate) fn take_reads() -> Vec<u32> {
             seen[w] &= !bit;
         }
     }
+}
+
+/// Before a submission: the marks of slots forgotten since the last one go
+/// now (a placed texture written, one given up), so the reads of the
+/// submission about to run are the ones [`take_reads`] finds after it.
+pub(crate) fn clear_forgotten_reads() {
+    let mut maps = read_marks();
+    if !maps.is_empty() {
+        let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+        clear_forgotten(&mut maps, &mut reads);
+    }
+}
+
+/// After a submission: the heap slots its shaders first read texture views
+/// at (`victory_shader::emit`, "Read marks"), each once until
+/// [`forget_read`]. Clears the slots forgotten while it ran first.
+pub(crate) fn take_reads() -> Vec<u32> {
+    let mut maps = read_marks();
+    if maps.is_empty() {
+        return Vec::new();
+    }
+    let mut reads = READS.lock().unwrap_or_else(|e| e.into_inner());
+    clear_forgotten(&mut maps, &mut reads);
     let mut new = Vec::new();
-    for (w, s) in seen.iter_mut().enumerate() {
+    for (w, s) in reads.0.iter_mut().enumerate() {
         let mut fresh = maps.iter().fold(0, |x, bits| x | bits[w]) & !*s;
         *s |= fresh;
         while fresh != 0 {
@@ -888,6 +1244,42 @@ pub(crate) fn forget_read(slot: u32) {
     READS.lock().unwrap_or_else(|e| e.into_inner()).1.push(slot);
 }
 
+/// Threads that put marked pages back, at most (the title's own threads
+/// run meanwhile).
+const PAGE_THREADS: usize = 6;
+/// Marked pages worth a thread more: fewer go back on the submitting one.
+const PAGES_PER_THREAD: usize = 8;
+
+/// Runs `f` on every `(copy, page)`, on several threads when there are many:
+/// a 64 KiB page costs 55 to 80 microseconds (two reads, a compare, writes
+/// and a protection change), and a world frame marks 2,000. The copies of
+/// one page keep their order, on one thread.
+fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow>, usize) + Sync) {
+    pages.sort_by_key(|&(_, page)| page);
+    let threads = (pages.len() / PAGES_PER_THREAD).min(PAGE_THREADS);
+    if threads < 2 {
+        for (copy, page) in &pages {
+            f(copy, *page);
+        }
+        return;
+    }
+    let groups: Vec<&[(Arc<Shadow>, usize)]> = pages.chunk_by(|a, b| a.1 == b.1).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        while let Some(group) = groups.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+            for (copy, page) in *group {
+                f(copy, *page);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            scope.spawn(work);
+        }
+        work();
+    });
+}
+
 /// After a submission: every page its shaders marked as written through
 /// views goes back ([`Shadow::copy_back_marked`]), but for pages in
 /// `withheld` (ranges of copies that lists whose writes stay out of title
@@ -910,7 +1302,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         // Marks of offsets past the bitmap land in its last bit, no copy's.
         bits[words - 1] = 0;
         let used = (marks().end as usize).div_ceil(32).min(words);
-        for (w, word) in bits[..used].iter_mut().enumerate() {
+        for (w, word) in bits[..used].iter_mut().enumerate().filter(|(_, word)| **word != 0) {
             let mut x = std::mem::take(word);
             let into = if memory && memory_withheld { &mut held } else { &mut marked };
             while x != 0 {
@@ -946,12 +1338,18 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         let m = marks();
         marked.iter().filter_map(|&n| page_of(&m, n)).collect()
     };
-    for (copy, page) in pages {
+    pull(
+        &pages
+            .iter()
+            .map(|(copy, page)| (copy.clone(), *page, PAGE))
+            .collect::<Vec<_>>(),
+    );
+    for_each_by_page(pages, |copy, page| {
         if withheld
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
+            .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
         {
-            continue;
+            return;
         }
         let written = copy.copy_back_marked(page);
         #[cfg(feature = "diagnostics")]
@@ -961,12 +1359,137 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         }
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
+    });
+}
+
+/// Before the CPU reads what shaders may have written: the title address
+/// ranges `(copy, address, len)` of copies in video memory are copied into
+/// their mirrors, by the GPU, at once (one list for all; ranges of other
+/// copies are skipped).
+// shortcut: shaders' writes outside every declared range and marked page
+// (to the copy, not to title memory) stay in video memory: the mirror keeps
+// the bytes from before until a later range brings them.
+pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
+    // Whole pages, so that the pages pulled are current in the mirror.
+    let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
+    for (copy, address, len) in ranges {
+        if copy.vram.is_none() {
+            continue;
+        }
+        let (from, to) = copy.inside(*address, *len);
+        if from >= to {
+            continue;
+        }
+        let (from, to) = (
+            from / PAGE * PAGE,
+            (to.div_ceil(PAGE) * PAGE).min(copy.len as usize),
+        );
+        runs.push((copy, from, to - from));
+    }
+    bring_back(&mut runs);
+}
+
+/// Before a submission whose lists declared that shaders write title
+/// address ranges `(copy, address, len)` (not marked): their snapshots
+/// ([`Shadow::writing`]) read the copies' mirrors. The pages there the
+/// mirrors are behind on come back now, all in one GPU copy, and until
+/// [`snapshots_done`] refreshes there write the mirrors too: else each
+/// snapshot waited for a GPU copy of its own.
+pub(crate) fn snapshots_ahead(ranges: &[(Arc<Shadow>, usize, usize)]) {
+    let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
+    for (copy, address, len) in ranges {
+        let Some(v) = &copy.vram else { continue };
+        let (from, to) = copy.inside(*address, *len);
+        if from >= to {
+            continue;
+        }
+        let (from, to) = (
+            from / PAGE * PAGE,
+            (to.div_ceil(PAGE) * PAGE).min(copy.len as usize),
+        );
+        {
+            let mut ahead = v.ahead.lock().unwrap_or_else(|e| e.into_inner());
+            ahead.push((from, to));
+            ahead.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ahead.len());
+            for &(a, b) in ahead.iter() {
+                match merged.last_mut() {
+                    Some(m) if a <= m.1 => m.1 = m.1.max(b),
+                    _ => merged.push((a, b)),
+                }
+            }
+            *ahead = merged;
+        }
+        runs.extend(copy.stale_runs(from, to));
+    }
+    bring_back(&mut runs);
+}
+
+/// After the submission's copy-backs: refreshes write video memory alone
+/// again ([`snapshots_ahead`]).
+pub(crate) fn snapshots_done(ranges: &[(Arc<Shadow>, usize, usize)]) {
+    for (copy, _, _) in ranges {
+        if let Some(v) = &copy.vram {
+            v.ahead.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
     }
 }
+
+/// Copies runs `(copy, offset, len)` of mirrored copies (whole pages, or
+/// to the copy's end) from video memory into their mirrors, by the GPU,
+/// in one list; the pages are current in the mirrors after. Each copy's
+/// stale pages stay locked over the GPU copy: a refresh meanwhile marks
+/// its page again once the lock is released, so the bit is not lost.
+fn bring_back(runs: &mut [(&Shadow, usize, usize)]) {
+    if runs.is_empty() {
+        return;
+    }
+    runs.sort_unstable_by_key(|r| (std::ptr::from_ref(r.0) as usize, r.1));
+    // Overlapping or adjacent runs of a copy as one region.
+    let mut merged: Vec<(&Shadow, usize, usize)> = Vec::with_capacity(runs.len());
+    for &(copy, at, n) in runs.iter() {
+        if let Some(last) = merged.last_mut()
+            && std::ptr::eq(last.0, copy)
+            && at <= last.1 + last.2
+        {
+            last.2 = last.2.max(at + n - last.1);
+            continue;
+        }
+        merged.push((copy, at, n));
+    }
+    // Locked in address order (the runs are sorted by copy).
+    let mut locked = Vec::new();
+    let mut regions = Vec::with_capacity(merged.len());
+    for &(copy, at, n) in &merged {
+        let Some(v) = &copy.vram else { continue };
+        if !locked.last().is_some_and(|(c, _)| std::ptr::eq(*c, copy)) {
+            locked.push((copy, v.stale.lock().unwrap_or_else(|e| e.into_inner())));
+        }
+        let bits = &mut locked.last_mut().expect("just pushed").1;
+        for k in at / PAGE..(at + n).div_ceil(PAGE) {
+            bits[k / 64] &= !(1 << (k % 64));
+        }
+        regions.push((&v.mirror, at as u64, &copy.buffer, at as u64, n as u64));
+    }
+    #[cfg(test)]
+    if !regions.is_empty() {
+        BROUGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(host) = host() {
+        host.copy_now(&regions);
+    }
+}
+
+/// GPU copies [`bring_back`] made (tests).
+#[cfg(test)]
+static BROUGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// The title made it without unordered access: shaders only read it,
+    /// so its copy may be in a GPU upload heap ([`register_read_only`]).
+    read_only: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -989,22 +1512,122 @@ fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// The longest title buffer registered so far (it stays after the buffer is
+/// released): a buffer starting further below an address than this cannot
+/// hold it. Changed under `BUFFERS`' lock.
+static MAX_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// Title buffers this long or longer are also kept in [`BIG`]: few, and
+/// they set [`MAX_SPAN`].
+const BIG_LEN: u64 = 1 << 20;
+
+/// The longest title buffer shorter than [`BIG_LEN`] registered so far. A
+/// lookup scans only that far below an address in [`BUFFERS`], then the
+/// few big buffers further below: a miss scanned every buffer within
+/// `MAX_SPAN` (174 MB in the world, about 480 entries on average).
+static SMALL_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// The big title buffers by (start, resource), with their end. Locked after
+/// [`BUFFERS`], and only while it is held.
+static BIG: Mutex<BTreeMap<(u64, usize), u64>> = Mutex::new(BTreeMap::new());
+
+fn big() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), u64>> {
+    BIG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    register_as(resource, start, len, false);
+}
+
+/// [`register`] for a buffer the title made without unordered access:
+/// shaders only read it, and the CPU only writes its copy (refreshes), so
+/// the copy can be in video memory the CPU writes through the PCI BAR
+/// ([`Host::gpu_upload_buffer`](crate::host::Host::gpu_upload_buffer)).
+pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
+    register_as(resource, start, len, true);
+}
+
+fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
+    let mut map = buffers();
+    MAX_SPAN.fetch_max(len, Ordering::Relaxed);
+    if len >= BIG_LEN {
+        big().insert((start, resource), start.saturating_add(len));
+    } else {
+        SMALL_SPAN.fetch_max(len, Ordering::Relaxed);
+    }
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end: start.saturating_add(len),
             shadow: None,
+            read_only,
         },
     );
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+    let mut map = buffers();
+    big().remove(&(start, resource));
+    if map.remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
         changed();
     }
+}
+
+/// The innermost entry holding `[address, end)`: the one starting closest
+/// below `address` that reaches `end`, among those starting at most `span`
+/// (the longest entry's length) below `end`. Big buffers hold many smaller
+/// ones (a heap's placed buffers), so the one holding an address past
+/// those can be any number of entries back.
+fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: u64) -> Option<(u64, usize)> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range((lowest, 0)..=(address, usize::MAX))
+        .rev()
+        .find(|(_, e)| e.end >= end)
+        .map(|(k, _)| *k)
+}
+
+/// [`enclosing`] in two steps: the buffers starting within `small` (the
+/// longest buffer shorter than [`BIG_LEN`]) below `end`, then the big ones
+/// (`big`) starting further below, back to `span`. Only a big buffer can
+/// hold `[address, end)` from further below, so the result is the same.
+fn enclosing_split(
+    map: &BTreeMap<(u64, usize), Entry>,
+    big: &BTreeMap<(u64, usize), u64>,
+    small: u64,
+    span: u64,
+    address: u64,
+    end: u64,
+) -> Option<(u64, usize)> {
+    if let Some(key) = enclosing(map, small, address, end) {
+        return Some(key);
+    }
+    let lowest = end.saturating_sub(span);
+    let upper = end.saturating_sub(small).min(address.saturating_add(1));
+    if lowest >= upper {
+        return None;
+    }
+    big.range((lowest, 0)..(upper, 0))
+        .rev()
+        .find(|(_, big_end)| **big_end >= end)
+        .map(|(k, _)| *k)
+}
+
+/// The innermost title buffer holding `[address, end)`, under `BUFFERS`'
+/// lock (`map`).
+fn holding(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Option<(u64, usize)> {
+    enclosing_split(
+        map,
+        &big(),
+        SMALL_SPAN.load(Ordering::Relaxed),
+        MAX_SPAN.load(Ordering::Relaxed),
+        address,
+        end,
+    )
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -1012,12 +1635,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
+    let key = holding(&map, address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
@@ -1026,8 +1644,38 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
+        // Shaders write some buffers (unordered access): only the others'
+        // copies may be in upload memory.
+        let size = len.next_multiple_of(1 << 16);
+        let host = host()?;
+        let upload = entry
+            .read_only
+            .then(|| host.gpu_upload_buffer(size))
+            .flatten();
+        let in_upload = upload.is_some();
+        // A buffer shaders may write: in video memory too, with a mirror.
+        let mut vram = None;
+        let (buffer, data) = match upload {
+            Some(made) => made,
+            None => {
+                let mirror = host.shared_buffer(size)?;
+                match (!entry.read_only && host.gpu_upload_writes())
+                    .then(|| host.gpu_upload_buffer(size))
+                    .flatten()
+                {
+                    Some((video, video_data)) => {
+                        vram = Some(Vram {
+                            mirror: mirror.0,
+                            data: video_data,
+                            stale: Mutex::new(vec![0; (size as usize).div_ceil(PAGE).div_ceil(64)]),
+                            ahead: Mutex::new(Vec::new()),
+                        });
+                        (video, mirror.1)
+                    }
+                    None => mirror,
+                }
+            }
+        };
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -1044,28 +1692,66 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                 "buffer copied to the host"
             );
         }
-        entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        let shadow = Shadow::new_at(buffer, data, gpu, key.0, len, None, vram);
+        shadow
+            .upload
+            .store(in_upload, std::sync::atomic::Ordering::Relaxed);
+        entry.shadow = Some(shadow);
         changed();
     }
     entry.shadow.clone()
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (Grand
-/// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
+/// Titles also use memory outside any buffer object as GPU memory (the
+/// title's interface vertices, from its own allocator). Such memory
+/// gets copies of the aligned windows it touches. A window is 256 KiB:
+/// lookups while the title loads its world touched about 30% of
+/// the 4 MiB windows this used to copy, so most of their bytes (GBs of host
+/// memory) were never asked for; smaller windows cost more of them, each a
+/// host buffer and a page-table entry.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+const WINDOW: u64 = 256 << 10;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// The longest window in `LOOSE`. Changed under its lock.
+static LOOSE_SPAN: AtomicU64 = AtomicU64::new(0);
+
+/// Below this nothing is ever mapped (the null page and its guard area).
+const LOWEST_MAPPED: u64 = 0x10000;
+
+/// The window copy holding `[address, end)` among `windows` (by start and
+/// length, none longer than `span`), the innermost if several do.
+fn enclosing_window<V>(windows: &BTreeMap<(u64, u64), V>, span: u64, address: u64, end: u64) -> Option<&V> {
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    windows
+        .range((lowest, 0)..=(address, u64::MAX))
+        .rev()
+        .find(|&(&(s, l), _)| s.saturating_add(l) >= end)
+        .map(|(_, v)| v)
+}
+
+/// The window copy for `[address, end)` outside buffers: one already made
+/// that holds it (a range spanning two windows has one of its own, which
+/// later ranges in it share), else a new one. None for memory that is not
+/// committed (a stale or null address): 4 MiB of zeros would not help.
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if address < LOWEST_MAPPED {
+        return None;
+    }
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)? - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
         return Some(shadow.clone());
+    }
+    if !crate::texture::committed(address as *const u8, 1) {
+        return None;
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -1077,6 +1763,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
     changed();
     Some(shadow)
@@ -1159,7 +1846,7 @@ fn exact(address: u64, len: u64, element: u64) -> Option<Arc<Shadow>> {
     }
     // A run of a shared buffer, its start a whole number of elements in.
     let (buffer, data, gpu, slice) = arena().take(len, element)?;
-    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice));
+    let shadow = Shadow::new_at(buffer, data, gpu, address, len, Some(slice), None);
     map.insert((address, len, element), Arc::downgrade(&shadow));
     #[cfg(feature = "diagnostics")]
     {
@@ -1305,6 +1992,811 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Runs this binary's test `name` again in a child process with
+    /// `VICTORY_GPU_UPLOAD=1`, and `VICTORY_GPU_UPLOAD_WRITES=1` if `writes`
+    /// (the switches are read once per process): true
+    /// in that child, where the test does its work; false in the parent,
+    /// once the child passed.
+    fn rerun_with_gpu_upload(name: &str, writes: bool) -> bool {
+        const CHILD: &str = "VICTORY_TEST_GPU_UPLOAD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                name,
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+                "--include-ignored",
+            ])
+            .env(CHILD, "1")
+            .env("VICTORY_GPU_UPLOAD", "1")
+            .env("VICTORY_GPU_UPLOAD_WRITES", if writes { "1" } else { "0" })
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} with VICTORY_GPU_UPLOAD=1:\n{text}"
+        );
+        assert!(text.contains("1 passed"), "{name} did not run:\n{text}");
+        eprintln!("{text}");
+        false
+    }
+
+    /// Read-only buffers come and go, more bytes of them in all than the
+    /// GPU upload budget, a few at a time: each one's copy still goes in a
+    /// GPU upload heap, and its bytes leave the budget once the last
+    /// reference to its buffer is gone (a clone, as descriptor tables hold,
+    /// keeps them charged). Counted for the whole run, copies went to
+    /// system memory for good after the budget's worth (#2120).
+    #[test]
+    fn upload_budget_is_given_back_when_copies_go() {
+        use windows::core::Interface;
+        if !rerun_with_gpu_upload(
+            "shadow::tests::upload_budget_is_given_back_when_copies_go",
+            false,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.gpu_upload() {
+            return; // no GPU upload heaps (resizable BAR) here
+        }
+        const LEN: usize = 128 << 20;
+        let p = crate::watch::tests::pool(LEN / PAGE);
+        let base = crate::host::upload_bytes();
+        // 2.5 GiB in all, past the 2 GiB budget.
+        for round in 0..20 {
+            register_read_only(p, p as u64, LEN as u64);
+            let copy = find(p as u64, LEN as u64).expect("a copy");
+            assert_eq!(
+                heap_type(&copy),
+                D3D12_HEAP_TYPE_GPU_UPLOAD,
+                "round {round}: in a GPU upload heap"
+            );
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base + LEN as u64,
+                "round {round}: charged"
+            );
+            // A clone of the buffer, as a descriptor table holds, outlives
+            // the copy: still charged until it goes.
+            let held = copy.buffer.clone();
+            let weak = Arc::downgrade(&copy);
+            unregister(p, p as u64);
+            drop(copy);
+            assert!(weak.upgrade().is_none(), "round {round}: the copy is gone");
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base + LEN as u64,
+                "round {round}: held"
+            );
+            assert!(!held.as_raw().is_null());
+            drop(held);
+            assert_eq!(
+                crate::host::upload_bytes(),
+                base,
+                "round {round}: given back"
+            );
+        }
+        crate::watch::tests::free(p);
+    }
+
+    /// A buffer shaders may write, its copy made (mirrored in video memory
+    /// when the switches are on), and title memory filled with a pattern
+    /// the copy then took. Returns the pool, its length and the copy.
+    fn mirrored_buffer(pages: usize) -> (usize, usize, Arc<Shadow>) {
+        let p = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        register(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("a copy");
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
+        for (i, b) in title.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        copy.update(p, len);
+        (p, len, copy)
+    }
+
+    /// Records into `list` the GPU writing `bytes` into the copy at title
+    /// address `at` (a copy from a buffer of ours, as a shader would store).
+    fn gpu_store(list: &HostList, copy: &Shadow, at: usize, bytes: &[u8]) {
+        let host = host().unwrap();
+        let (src, data) = host.shared_buffer(bytes.len() as u64).unwrap();
+        // SAFETY: our mapped buffer of `bytes.len()` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len()) };
+        list.keep(&src);
+        // SAFETY: an open list; both buffers live and common.
+        unsafe {
+            list.list.CopyBufferRegion(
+                &copy.buffer,
+                copy.offset(at as u64),
+                &src,
+                0,
+                bytes.len() as u64,
+            )
+        };
+    }
+
+    /// The bytes of the copy as the GPU sees them (video memory, or the
+    /// system memory copy), copied out by the GPU.
+    fn gpu_bytes(copy: &Shadow, at: usize, n: usize) -> Vec<u8> {
+        let host = host().unwrap();
+        let (out, data) = host.shared_buffer(n as u64).unwrap();
+        host.copy_now(&[(&out, 0, &copy.buffer, copy.offset(at as u64), n as u64)]);
+        // SAFETY: our mapped buffer, the copy done.
+        unsafe { std::slice::from_raw_parts(data, n) }.to_vec()
+    }
+
+    /// With `VICTORY_GPU_UPLOAD_WRITES=1` too, the copy of a buffer shaders
+    /// may write is in a GPU upload heap, mirrored in system memory: the
+    /// GPU sees what a refresh wrote, and the mirror holds the same.
+    #[test]
+    fn written_buffers_copies_are_in_video_memory_with_a_mirror() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::written_buffers_copies_are_in_video_memory_with_a_mirror",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return; // no GPU upload heaps here
+        }
+        let (p, len, copy) = mirrored_buffer(2);
+        assert!(copy.mirrored());
+        assert_eq!(heap_type(&copy), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert!(
+            gpu_bytes(&copy, p, len) == title,
+            "the GPU sees the refreshed bytes"
+        );
+        // The refresh wrote video memory only; the mirror catches up when
+        // the CPU reads it.
+        // SAFETY: the mirror's bytes (read again after `freshen` below).
+        let mirror = unsafe { std::slice::from_raw_parts(copy.data, len) };
+        assert!(mirror != title, "the refresh did not write the mirror");
+        copy.freshen(0, len);
+        // SAFETY: as above.
+        let mirror = unsafe { std::slice::from_raw_parts(copy.data, len) };
+        assert!(mirror == title, "the mirror has caught up");
+        // The title writes again; the next refresh reaches video memory.
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + PAGE + 100) as *mut u8).write_volatile(0xA5) };
+        copy.update(p, len);
+        assert_eq!(gpu_bytes(&copy, p + PAGE + 100, 1), [0xA5]);
+        unregister(p, p as u64);
+    }
+
+    /// End to end through a submission: the GPU writes the copy in video
+    /// memory, in a range a list declared (`marked`: and in a page shaders
+    /// marked as written), while the title writes another byte of the same
+    /// page; afterwards title memory holds both writes. Without the mirror
+    /// being brought up to date (`pull`) the GPU's bytes would never reach
+    /// it, nor title memory.
+    fn gpu_writes_reach_title_memory(marked: bool) {
+        let host = host().unwrap();
+        let (p, len, copy) = mirrored_buffer(2);
+        assert!(copy.mirrored());
+        let list = host.new_list().unwrap();
+        let (at, gpu) = (p + PAGE + 64, [0xC3u8; 16]);
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, len as u64, marked);
+        gpu_store(&list, &copy, at, &gpu);
+        list.close();
+        // The title writes the same page meanwhile, past the GPU's bytes.
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + PAGE + 200) as *mut u8).write_volatile(0x3C) };
+        if marked {
+            // The shaders' mark for the page (the GPU copy sets none).
+            let (bit, _) = copy.mark_entry(at as u64).expect("marked memory");
+            let words = bitmap(false).unwrap().data as *mut u32;
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *words.add(bit as usize / 32) |= 1 << (bit % 32) };
+        }
+        host.execute(&[&list]);
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert_eq!(
+            title[PAGE + 64..PAGE + 80],
+            gpu,
+            "the GPU's bytes (marked {marked})"
+        );
+        assert_eq!(
+            title[PAGE + 200],
+            0x3C,
+            "the title's byte (marked {marked})"
+        );
+        assert_eq!(
+            title[PAGE + 63],
+            ((PAGE + 63) % 251) as u8,
+            "the rest as it was"
+        );
+        assert_eq!(
+            gpu_bytes(&copy, p + PAGE + 64, 16),
+            gpu,
+            "video memory keeps them"
+        );
+        unregister(p, p as u64);
+    }
+
+    #[test]
+    fn gpu_writes_to_mirrored_copies_reach_title_memory() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::gpu_writes_to_mirrored_copies_reach_title_memory",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        gpu_writes_reach_title_memory(false);
+        if bitmap(false).is_some() {
+            gpu_writes_reach_title_memory(true);
+        }
+    }
+
+    /// A list whose writes stay out of title memory (a program using title
+    /// memory read memory with no copy): the copy keeps the GPU's bytes
+    /// until its next refresh takes title memory's again
+    /// (`crate::memory::drop_withheld`), and so does its mirror (the CPU's
+    /// next look at the range sees them), while title memory keeps its own.
+    #[test]
+    fn withheld_writes_stay_in_the_copy_and_its_mirror() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::withheld_writes_stay_in_the_copy_and_its_mirror",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(1);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        {
+            // A program using title memory declares the write: only such
+            // programs' writes are withheld when their list misses.
+            let _writer = list.writer_uses_memory(true);
+            copy.gpu_writes(&list, p as u64, len as u64, false);
+        }
+        gpu_store(&list, &copy, p + 8, &[0x99; 8]);
+        list.defer_missed(|| true);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: our pool's bytes, and the mirror's.
+        let (title, mirror) = unsafe {
+            (
+                std::slice::from_raw_parts(p as *const u8, len),
+                std::slice::from_raw_parts(copy.data, len),
+            )
+        };
+        assert_eq!(title[8], 8, "title memory keeps its byte");
+        assert_eq!(mirror[8..16], [0x99; 8], "the mirror has the GPU's");
+        unregister(p, p as u64);
+    }
+
+    /// The mirror falls behind where a refresh wrote video memory only, and
+    /// catches up on what the CPU reads, and only there: a read of a page
+    /// brings that page back; pages GPU writes are pulled for come back
+    /// whole; a refresh where a snapshot is ahead writes both.
+    #[test]
+    fn mirrors_catch_up_on_the_pages_read() {
+        if !rerun_with_gpu_upload("shadow::tests::mirrors_catch_up_on_the_pages_read", true) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(4);
+        assert_eq!(
+            copy.stale_pages(),
+            [0, 1, 2, 3],
+            "the refresh wrote video memory only"
+        );
+        // SAFETY: our pool's bytes, and the mirror's.
+        let (title, mirror) = unsafe {
+            (
+                std::slice::from_raw_parts(p as *const u8, len),
+                std::slice::from_raw_parts(copy.data, len),
+            )
+        };
+        // A read of a few bytes of page 1.
+        assert_eq!(
+            copy.read_host((p + PAGE + 8) as u64, 1)[0].to_le_bytes(),
+            title[PAGE + 8..PAGE + 12]
+        );
+        assert_eq!(copy.stale_pages(), [0, 2, 3]);
+        assert!(
+            mirror[PAGE..2 * PAGE] == title[PAGE..2 * PAGE],
+            "page 1 came back whole"
+        );
+        assert!(
+            mirror[2 * PAGE..3 * PAGE] != title[2 * PAGE..3 * PAGE],
+            "page 2 did not"
+        );
+        // Bytes the GPU wrote in page 3 are pulled: the whole page comes.
+        pull(&[(copy.clone(), p + 3 * PAGE + 100, 4)]);
+        assert_eq!(copy.stale_pages(), [0, 2]);
+        assert!(mirror[3 * PAGE..] == title[3 * PAGE..]);
+        // A snapshot ahead over page 2: the refresh there writes both.
+        let ahead = [(copy.clone(), p + 2 * PAGE + 10, 10)];
+        snapshots_ahead(&ahead);
+        assert_eq!(copy.stale_pages(), [0], "page 2 brought back up front");
+        // SAFETY: our pool's bytes.
+        unsafe {
+            ((p + 2 * PAGE + 500) as *mut u8).write_volatile(0x11);
+            ((p + 40) as *mut u8).write_volatile(0x22);
+        }
+        copy.update(p, len);
+        assert_eq!(copy.stale_pages(), [0], "page 2 stays current");
+        assert_eq!(mirror[2 * PAGE + 500], 0x11);
+        snapshots_done(&ahead);
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + 2 * PAGE + 600) as *mut u8).write_volatile(0x33) };
+        copy.update(p, len);
+        assert_eq!(copy.stale_pages(), [0, 2], "video memory only again");
+        assert_eq!(gpu_bytes(&copy, p + 2 * PAGE + 600, 1), [0x33]);
+        copy.freshen(0, len);
+        assert!(copy.stale_pages().is_empty());
+        assert!(mirror == title, "the mirror has all of it");
+        unregister(p, p as u64);
+    }
+
+    /// A submission whose list declares shaders writing several ranges,
+    /// apart, of a copy the refresh left behind in its mirror: their
+    /// snapshots come back in one GPU copy, and what shaders write in
+    /// another in one more (not one per range); title memory then has the
+    /// GPU's bytes and the title's.
+    #[test]
+    fn snapshots_of_mirrored_copies_come_back_at_once() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::snapshots_of_mirrored_copies_come_back_at_once",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(4);
+        assert_eq!(copy.stale_pages().len(), 4);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        for k in 0..4 {
+            copy.gpu_writes(&list, (p + k * PAGE + 64) as u64, 256, false);
+        }
+        gpu_store(&list, &copy, p + 2 * PAGE + 100, &[0xE7; 8]);
+        list.close();
+        // The title writes page 3, inside its range, before the submission.
+        // SAFETY: our pool's bytes.
+        unsafe { ((p + 3 * PAGE + 70) as *mut u8).write_volatile(0x5A) };
+        let before = BROUGHT.load(std::sync::atomic::Ordering::Relaxed);
+        host.execute(&[&list]);
+        let copies = BROUGHT.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(copies, 2, "the snapshots' pages, then what the GPU wrote");
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert_eq!(
+            title[2 * PAGE + 100..2 * PAGE + 108],
+            [0xE7; 8],
+            "the GPU's bytes"
+        );
+        assert_eq!(title[3 * PAGE + 70], 0x5A, "the title's byte");
+        assert_eq!(title[64], 64, "the rest as it was");
+        unregister(p, p as u64);
+    }
+
+    /// A range declared with marks, over a copy the refresh left behind in
+    /// its mirror: only the page shaders marked comes back (one GPU copy),
+    /// not the range, and its bytes reach title memory.
+    #[test]
+    fn marked_ranges_of_mirrored_copies_bring_back_their_marked_pages_only() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::marked_ranges_of_mirrored_copies_bring_back_their_marked_pages_only",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() || bitmap(false).is_none() {
+            return;
+        }
+        let (p, len, copy) = mirrored_buffer(4);
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, len as u64);
+        copy.gpu_writes(&list, p as u64, len as u64, true);
+        let at = p + 2 * PAGE + 100;
+        gpu_store(&list, &copy, at, &[0x4D; 8]);
+        list.close();
+        let (bit, _) = copy.mark_entry(at as u64).expect("marked memory");
+        let words = bitmap(false).unwrap().data as *mut u32;
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *words.add(bit as usize / 32) |= 1 << (bit % 32) };
+        let before = BROUGHT.load(std::sync::atomic::Ordering::Relaxed);
+        host.execute(&[&list]);
+        let copies = BROUGHT.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(copies, 1, "the marked page alone");
+        assert_eq!(copy.stale_pages(), [0, 1, 3], "the other pages stay behind");
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+        assert_eq!(title[2 * PAGE + 100..2 * PAGE + 108], [0x4D; 8]);
+        unregister(p, p as u64);
+    }
+
+    /// The copy's tests against system memory copies, again with copies in
+    /// video memory and their mirrors behind (snapshots, refreshes under a
+    /// busy range, copy-back by bytes and by marked pages).
+    #[test]
+    fn copy_tests_pass_with_mirrored_copies() {
+        if std::env::var_os("VICTORY_TEST_GPU_UPLOAD_CHILD").is_some() {
+            return;
+        }
+        for name in [
+            "shadow::tests::title_writes_under_a_busy_range_are_copied",
+            "shadow::tests::snapshots_cover_the_declared_ranges_and_writes_go_back_once",
+            "shadow::tests::marked_pages_go_back_by_the_bytes_the_gpu_changed",
+        ] {
+            rerun_with_gpu_upload(name, true);
+        }
+    }
+
+    /// A shader reading and writing 256 MiB of a written buffer's copy, in
+    /// system memory and (`VICTORY_GPU_UPLOAD_WRITES=1`) in video memory, and
+    /// what bringing 64 marked pages back to the mirror costs.
+    /// `cargo test --release -p victory-gpu --lib written_copies -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: run in release with --ignored --nocapture"]
+    fn written_copies_in_video_and_system_memory() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        if !rerun_with_gpu_upload(
+            "shadow::tests::written_copies_in_video_and_system_memory",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            eprintln!("no GPU upload heaps here");
+            return;
+        }
+        const SRC: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer b : register(u0);
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    // Read 16 dwords, write them back incremented: 64 bytes read and
+    // written per thread.
+    for (uint k = 0; k < 16; k++) {
+        uint at = (id.x * 16 + k) * 4;
+        b.Store(at, b.Load(at) + 1);
+    }
+}"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source outlives the call.
+        unsafe {
+            D3DCompile(
+                SRC.as_ptr().cast(),
+                SRC.len(),
+                s!("b"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's bytes; plain creation.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        const BYTES: usize = 256 << 20;
+        // The system memory copy: a mirrored copy's mirror, used by the GPU
+        // as the copies are without the switch.
+        let p = crate::watch::tests::pool(BYTES / PAGE);
+        register(p, p as u64, BYTES as u64);
+        let copy = find(p as u64, BYTES as u64).unwrap();
+        assert!(copy.mirrored());
+        copy.update(p, BYTES);
+        let mirror = &copy.vram.as_ref().unwrap().mirror;
+        for (label, buffer) in [
+            ("system memory (as without the switch)", mirror),
+            ("video memory (GPU upload heap)", &copy.buffer),
+        ] {
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let list = host.new_list().unwrap();
+                // SAFETY: an open list, live objects.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list
+                        .SetComputeRootUnorderedAccessView(0, buffer.GetGPUVirtualAddress());
+                    list.list.Dispatch((BYTES / 4 / 16 / 256) as u32, 1, 1);
+                }
+                list.close();
+                let t = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "a shader reading and writing 256 MiB of the copy in {label}: {:.2} ms ({:.1} GB/s each way)",
+                best * 1e3,
+                BYTES as f64 / best / 1e9
+            );
+        }
+        // Bringing written pages back: 64 scattered 64 KiB pages (4 MiB).
+        let pages: Vec<_> = (0..64)
+            .map(|k| (copy.clone(), p + k * 61 * PAGE % BYTES, PAGE))
+            .collect();
+        let mut best = f64::MAX;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            pull(&pages);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "bringing 64 written 64 KiB pages back to the mirror: {:.3} ms",
+            best * 1e3
+        );
+        let one = [(copy.clone(), p, PAGE)];
+        let mut best = f64::MAX;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            pull(&one);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "bringing 1 written page back (the fixed cost of a pull): {:.3} ms",
+            best * 1e3
+        );
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
+    }
+
+    /// The heap type a copy's buffer is in.
+    fn heap_type(copy: &Shadow) -> D3D12_HEAP_TYPE {
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: a live committed buffer.
+        unsafe {
+            copy.buffer
+                .GetHeapProperties(Some(&mut props), None)
+                .unwrap()
+        };
+        props.Type
+    }
+
+    /// With `VICTORY_GPU_UPLOAD=1`, the copy of a buffer made without
+    /// unordered access is in a GPU upload heap: a refresh writes the
+    /// title's bytes there, and the GPU reads them (copied out into system
+    /// memory here). A buffer shaders may write keeps its copy in system
+    /// memory.
+    #[test]
+    fn read_only_buffers_get_their_copies_in_video_memory() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::read_only_buffers_get_their_copies_in_video_memory",
+            false,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !host.gpu_upload() {
+            return; // no GPU upload heaps (resizable BAR) here
+        }
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register_read_only(p, p as u64, len as u64);
+        let copy = find(p as u64, len as u64).expect("a copy");
+        assert!(copy.upload.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(heap_type(&copy), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        // The title writes; the copy is refreshed; the GPU reads it.
+        // SAFETY: our pool's bytes.
+        let title = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, len) };
+        for (i, b) in title.iter_mut().enumerate() {
+            *b = (i % 253) as u8;
+        }
+        copy.update(p, len);
+        let (out, data) = host.shared_buffer(len as u64).unwrap();
+        let list = host.new_list().unwrap();
+        // SAFETY: an open list; both buffers are live and start common.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&out, 0, &copy.buffer, 0, len as u64)
+        };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapped output, `len` bytes, the copy done.
+        let read = unsafe { std::slice::from_raw_parts(data, len) };
+        assert!(
+            read == &title[..],
+            "what the GPU read is what the title wrote"
+        );
+        unregister(p, p as u64);
+        // A buffer shaders may write.
+        let q = crate::watch::tests::pool(1);
+        register(q, q as u64, PAGE as u64);
+        let writable = find(q as u64, PAGE as u64).expect("a copy");
+        assert!(!writable.upload.load(std::sync::atomic::Ordering::Relaxed));
+        assert_ne!(heap_type(&writable), D3D12_HEAP_TYPE_GPU_UPLOAD);
+        unregister(q, q as u64);
+    }
+
+    /// A shader reading 256 MiB of a read-only buffer's copy (GPU upload
+    /// heap) and of a writable one's (system memory), with
+    /// `VICTORY_GPU_UPLOAD=1`.
+    /// `cargo test --release -p victory-gpu --lib reading_copies -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: run in release with --ignored --nocapture"]
+    fn reading_copies_in_video_and_system_memory() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::{Interface, s};
+        if !rerun_with_gpu_upload(
+            "shadow::tests::reading_copies_in_video_and_system_memory",
+            false,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload() {
+            eprintln!("no GPU upload heaps here");
+            return;
+        }
+        const SRC: &str = r#"
+#define RS "SRV(t0), UAV(u0)"
+ByteAddressBuffer b : register(t0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(256, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint s = 0;
+    for (uint k = 0; k < 16; k++) s += b.Load((id.x * 16 + k) * 4);
+    if (s == 0x12345678) o.Store(0, s);
+}"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source outlives the call.
+        unsafe {
+            D3DCompile(
+                SRC.as_ptr().cast(),
+                SRC.len(),
+                s!("b"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .unwrap();
+        }
+        let code = code.unwrap();
+        // SAFETY: the blob's bytes; plain creation.
+        let (root, pso) = unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        const BYTES: usize = 256 << 20;
+        let (out, _) = host.shared_buffer(256).unwrap();
+        for read_only in [false, true] {
+            let p = crate::watch::tests::pool(BYTES / PAGE);
+            if read_only {
+                register_read_only(p, p as u64, BYTES as u64);
+            } else {
+                register(p, p as u64, BYTES as u64);
+            }
+            let copy = find(p as u64, BYTES as u64).unwrap();
+            // The first refresh copies all of it (every page is new).
+            let t = std::time::Instant::now();
+            copy.update(p, BYTES);
+            let refresh = t.elapsed().as_secs_f64();
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let list = host.new_list().unwrap();
+                // SAFETY: an open list, live objects.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    list.list.SetComputeRootShaderResourceView(0, copy.gpu);
+                    list.list
+                        .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                    list.list.Dispatch((BYTES / 4 / 16 / 256) as u32, 1, 1);
+                }
+                list.close();
+                let t = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            let _ = copy.buffer.as_raw();
+            eprintln!(
+                "{}: shader reads 256 MiB in {:.2} ms ({:.1} GB/s); refresh writes it in {:.1} ms ({:.1} GB/s)",
+                if read_only {
+                    "read-only buffer's copy (GPU upload heap)"
+                } else {
+                    "writable buffer's copy (system memory)"
+                },
+                best * 1e3,
+                BYTES as f64 / best / 1e9,
+                refresh * 1e3,
+                BYTES as f64 / refresh / 1e9
+            );
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+        }
+    }
 
     /// A shader's read mark of heap slot `slot` in the bitmap of shaders
     /// that use title memory (`memory`) or of the others.
@@ -1314,6 +2806,19 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// Records a GPU write setting `slot`'s read mark in the bitmap, as a
+    /// shader reading that heap slot does during a submission.
+    pub(crate) fn record_mark_read(list: &crate::host::HostList, memory: bool, slot: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        let (src, data) = host().unwrap().upload_buffer(4).unwrap();
+        // SAFETY: our 4-byte upload buffer.
+        unsafe { data.cast::<u32>().write_unaligned(1u32 << (slot % 32)) };
+        let offset = u64::from(victory_shader::emit::VIEW_READS / 8) + u64::from(slot / 32) * 4;
+        // SAFETY: an open list, live buffers, 4 bytes inside both.
+        unsafe { list.list.CopyBufferRegion(&b._buffer, offset, &src, 0, 4) };
+        list.keep(&src);
     }
 
     /// The title writes a constant under a range an earlier list of the
@@ -1526,6 +3031,94 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
+    /// A marked page whose bytes the shaders left as they were (as for a
+    /// third of the world's marked pages) goes back as nothing: title memory
+    /// is not written, and the page stays taken (not changed, so the next
+    /// refresh does not copy it again).
+    #[test]
+    fn a_marked_page_the_shaders_left_alone_stays_taken() {
+        let p = crate::watch::tests::pool(1);
+        register(p, p as u64, PAGE as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, PAGE as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, PAGE);
+        copy.writing(p, PAGE, true);
+        // The shaders write the byte the copy already has.
+        copy.write_host((p + 10) as u64, &[0]);
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+        let t = copy.tracked.as_ref().expect("tracked memory");
+        assert!(!t.changed(p / PAGE), "still taken");
+        assert_eq!(copy.copy_back(p, PAGE), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
+    thread_local! {
+        /// Title writes [`after_read`] makes, last first.
+        static AFTER_READ: std::cell::RefCell<Vec<(usize, u8)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A title thread's write landing just after a copy-back read the page
+    /// (tests): the next of [`AFTER_READ`]'s.
+    pub(super) fn after_read() {
+        if let Some((at, value)) = AFTER_READ.with(|w| w.borrow_mut().pop()) {
+            // SAFETY: a byte of the test's title memory (guarded or not: a
+            // guard's fault opens it).
+            unsafe { (at as *mut u8).write_volatile(value) };
+        }
+    }
+
+    /// The title writes a page while it goes back, just after the copy-back
+    /// read it. Only the bytes the shaders changed go into title memory, for
+    /// a page marked through views and a page shaders wrote at computed
+    /// addresses alike: the title's byte stays (a whole page put back undid
+    /// it), and the copy has it too.
+    #[test]
+    fn a_copy_back_puts_back_only_the_bytes_the_gpu_changed() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shaders write a byte in each page.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
+        let title = |at: usize| (p + at) as *mut u8;
+        AFTER_READ.with(|w| *w.borrow_mut() = vec![(p + PAGE + 40, 0x88), (p + 40, 0x77)]);
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        // SAFETY: (reads below) bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        // Page 0 was marked through a view.
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *(b.data as *mut u32).add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+        assert_eq!(
+            (read(10), read(40)),
+            (0xaa, 0x77),
+            "the shader's byte and the title's, page 0"
+        );
+        assert_eq!(host(40), 0x77, "the copy reads the title's byte");
+        // Page 1 was written at addresses shaders computed.
+        assert_eq!(copy.copy_back_page(p + PAGE), PAGE);
+        assert_eq!(
+            (read(PAGE + 10), read(PAGE + 40)),
+            (0xbb, 0x88),
+            "both bytes, page 1"
+        );
+        assert_eq!(host(PAGE + 40), 0x88, "the copy reads the title's byte");
+        unregister(p, p as u64);
+    }
+
     /// Marks of shaders using title memory stay out of title memory while
     /// their results are held back, and are cleared; the other shaders'
     /// marks of the same submission go back.
@@ -1600,45 +3193,100 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
-    /// A partial refresh of an armed page updates its saved bytes too (both
-    /// under and beside a pending marked range): copy-back neither puts the
-    /// refreshed byte back over a later title write nor drops a shader write
-    /// back to the pre-fault value.
+    /// The block-wise comparison finds the same runs as a byte-wise one:
+    /// across block and line edges, at the ends, with the GPU's bytes told
+    /// apart, and for lengths that are not whole blocks.
     #[test]
-    fn partial_refresh_under_marked_range_updates_saved_bytes() {
-        let p = crate::watch::tests::pool(2);
-        let len = 2 * PAGE;
+    fn differing_matches_a_byte_wise_comparison() {
+        let naive = |host: &[u8], title: &[u8], gpu: &dyn Fn(usize) -> bool| {
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for i in 0..host.len() {
+                if host[i] != title[i] && gpu(i) {
+                    match runs.last_mut() {
+                        Some((_, end)) if *end == i => *end = i + 1,
+                        _ => runs.push((i, i + 1)),
+                    }
+                }
+            }
+            runs
+        };
+        for len in [0, 1, 31, 33, 1023, 1025, PAGE - 7, PAGE] {
+            let title = vec![0x5au8; len];
+            let mut host = title.clone();
+            // Single bytes, runs over line and block edges, the last byte.
+            let mut at = 3;
+            while at < len {
+                host[at] ^= 0xff;
+                at += 997;
+            }
+            for i in (1020..1060).filter(|&i| i < len) {
+                host[i] = 0;
+            }
+            if let Some(last) = host.last_mut() {
+                *last = 1;
+            }
+            let gpu = |i: usize| !i.is_multiple_of(5);
+            assert_eq!(
+                differing(&host, &title, gpu),
+                naive(&host, &title, &gpu),
+                "length {len}"
+            );
+            assert_eq!(
+                differing(&host, &title, |_| true),
+                naive(&host, &title, &|_| true),
+                "length {len}"
+            );
+        }
+    }
+
+    /// Many marked pages, in two copies of the same memory (a buffer and
+    /// one placed inside it): every shader write reaches title memory.
+    #[test]
+    fn many_marked_pages_all_go_back() {
+        const PAGES: usize = 96;
+        let p = crate::watch::tests::pool(PAGES);
+        let len = PAGES * PAGE;
         register(p, p as u64, len as u64);
-        let Some(copy) = find(p as u64, len as u64) else {
+        register(p + 1, (p + len / 2) as u64, (len / 2) as u64);
+        let (Some(outer), Some(inner), Some(b)) = (
+            find(p as u64, len as u64),
+            find((p + len / 2) as u64, (len / 2) as u64),
+            bitmap(false),
+        ) else {
+            unregister(p + 1, (p + len / 2) as u64);
             unregister(p, p as u64);
             return; // no host GPU here
         };
-        let write = |at: usize, v: u8| {
-            // SAFETY: a byte of our pool.
-            unsafe { ((p + at) as *mut u8).write_volatile(v) };
+        outer.update(p, len);
+        inner.update(p + len / 2, len / 2);
+        let words = b.data as *mut u32;
+        let mark = |n: usize| {
+            // SAFETY: a dword of the mapped bitmap.
+            unsafe { *words.add(n / 32) |= 1 << (n % 32) };
         };
-        copy.update(p, len);
-        // Arms both pages: page 0 is wholly busy; page 1 past +16 is free.
-        copy.writing(p, PAGE + 16, true);
-        for (at, v) in [(20, 0x55), (24, 0x44), (40, 0x11), (PAGE + 20, 0x55)] {
-            write(at, v);
+        // Even pages through the outer copy, odd pages of the upper half
+        // through the inner one.
+        let mut written = Vec::new();
+        for page in 0..PAGES {
+            let at = p + page * PAGE + 10;
+            let (copy, first) = if page >= PAGES / 2 && page % 2 == 1 {
+                (&inner, PAGES / 2)
+            } else {
+                (&outer, 0)
+            };
+            copy.writing(p + page * PAGE, PAGE, true);
+            copy.write_host(at as u64, &[page as u8 + 1]);
+            mark(copy.marks.expect("tracked memory gets mark bits") as usize + page - first);
+            written.push((at, page as u8 + 1));
         }
-        assert!(copy.update(p + 16, 16) > 0 && copy.update(p + PAGE + 16, 16) > 0);
-        copy.write_host((p + 10) as u64, &[0xaa]);
-        copy.write_host((p + 24) as u64, &[0x00]);
-        copy.write_host((p + PAGE + 10) as u64, &[0xbb]);
-        write(20, 0x66);
-        write(PAGE + 20, 0x77);
-        copy.copy_back_marked(p);
-        copy.copy_back_marked(p + PAGE);
-        // SAFETY: bytes of our pool.
-        let read = |at: usize| unsafe { ((p + at) as *const u8).read_volatile() };
-        assert_eq!(
-            [read(10), read(20), read(24), read(40)],
-            [0xaa, 0x66, 0x00, 0x11]
-        );
-        assert_eq!([read(PAGE + 10), read(PAGE + 20)], [0xbb, 0x77]);
-        copy.copy_back(p, PAGE + 16);
+        copy_back_marks(&[], false);
+        for (at, value) in written {
+            // SAFETY: a byte of our pool.
+            assert_eq!(unsafe { (at as *const u8).read_volatile() }, value, "{at:#x}");
+        }
+        outer.copy_back(p, len);
+        inner.copy_back(p + len / 2, len / 2);
+        unregister(p + 1, (p + len / 2) as u64);
         unregister(p, p as u64);
     }
 
@@ -1656,5 +3304,201 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn entry(start: u64, len: u64) -> Entry {
+        Entry {
+            end: start + len,
+            shadow: None,
+            read_only: false,
+        }
+    }
+
+    /// A 256 MiB parent with `children` 64 KiB buffers placed in its first
+    /// part, as a heap's placed buffers.
+    fn heap(base: u64, children: u64) -> BTreeMap<(u64, usize), Entry> {
+        let mut map = BTreeMap::new();
+        map.insert((base, 1), entry(base, 256 * MIB));
+        for i in 0..children {
+            map.insert((base + i * 0x10000, 100 + i as usize), entry(base + i * 0x10000, 0x10000));
+        }
+        map
+    }
+
+    #[test]
+    fn a_parent_is_found_past_many_children() {
+        let base = 0x10_0000_0000;
+        let map = heap(base, 200);
+        let span = 256 * MIB;
+        // Past all 200 children (and the 64 entries looked at before).
+        let at = base + 200 * 0x10000 + 0x100;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        let first_64 = map.range(..=(at, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= at + 16);
+        assert!(first_64.is_none(), "the parent is more than 64 entries back");
+        // Near the parent's end.
+        let at = base + 256 * MIB - 16;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Inside a child: the child, the innermost.
+        let at = base + 150 * 0x10000 + 8;
+        assert_eq!(enclosing(&map, span, at, at + 8), Some((base + 150 * 0x10000, 250)));
+        // Across two children: only the parent holds it.
+        let at = base + 151 * 0x10000 - 8;
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Past the parent, and before it.
+        let at = base + 256 * MIB;
+        assert_eq!(enclosing(&map, span, at, at + 1), None);
+        assert_eq!(enclosing(&map, span, base - 16, base + 16), None);
+        // Longer than any buffer: none, without looking.
+        assert_eq!(enclosing(&map, span, base, base + span + 1), None);
+        assert_eq!(enclosing(&map, 0, base, base + 1), None);
+    }
+
+    #[test]
+    fn a_lookup_scans_small_buffers_near_the_address_then_the_big_ones() {
+        let base = 0x30_0000_0000u64;
+        let mut map = BTreeMap::new();
+        let mut big = BTreeMap::new();
+        // One big heap (64 MiB) holding many small placed buffers, and a
+        // second big buffer further up that ends before the address.
+        let heap = 64 * MIB;
+        map.insert((base, 1), Entry { end: base + heap, shadow: None, read_only: false });
+        big.insert((base, 1), base + heap);
+        for i in 0..400u64 {
+            let at = base + i * 0x10000;
+            map.insert((at, 10 + i as usize), Entry { end: at + 0x1000, shadow: None, read_only: false });
+        }
+        let other = base + 32 * MIB;
+        map.insert((other, 2), Entry { end: other + 2 * MIB, shadow: None, read_only: false });
+        big.insert((other, 2), other + 2 * MIB);
+        let small = 0x1000;
+        let span = heap;
+        // Past every small buffer and past `other`: only the heap holds it.
+        let at = base + 48 * MIB;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 16), Some((base, 1)));
+        assert_eq!(enclosing(&map, span, at, at + 16), Some((base, 1)));
+        // Inside a small buffer: that one, as before.
+        let at = base + 150 * 0x10000 + 8;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 8), Some((base + 150 * 0x10000, 160)));
+        // Inside `other`: the innermost big one.
+        let at = other + MIB;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 16), Some((other, 2)));
+        // Past the heap: none.
+        let at = base + heap + 16;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 16), None);
+        // A range longer than any small buffer still finds the heap.
+        let at = base + 50 * MIB;
+        assert_eq!(enclosing_split(&map, &big, small, span, at, at + 2 * small), Some((base, 1)));
+    }
+
+    #[test]
+    fn registered_buffers_widen_the_search() {
+        // High above anything a test maps; resource numbers no live
+        // resource has.
+        let base = 0x7f00_0000_0000;
+        let len = 512 * MIB;
+        register(1, base, len);
+        for i in 0..100u64 {
+            register(2 + i as usize, base + i * 0x1000, 0x1000);
+        }
+        assert!(MAX_SPAN.load(Ordering::Relaxed) >= len);
+        let at = base + len - 64;
+        let found = holding(&buffers(), at, at + 64);
+        for i in 0..100u64 {
+            unregister(2 + i as usize, base + i * 0x1000);
+        }
+        unregister(1, base);
+        assert_eq!(found, Some((base, 1)));
+        assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+    }
+
+    #[test]
+    fn loose_windows_are_reused_for_ranges_inside_them() {
+        let w = WINDOW;
+        let base = 0x20_0000_0000;
+        let mut windows = BTreeMap::new();
+        windows.insert((base, w), "first");
+        // A range across the next two windows got one of its own.
+        windows.insert((base + w, 2 * w), "spanning");
+        let span = 2 * w;
+        let find = |address: u64, len: u64| enclosing_window(&windows, span, address, address + len).copied();
+        assert_eq!(find(base, 1), Some("first"));
+        assert_eq!(find(base + w - 16, 16), Some("first"));
+        // Inside the spanning window, also in its second half.
+        assert_eq!(find(base + w + 8, 64), Some("spanning"));
+        assert_eq!(find(base + 2 * w + 8, 64), Some("spanning"));
+        assert_eq!(find(base + 3 * w - 8, 8), Some("spanning"));
+        // Across the first window's end: none holds it whole.
+        assert_eq!(find(base + w - 8, 16), None);
+        // Past every window, before them, longer than any.
+        assert_eq!(find(base + 3 * w, 1), None);
+        assert_eq!(find(base - 8, 4), None);
+        assert_eq!(find(base, 3 * w), None);
+    }
+
+    /// A range in one window, then a range across that window's end, which
+    /// gets a window of its own over both (the first inside it): what the
+    /// title writes reaches both copies, and what the GPU writes through
+    /// the spanning one goes back to title memory and from there into the
+    /// first at its next refresh. (Within one submission the two copies are
+    /// apart, as any two copies of the same bytes are.)
+    #[test]
+    fn overlapping_windows_agree_through_title_memory() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if host().is_none() {
+            return;
+        }
+        let w = WINDOW as usize;
+        // SAFETY: a fresh allocation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * w, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let b = p.next_multiple_of(w);
+        let title = |at: usize| (b + at) as *mut u8;
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(w - 40).write_volatile(0x11) };
+        let first = loose((b + w - 64) as u64, (b + w - 32) as u64).expect("a window");
+        let spanning = loose((b + w - 16) as u64, (b + w + 16) as u64).expect("a window across the boundary");
+        assert!(!Arc::ptr_eq(&first, &spanning));
+        assert_eq!((first.start, first.len), (b as u64, w as u64));
+        assert_eq!((spanning.start, spanning.len), (b as u64, 2 * w as u64), "the first lies inside it");
+        let byte = |s: &Shadow, at: usize| s.read_host(((b + at) & !3) as u64, 1)[0].to_le_bytes()[(b + at) % 4];
+        // The title writes: both copies take it at their refresh.
+        // SAFETY: a byte of our allocation.
+        unsafe { title(w - 40).write_volatile(0x22) };
+        first.update(b + w - 64, 64);
+        spanning.update(b + w - 64, 64);
+        assert_eq!((byte(&first, w - 40), byte(&spanning, w - 40)), (0x22, 0x22));
+        // A shader writes through the spanning copy; it goes back to title
+        // memory, and the first copy takes it at its next refresh.
+        spanning.writing(b + w - 64, 64, false);
+        spanning.write_host((b + w - 40) as u64, &[0x33]);
+        spanning.copy_back(b + w - 64, 64);
+        // SAFETY: a byte of our allocation.
+        let back = unsafe { title(w - 40).read_volatile() };
+        assert_eq!(back, 0x33, "back in title memory");
+        first.update(b + w - 64, 64);
+        assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
+        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn loose_memory_must_be_committed() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // The null page and its guard area.
+        assert!(loose(0, 16).is_none());
+        assert!(loose(0x1000, 0x1010).is_none());
+        assert!(loose(LOWEST_MAPPED - 1, LOWEST_MAPPED + 1).is_none());
+        // Reserved, not committed.
+        // SAFETY: a fresh reservation, released below.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), WINDOW as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(p, 0);
+        assert!(loose(p + 64, p + 128).is_none());
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // Too close to the top to round up to a window.
+        assert!(loose(u64::MAX - 8, u64::MAX).is_none());
     }
 }

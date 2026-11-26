@@ -12,7 +12,7 @@
 //! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! groups in y and z, 2^20 in x and per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -35,6 +35,11 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Groups in x that run as the title asks: its tile lists are a group per
+// tile, 67,440 at 2560x1440. D3D12 names 65,535 for a dispatch and does not
+// look at indirect counts; an RTX 3080 Ti runs every group (the test
+// `a_dispatch_of_more_than_65535_groups_runs_whole`).
+static const uint WIDEST = 1u << 20;
 // Clamps the record at `at` into `dest`; its cost.
 uint clamped(uint at) {
     uint cost;
@@ -52,9 +57,12 @@ uint clamped(uint at) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = args.Load3(at);
+        // Up to WIDEST groups in x run as asked; a record asking for more
+        // runs 65,535.
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
@@ -139,14 +147,19 @@ fn clamp() -> Option<&'static Clamp> {
 }
 
 fn make() -> windows::core::Result<Clamp> {
+    make_from(SOURCE)
+}
+
+/// A compute pipeline of ours compiled from `source`.
+fn make_from(source: &str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -313,6 +326,61 @@ mod tests {
         }
     }
 
+    /// The title's tile lists are dispatches of a group per tile, more than
+    /// 65,535 of them at 2560x1440: every group runs once, under its number.
+    #[test]
+    fn a_dispatch_of_more_than_65535_groups_runs_whole() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        const WORKER: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+}
+"#;
+        const GROUPS: u32 = 67_440;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let worker = super::make_from(WORKER).unwrap();
+        let (title, data) = host.shared_buffer(24).unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a valid single-argument signature.
+        unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature) }.unwrap();
+        let (holder, list) = (host.new_list().unwrap(), host.new_list().unwrap());
+        let seen = holder.arguments(16).unwrap();
+        let mut at = std::ptr::null_mut();
+        // SAFETY: our mapped buffers; an open list and live objects.
+        unsafe {
+            data.cast::<[u32; 3]>().write_volatile([GROUPS, 1, 1]);
+            seen.Map(0, None, Some(&mut at)).unwrap();
+            at.cast::<[u32; 2]>().write_volatile([0, 0]);
+            let arguments = super::bound(&list, title.GetGPUVirtualAddress(), (2, 12, 1)).unwrap();
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+            list.list.ExecuteIndirect(signature.as_ref().unwrap(), 1, &arguments, 0, None, 0);
+            super::done(&list, &arguments);
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(at.cast::<[u32; 2]>().read_volatile(), [GROUPS, GROUPS - 1]);
+        }
+    }
+
     /// Rejected records do not wrap the budget: of 128 garbage draws (2^26
     /// vertex instances each once clamped) two run, where a wrapping add
     /// let four; of 600 garbage mesh dispatches 16, not 31.
@@ -369,7 +437,7 @@ mod tests {
         let (title, data) = host.shared_buffer(1 << 16).unwrap();
         // SAFETY: our mapped buffer; a live buffer.
         let gpu = unsafe {
-            data.cast::<[u32; 3]>().write_volatile([70_000, 1, 1]);
+            data.cast::<[u32; 3]>().write_volatile([(1 << 20) + 1, 1, 1]);
             title.GetGPUVirtualAddress()
         };
         let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
@@ -404,7 +472,7 @@ mod tests {
                 assert_eq!(clamped, [65_535, 1, 1]);
             }
             // SAFETY: as above.
-            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+            assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [(1 << 20) + 1, 1, 1], "the title's copy as written");
         }
     }
 

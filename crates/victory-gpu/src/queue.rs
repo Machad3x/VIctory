@@ -121,10 +121,30 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held();
+        let mut skipped = 0;
         for &l in lists {
-            for segment in crate::list::segments(l) {
-                let waits = segment.waits();
-                held.push(this as usize, Item::Segment(segment, waits));
+            match crate::list::start(l) {
+                crate::list::Submission::Run(segments, lease) => {
+                    // The list's slots stay its own until its last segment
+                    // has run.
+                    let last = segments.len() - 1;
+                    for (k, segment) in segments.into_iter().enumerate() {
+                        let waits = segment.waits();
+                        let lease = (k == last).then(|| lease.clone());
+                        held.push(this as usize, Item::Segment((segment, lease), waits));
+                    }
+                }
+                crate::list::Submission::Lost => skipped += 1,
+                crate::list::Submission::None => {}
+            }
+        }
+        if skipped > 0 {
+            static LOST: AtomicBool = AtomicBool::new(false);
+            if !LOST.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    skipped,
+                    "lists submitted again after their dynamic descriptor slots were taken back are not run"
+                );
             }
         }
         account().submissions += 1;
@@ -154,7 +174,15 @@ use crate::hold::Item;
 
 /// Every queue's held work.
 #[cfg(windows)]
-type Holding = crate::hold::Held<std::sync::Arc<crate::host::HostList>>;
+type Holding = crate::hold::Held<Segment>;
+
+/// A title list's host list, and with its last one the lease of the list's
+/// dynamic slots, finished once it ran ([`crate::list::start`]).
+#[cfg(windows)]
+type Segment = (
+    std::sync::Arc<crate::host::HostList>,
+    Option<std::sync::Arc<crate::descriptor::lease::Lease>>,
+);
 
 #[cfg(windows)]
 static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held::new());
@@ -204,13 +232,18 @@ fn pump(held: &mut Holding, why: Why) {
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+    let mut run = |_: usize, segments: Vec<Segment>| {
+        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
         let at = std::time::Instant::now();
         host.execute(&lists);
         ran += at.elapsed();
         drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
+        for (list, lease) in segments {
+            if let Some(lease) = lease {
+                lease.finish();
+            }
+            crate::list::recycle(list);
+        }
     };
     let mut signal = |f: usize, value: u64| {
         crate::fence::set(f as This, value);
@@ -400,7 +433,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// The queue's later work waits until the fence reaches `value`.
 ///
 /// shortcut: the fence is not kept alive while the queue waits for it;
-/// Grand Theft Auto VI makes no queue wait for a fence.
+/// The title makes no queue wait for a fence.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
@@ -640,7 +673,7 @@ const PAGE: u64 = 64 << 10;
 
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
-/// batches' addresses. Grand Theft Auto VI streams textures into pool pages
+/// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once.
 ///
@@ -730,7 +763,7 @@ const METHODS: [(usize, *const ()); 15] = [
 /// Newer titles' queues have two more methods before Signal, which moved
 /// from 0x70 to 0x80: every slot from 0x70 on is two later (taken here as
 /// starting exactly at 0x70, the methods before it kept in place).
-/// Inferred from Grand Theft Auto VI's calls: Signal 0x80 `(fence,
+/// Inferred from the title's calls: Signal 0x80 `(fence,
 /// value)`, timestamp frequency 0x90 (title+0x24841a6), suspend and resume
 /// 0xb8/0xc0, PresentX 0x100, the frame-token submission 0x118 `(count,
 /// lists, token, flags)` (title+0x24821dd).
@@ -873,7 +906,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 
-    /// Grand Theft Auto VI's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
+    /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.
     #[test]
     fn console_queues_are_created_as_on_pc() {
         let null = std::ptr::null();

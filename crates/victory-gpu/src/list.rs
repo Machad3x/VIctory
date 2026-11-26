@@ -11,6 +11,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+#[cfg(windows)]
+use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -32,7 +34,7 @@ const ALLOCATOR_IIDS: [Iid; 4] = [
 
 /// The list interfaces up to `ID3D12GraphicsCommandList6` (the table has
 /// all their slots): those whose ids are the same as on PC, the console's
-/// own List5 and List6 (Grand Theft Auto VI asks for List6), then the
+/// own List5 and List6 (the title asks for List6), then the
 /// device child's.
 const LIST_IIDS: [Iid; 10] = [
     guid(
@@ -106,7 +108,7 @@ struct List {
     graphics_root_headers: [u32; 128],
     compute_root_headers: [u32; 128],
     pipeline_shadow: [u32; 8],
-    /// Newer titles' lists are larger: Grand Theft Auto VI's state flush
+    /// Newer titles' lists are larger: the title's state flush
     /// (title+0x32786) copies a pipeline's 32 bytes to +0x544..+0x564 and
     /// tests +0x548, so its layout runs past 0x560. Its size is unknown;
     /// this keeps our fields clear of whatever the title writes there.
@@ -138,6 +140,49 @@ pub(crate) fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// What [`start`] finds for a list about to be submitted.
+#[cfg(windows)]
+pub(crate) enum Submission {
+    /// Ready to run on the host ([`segments`]); finish the lease once the
+    /// last of them has run.
+    Run(
+        Vec<std::sync::Arc<crate::host::HostList>>,
+        std::sync::Arc<crate::descriptor::lease::Lease>,
+    ),
+    /// The list lost its dynamic slots after an earlier submission; skip it.
+    Lost,
+    /// Null or without a host list; nothing to submit.
+    None,
+}
+
+/// Before a list is submitted: takes its host lists and locks its current
+/// dynamic-slot lease against reclamation until the caller finishes it
+/// (see [`crate::descriptor::lease`]), also while a queue holds the work
+/// (`crate::hold`). Capturing both here means the caller never reads the
+/// list again after submission, even if another thread resets or releases
+/// it on a bottom-of-pipe write.
+#[cfg(windows)]
+pub(crate) fn start(this: This) -> Submission {
+    let segments = segments(this);
+    if segments.is_empty() {
+        return Submission::None;
+    }
+    let lease = {
+        // SAFETY: `segments` checked non-null; the title passes one of our lists.
+        let state = unsafe { &(*this.cast::<List>()).state };
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lease()
+            .clone()
+    };
+    if lease.start() {
+        Submission::Run(segments, lease)
+    } else {
+        Submission::Lost
+    }
 }
 
 /// The host list a title list's calls record into (its current segment),
@@ -176,8 +221,8 @@ pub(crate) fn segments(this: This) -> Vec<std::sync::Arc<crate::host::HostList>>
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lists reset or released while a queue still held some of their host
-/// lists: D3D12 lets a list be reset as soon as it is submitted (Grand
-/// Theft Auto VI does, 0-21 times a world frame).
+/// lists: D3D12 lets a list be reset as soon as it is submitted (the
+/// title does, 0-21 times a world frame).
 static EARLY_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Cuts and early resets since the last call (the frame line).
@@ -268,7 +313,7 @@ fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
 
 /// Host lists [`restart`] left to a queue, back once they ran: the next
 /// ones it hands out (a host list and its allocators are not free to make;
-/// Grand Theft Auto VI resets up to 21 lists a frame while they are held).
+/// The title resets up to 21 lists a frame while they are held).
 #[cfg(windows)]
 static SPARE: std::sync::Mutex<Vec<crate::host::HostList>> = std::sync::Mutex::new(Vec::new());
 
@@ -648,16 +693,20 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
-        if let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        if let (Some(dst_write), Some(from)) = (
+            crate::texture::prepare_host_write(dst),
             crate::resource::host_resource(src),
         ) {
+            let to = dst_write.resource().clone();
+            if crate::texture::incompatible_copy(crate::resource::packed_format(src), crate::resource::packed_format(dst)) {
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_writes(list, dst);
+            dst_write.record(list);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -712,12 +761,14 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        let Some(to) = crate::resource::host_resource(dst.resource) else {
+        let Some(dst_write) = crate::texture::prepare_host_write(dst.resource) else {
             if dst.kind == FOOTPRINT && src.kind != FOOTPRINT {
                 read_back(list, &dst, [x, y, z], &src, source_box);
             }
             return;
         };
+        let to = dst_write.resource().clone();
+        let packed = crate::resource::packed_format(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -729,24 +780,43 @@ extern "system" fn copy_texture_region(
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some(footprint) = host_footprint(src.footprint, packed) else { return };
+            let Some(host_bytes) = footprint.bytes() else { return };
+            let Some((buffer, staging)) = list.upload(host, host_bytes) else {
                 return;
             };
             // The list owns this mapped D3D12 upload buffer. Wine can report
             // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if let Some(format) = packed {
+                let (data, staging) = (data as usize, staging as usize);
+                list.defer_host(move || {
+                    let mut guest = vec![0; bytes as usize];
+                    crate::host::copy_mapped(guest.as_mut_ptr(), data as *const u8, guest.len(), false);
+                    // SAFETY: the mapped upload spans the expanded footprint.
+                    let rgba = unsafe { std::slice::from_raw_parts_mut(staging as *mut u8, host_bytes as usize) };
+                    let row = footprint.width as usize * 2;
+                    for (src, dst) in guest.chunks(src.footprint.row_pitch as usize).zip(rgba.chunks_mut(footprint.row_pitch as usize)) {
+                        crate::texture::expand_row(format, &src[..row], dst);
+                    }
+                });
+            } else {
+                list.defer_fill(staging, data, bytes as usize);
+            }
+            from.footprint = footprint;
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, host_bytes));
             }
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::incompatible_copy(crate::resource::packed_format(src.resource), packed) {
+                return;
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -754,7 +824,7 @@ extern "system" fn copy_texture_region(
             from.resource = texture.as_raw().cast_const().cast();
         }
         ensure_state(list, dst.resource, COPY_DEST);
-        crate::texture::host_writes(list, dst.resource);
+        dst_write.record(list);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -797,6 +867,22 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Doubling a packed pitch preserves its alignment and doubles every texel offset.
+#[cfg(windows)]
+fn host_footprint(mut f: crate::resource::PlacedFootprint, packed: Option<u32>) -> Option<crate::resource::PlacedFootprint> {
+    f.offset = 0;
+    if packed.is_some() {
+        if crate::resource::element(f.format) != Some((2, 1)) || f.width == 0 || f.height == 0 || f.depth == 0
+            || f.width.checked_mul(2)? > f.row_pitch || !f.row_pitch.is_multiple_of(256)
+        {
+            return None;
+        }
+        f.format = 28;
+        f.row_pitch = f.row_pitch.checked_mul(2)?;
+    }
+    Some(f)
 }
 
 /// Texture read backs since the last frame-rate line: how many, bytes
@@ -853,7 +939,12 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
         refused!("a region outside its footprint");
     };
-    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, len)) else {
+    let packed = crate::resource::packed_format(src.resource);
+    let Some(footprint) = host_footprint(dst.footprint, packed) else {
+        refused!("invalid packed footprint");
+    };
+    let Some(host_bytes) = footprint.bytes() else { return };
+    let (Some(title), Some((buffer, data))) = (buffer_range(dst.resource, dst.footprint.offset, len), list.readback(host, host_bytes)) else {
         return;
     };
     if crate::texture::title_written(&texture) {
@@ -862,7 +953,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     ensure_state(list, src.resource, COPY_SOURCE);
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
-    to.footprint.offset = 0;
+    to.footprint = footprint;
     from.resource = texture.as_raw().cast_const().cast();
     #[cfg(feature = "diagnostics")]
     {
@@ -903,10 +994,20 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     };
     let (data, title) = (data as usize, title as usize);
     list.defer_after(move || {
+        let mut row = Vec::new();
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
             let _writing = crate::watch::writing(title + at, n);
-            crate::host::write_mapped((title + at) as *mut u8, (data + at) as *const u8, n);
+            let src = if let Some(format) = packed {
+                // SAFETY: the same region in the expanded footprint has twice the offset and length.
+                let rgba = unsafe { std::slice::from_raw_parts((data + at * 2) as *const u8, n * 2) };
+                row.resize(n, 0);
+                crate::texture::pack_row(format, rgba, &mut row);
+                row.as_ptr()
+            } else {
+                (data + at) as *const u8
+            };
+            crate::host::write_mapped((title + at) as *mut u8, src, n);
         }
     });
 }
@@ -935,31 +1036,37 @@ extern "system" fn resolve(
 ) {
     #[cfg(windows)]
     if let Some(list) = host_list(this)
-        && let (Some(to), Some(from)) = (
-            crate::resource::host_resource(dst),
+        && let (Some(dst_write), Some(from)) = (
+            crate::texture::prepare_host_write(dst),
             crate::resource::host_resource(src),
         )
     {
+        let to = dst_write.resource().clone();
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
         };
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
+        let packed = crate::resource::packed_format(dst);
+        if crate::texture::incompatible_copy(crate::resource::packed_format(src), packed) {
+            return;
+        }
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
-        crate::texture::host_writes(list, dst);
+        dst_write.record(list);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let planes = [(&b, src_sub), (&a, dst_sub)];
+            let stencil = is_stencil_plane(format, planes);
+            let host_format = if packed.is_some() { a.Format } else { resolve_format(format, planes) };
+            if (a.Width, a.Height) == (b.Width, b.Height) && !stencil {
                 list.list
-                    .ResolveSubresource(&to, dst_sub, &from, src_sub, format);
+                    .ResolveSubresource(&to, dst_sub, &from, src_sub, host_format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -976,14 +1083,61 @@ extern "system" fn resolve(
                     &from,
                     src_sub,
                     Some(&rect),
-                    format,
-                    D3D12_RESOLVE_MODE_AVERAGE,
+                    host_format,
+                    if stencil { STENCIL_RESOLVE_MODE } else { D3D12_RESOLVE_MODE_AVERAGE },
                 );
             }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
+}
+
+/// How a resolve of the stencil plane combines the samples of a pixel
+/// (format 120, and the stencil subresources of 118). The host refuses the
+/// average for stencil, an integer format; MAX is the rule we chose, NOT the
+/// console's (unknown for pixels whose samples differ; where they agree, any
+/// mode gives their value). At the edge of a drawn shape the samples inside
+/// carry the written value and those outside the one it replaced (usually
+/// the cleared 0): MAX keeps the written value, so a stencil mask is not
+/// eaten at its edges, where MIN would erase them and shrink every mask by
+/// the edge pixels. Change it here.
+#[cfg(windows)]
+const STENCIL_RESOLVE_MODE: windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE =
+    windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE_MAX;
+
+/// Whether a resolve in the console's `format` is of the stencil plane:
+/// format 120, or 118 where both subresources are stencil ones.
+#[cfg(windows)]
+fn is_stencil_plane(format: u32, subresources: [(&D3D12_RESOURCE_DESC, u32); 2]) -> bool {
+    format == 120 || (format == 118 && subresources.into_iter().all(|(desc, index)| !is_depth_plane(desc, index)))
+}
+
+/// On a 2D MSAA resolve, all mip levels and array slices of plane 0 (depth)
+/// precede the first stencil subresource.
+#[cfg(windows)]
+fn is_depth_plane(desc: &D3D12_RESOURCE_DESC, index: u32) -> bool {
+    index < u32::from(desc.MipLevels) * u32::from(desc.DepthOrArraySize)
+}
+
+/// A resolve of the depth plane of format 118 takes the plane's typed
+/// format, and one of the stencil plane its own (22). The host's
+/// depth/stencil view names both planes.
+#[cfg(windows)]
+fn resolve_format(
+    format: u32,
+    subresources: [(&D3D12_RESOURCE_DESC, u32); 2],
+) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+    };
+    if format == 118 && subresources.into_iter().all(|(desc, index)| is_depth_plane(desc, index)) {
+        DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+    } else if is_stencil_plane(format, subresources) {
+        DXGI_FORMAT_X32_TYPELESS_G8X24_UINT
+    } else {
+        DXGI_FORMAT(crate::resource::pc_format(format) as i32)
+    }
 }
 
 #[repr(C)]
@@ -1108,14 +1262,33 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// Host group counts and whether any last group is incomplete. D3D12
+/// accepts at most 65,535 groups along each axis.
+#[cfg(any(windows, test))]
+pub(crate) fn thread_groups(threads: [u32; 3], size: [u32; 3]) -> Option<([u32; 3], bool)> {
+    if size.contains(&0) || threads.contains(&0) {
+        return None;
+    }
+    let groups: [u32; 3] = std::array::from_fn(|i| threads[i].div_ceil(size[i]));
+    let partial = (0..3).any(|i| !threads[i].is_multiple_of(size[i]));
+    groups
+        .iter()
+        .all(|&g| g <= 65_535)
+        .then_some((groups, partial))
+}
+
+/// Direct compute dispatch with console dispatch-initiator flags.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+    // COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    if flags & 0x20 != 0 {
+        state::dispatch_threads(this, x, y, z);
+    } else {
+        state::dispatch(this, x, y, z);
+    }
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1204,7 +1377,7 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
-/// same address; null on failure. Grand Theft Auto VI's BVH builder puts
+/// same address; null on failure. The title's BVH builder puts
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
@@ -1503,7 +1676,11 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch::<false>(list, x, y, z));
+    }
+    pub(super) fn dispatch_threads(this: This, x: u32, y: u32, z: u32) {
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch::<true>(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1590,7 +1767,7 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
+/// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
 /// (12), mesh dispatch (12), and the console's single-pass dispatch, type
 /// 105 (stride 12: the three group counts; its flags live in the
@@ -1811,7 +1988,7 @@ const MORE_METHODS: [(usize, *const ()); 12] = [
 /// base list, after the clears (0x198/0x1a0 as before) and before
 /// ExecuteIndirect, which moved from 0x1d8 to 0x1e8: every slot from 0x1d8
 /// on is two later (taken here as starting exactly at 0x1d8). Inferred from
-/// Grand Theft Auto VI's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
+/// The title's call shapes: ExecuteIndirect 0x1e8, bottom-of-pipe
 /// writes 0x238/0x240, waits 0x248/0x250, depth bounds 0x230, shading rate
 /// 0x3f0/0x400, syncs 0x418/0x420, ResetX 0x458 (asserts on failure).
 const fn newer_slot(slot: usize) -> usize {
@@ -1821,7 +1998,7 @@ const fn newer_slot(slot: usize) -> usize {
 /// Methods only newer titles' lists have. 0x490: the enhanced barrier
 /// `(group count, groups)`, with 16-byte groups `(type, count, barriers)`
 /// and 40-byte buffer barriers (title+0x95e0 builds them). 0x470 `(u64)`,
-/// called from Grand Theft Auto VI's state flush with its result unused.
+/// called from the title's state flush with its result unused.
 /// shortcut: 0x470's purpose is unknown; ignored until a title shows it
 /// matters.
 const NEWER_METHODS: [(usize, *const ()); 3] = [
@@ -1854,6 +2031,9 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+mod resolve_tests;
 
 #[cfg(all(test, windows))]
 pub(crate) fn has_newer_table(list: This) -> bool {
@@ -1897,6 +2077,29 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolves_select_the_depth_format_only_when_both_subresources_are_depth() {
+        let src = D3D12_RESOURCE_DESC {
+            MipLevels: 1,
+            DepthOrArraySize: 2,
+            ..Default::default()
+        };
+        let dst = D3D12_RESOURCE_DESC {
+            MipLevels: 3,
+            ..src
+        };
+        let format = |guest, from, to| resolve_format(guest, [(&src, from), (&dst, to)]).0;
+        assert_eq!(format(118, 1, 5), 21);
+        assert_eq!(format(118, 2, 5), 20);
+        assert_eq!(format(118, 1, 6), 20);
+        assert_eq!(format(119, 1, 5), 21);
+        assert_eq!(format(120, 2, 6), 22);
+        assert_eq!(format(118, 2, 6), 22, "both subresources of the stencil plane");
+        assert_eq!(format(120, 0, 0), 22);
+        assert_eq!(format(28, 0, 0), 28);
     }
 
     #[test]
@@ -1996,7 +2199,7 @@ mod tests {
             (at(0x18), at(0x28), at(0x30))
         };
         assert!(put >= draw_limit && put >= api_limit);
-        // The console's ID3D12GraphicsCommandList6, as Grand Theft Auto VI asks.
+        // The console's ID3D12GraphicsCommandList6, as the title asks.
         let mut same = null;
         assert_eq!(list_query(list, &LIST_IIDS[7], &mut same), S_OK);
         assert_eq!(same, list);
@@ -2046,4 +2249,64 @@ mod tests {
             assert_eq!(release(object), 0);
         }
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn finishing_a_started_submission_does_not_reclaim_a_reset_lists_new_slots() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let release_obj = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        if host_list(list).is_none() {
+            assert_eq!(release_obj(list), 0);
+            assert_eq!(release_obj(allocator), 0);
+            return; // no host GPU
+        }
+        let heap = 0x1000_0006;
+        with_state(list, |_, s| s.lease().add(heap, 10, 4));
+        assert_eq!(close(list), S_OK);
+        let Submission::Run(_, first_lease) = start(list) else {
+            panic!("list with host list should start");
+        };
+        // Concurrent reset after bottom-of-pipe writes replaces `State`'s lease
+        // and records new unsubmitted slots on the reset list.
+        assert_eq!(reset(list, allocator, null), S_OK);
+        with_state(list, |_, s| s.lease().add(heap, 20, 4));
+        first_lease.finish();
+        assert!(
+            !crate::descriptor::lease::reclaim(heap, |_| {
+                panic!("unsubmitted slots of the reset list must not be reclaimed")
+            })
+        );
+        with_state(list, |_, s| {
+            assert!(!s.lease().is_lost());
+            assert_eq!(s.lease().take(), [(heap, 20, 4)]);
+        });
+        // Concurrent release after `start` drops the list before `finish`.
+        with_state(list, |_, s| s.lease().add(heap, 30, 2));
+        assert_eq!(close(list), S_OK);
+        let Submission::Run(_, released_lease) = start(list) else {
+            panic!("list with host list should start");
+        };
+        assert_eq!(release_obj(list), 0);
+        assert_eq!(release_obj(allocator), 0);
+        released_lease.finish();
+        assert!(
+            !crate::descriptor::lease::reclaim(heap, |_| {
+                panic!("released list dropped its slots")
+            })
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "list/dispatch_tests.rs"]
+mod dispatch_tests;

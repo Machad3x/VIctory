@@ -81,6 +81,8 @@ fn program() -> HostShader {
     w.extend(s_load(1, 16, 4, 0x20)); // s[16:17] = descriptor 1, dwords 0-1
     w.push(S_WAITCNT_ALL);
     w.extend(s_load(0, 18, 16, 0x100)); // s18 = the dword at +0x100
+    // The buffer descriptor's record count and format, read as data.
+    w.extend(s_load(2, 20, 4, 0x28)); // s[20:21] = descriptor 1, dwords 2-3
     w.push(S_WAITCNT_ALL);
     // Pointers into a page no copy holds and into a 256 MiB region with no
     // block, read through: zeros, and both marked missed.
@@ -113,6 +115,10 @@ fn program() -> HostShader {
         w.push(v_mov_b32(5, k));
         w.extend(buffer_store_dword(5, 8, at));
     }
+    w.push(v_mov_b32(5, 20));
+    w.extend(buffer_store_dword(5, 8, 36));
+    w.push(v_mov_b32(7, 21));
+    w.extend(buffer_store_dword(7, 8, 40));
     w.push(S_ENDPGM);
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -188,6 +194,9 @@ fn program() -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");
@@ -251,9 +260,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     memory[0x84 / 4] = (-1.0f32).to_bits();
     let value = 0xCAFE_F00D;
     // Heap index 1 (the memory's view) has the title address, index 2 a
-    // texture's size fields.
+    // texture's size fields; four dwords per slot.
     let mut view_addresses = vec![0u32; 4 * 5];
     view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
+    let words = [0x0000_0100, 0x0500_0001];
+    view_addresses[6..8].copy_from_slice(&words);
     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
     view_addresses[9..12].copy_from_slice(&image);
     let mut ran = 0;
@@ -287,7 +298,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                             (3, Root::View { srv: true, data: view_addresses.clone() }),
                         ],
                         views: &[
-                            View::RawUav(9),
+                            View::RawUav(11),
                             View::Memory(&memory),
                             View::Pair,
                             View::NullPair,
@@ -300,7 +311,7 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(
                 out[0],
-                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2]],
+                [0x1111_1111, 0x2222_2222, 0x2222_2222, 0, 0, 0x3333_3333, image[0], image[1], image[2], words[0], words[1]],
                 "{label}: reads"
             );
             assert_eq!(out[1][0x40 / 4], value, "{label}: the store");
@@ -417,6 +428,9 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");
@@ -559,6 +573,9 @@ fn writes_through_views_mark_their_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: true,
     })
     .expect("lower");
@@ -630,12 +647,20 @@ fn writes_through_views_mark_their_pages() {
 /// mark their heap index (`emit`, "Read marks"): an `image_load` of the view
 /// at heap byte offset 32 (index 1) sets exactly the bit one past
 /// [`super::VIEW_READS`]. The same read through a table marks nothing (a
-/// table read makes its slot on the host).
+/// table read makes its slot on the host), unless the table entry is
+/// computed (a descriptor array: the host makes only the entries the
+/// used-resource list names).
 #[test]
 fn heap_direct_texture_reads_mark_their_heap_index() {
-    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32| {
+    let lower_with = |root: RootType, used: Vec<UsedResource>, offset: u32, dynamic: bool| {
         let mut w = vec![s_mov_b32(5, ZERO as u8)];
-        w.extend(s_load(3, 12, 4, offset));
+        let mut load = s_load(3, 12, 4, offset);
+        if dynamic {
+            // v_readfirstlane_b32 s6, v0; s_lshl_b32 s6, s6, 5; s6 the soffset.
+            w.extend([0x7E0C_0500, 0x8F06_8506]);
+            load[1] = 6 << 25 | offset;
+        }
+        w.extend(load);
         w.push(S_WAITCNT_ALL);
         w.extend((0..2).map(|v| v_mov_b32(v, ZERO)));
         // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
@@ -675,26 +700,31 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            target: super::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
             view_marks: true,
         })
         .expect("lower")
     };
-    let table = lower_with(
-        RootType::Table,
-        vec![UsedResource {
-            kind: ResourceType::Srv,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 8,
-            user_data: 4,
-            slot: 0,
-        }],
-        0,
-    );
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 4,
+        slot: 0,
+    }];
+    let table = lower_with(RootType::Table, used.clone(), 0, false);
     assert!(!table.view_marks, "a table read marks nothing");
-    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32);
+    let computed = lower_with(RootType::Table, used, 0, true);
+    assert!(
+        computed.view_marks && !computed.heap,
+        "a read at a computed table entry is marked"
+    );
+    let l = lower_with(RootType::ResourceHeap, Vec::new(), 32, false);
     assert!(l.view_marks && l.heap, "a heap-direct read is marked");
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -799,6 +829,9 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
         view_marks: false,
     })
     .expect("lower");

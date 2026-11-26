@@ -1,6 +1,7 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
+//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
+//! or 1.8 for compute derivatives).
 
 use super::bitcode::{Attr, Md, Module, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
@@ -15,10 +16,23 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view-stride table: dword `i` is the byte stride of
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
-/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
+/// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats,
+/// and between the two ([`VIEW_SKIP_SHIFT`]) the bytes the host's view
+/// starts before it.
 pub const VIEW_STRIDES: u8 = 255;
+/// Where a view-stride table dword keeps the bytes (0, 4, 8 or 12) the
+/// host's raw view of a structured buffer view starts before the view's
+/// first byte; the stride is in the bits below. A raw view starts on 16
+/// bytes (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), a console view on any
+/// dword: element 1 of a 12-, 24- or 456-byte stride is not on 16. The
+/// host makes such a view raw from the 16 bytes below, in its buffer's own
+/// copy, and translated programs add these bytes to every byte they
+/// address through it (`emit`, "Views off 16 bytes"). From astrosteveo's
+/// review of #1762: a copy of the view's own bytes instead missed writes
+/// made through the buffer's view in the same list, and the reverse.
+pub const VIEW_SKIP_SHIFT: u32 = 24;
 /// The bits of a view-stride table dword holding the stride.
-pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+pub const VIEW_STRIDE_BITS: u32 = (1 << VIEW_SKIP_SHIFT) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format
 /// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
@@ -63,6 +77,9 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
+    /// 64-bit floating point (`fptrunc` from a `double`).
+    pub const FLOAT64: u64 = 1 << 2;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -132,6 +149,11 @@ pub(crate) struct Shader {
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
+    /// The heap index of each handle of a raw buffer view, shader resource
+    /// or unordered access (its view-stride entry gives the bytes the
+    /// host's view starts early, [`VIEW_SKIP_SHIFT`]): as asked for, and
+    /// clamped below [`HEAP_VIEWS`].
+    pub buffer_index: std::collections::HashMap<V, (V, V)>,
     /// The heap index of each handle of a texture shader view (its reads
     /// are marked, `emit` "Read marks"), and those the instruction being
     /// lowered uses.
@@ -144,11 +166,29 @@ pub(crate) struct Shader {
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Compute derivatives require validator 1.8 rather than 1.6 or 1.7.
+    compute_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
     main: V,
     pub entry: usize,
+    /// The `dx.op` operations called (names without overload).
+    ops: std::collections::BTreeSet<String>,
+}
+
+thread_local! {
+    /// See [`last_summary`].
+    static LAST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// What the module this thread finished last declares and calls: its
+/// thread-group size and wave size, and its `dx.op` operations. A
+/// diagnostic for tools that report a module the validator refuses, since
+/// the validator's message for an operation the stage or the entry's
+/// properties do not allow names neither.
+pub(crate) fn last_summary() -> String {
+    LAST.with(|l| l.borrow().clone())
 }
 
 impl Shader {
@@ -201,16 +241,19 @@ impl Shader {
             view_marks: None,
             view_writes: None,
             view_index: std::collections::HashMap::new(),
+            buffer_index: std::collections::HashMap::new(),
             texture_index: std::collections::HashMap::new(),
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
             wave_size: None,
+            compute_derivatives: false,
             lds_dwords: 0,
             lds: None,
             main,
             entry,
+            ops: std::collections::BTreeSet::new(),
         }
     }
 
@@ -236,10 +279,25 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Validators before 1.8 reject gradient operations outside the
+        // pixel stage. This set matches DXC's gradient classification:
+        // the implicit-derivative samples (60/61/64) and the LOD query
+        // (81), plus the explicit derivatives (83..=86). Bfi and the dot
+        // products (53..=56) are arithmetic and stay on 1.6, and
+        // SampleGrad/SampleLevel (62/63) take explicit gradients, so the
+        // validator already accepts them in compute.
+        if self.threads.is_some()
+            && self.mesh.is_none()
+            && matches!(opcode, 60 | 61 | 64 | 81 | 83..=86)
+        {
+            self.compute_derivatives = true;
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
         self.m.ptr(fty);
+        self.ops
+            .insert(name.split('.').next().unwrap_or(name).to_owned());
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
@@ -540,6 +598,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        let asked = index;
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.
         let last = self.m.i32(if sampler { HEAP_SAMPLERS } else { HEAP_VIEWS } - 1);
@@ -561,6 +620,9 @@ impl Shader {
         if !sampler && (kind == 10 || props.0 & 0x1000 != 0 && (11..=12).contains(&kind)) {
             self.view_index.insert(h, index);
         }
+        if !sampler && props.0 & 0xFF == 11 {
+            self.buffer_index.insert(h, (asked, index));
+        }
         // Texture shader views (kinds 1-9).
         if !sampler && props.0 & 0x1000 == 0 && (1..=9).contains(&kind) {
             self.texture_index.insert(h, index);
@@ -570,6 +632,13 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let threads = self
+            .threads
+            .map_or(String::new(), |[x, y, z]| format!("threads {x}x{y}x{z}, "));
+        let wave = self.wave_size.map_or("any".to_owned(), |n| n.to_string());
+        let ops: Vec<&str> = self.ops.iter().map(String::as_str).collect();
+        let summary = format!("{threads}wave size {wave}; ops: {}", ops.join(", "));
+        LAST.with(|l| *l.borrow_mut() = summary);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The flags of what lowering made, as the module writes it: what only
@@ -902,7 +971,10 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let val_minor = if self.compute_derivatives { 8 } else { 6 };
+        let val_minor = i32c(&mut self, val_minor);
+        let val_version = self.m.md_node(vec![Some(one), Some(val_minor)]);
+        self.m.named_md("dx.valver", vec![val_version]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -942,8 +1014,14 @@ impl Shader {
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
         }
+        if self.flags & flags::FLOAT64 != 0 {
+            features |= 0x1;
+        }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
@@ -976,6 +1054,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            validator18: self.compute_derivatives,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -1040,8 +1119,130 @@ impl Shader {
 
 #[cfg(all(test, windows))]
 mod tests {
-    use super::super::bitcode::Term;
+    use super::super::bitcode::{Cast, Term};
+    use super::super::validator;
     use super::*;
+
+    /// Builds a compute shader calling `opcode` and returns its container
+    /// plus the derivative flag as detected by `op`. `Some(v)` overrides
+    /// the flag before the container is written.
+    fn compute_with_op(
+        opcode: u32,
+        name: &str,
+        attr: Attr,
+        args: usize,
+        validator18: Option<bool>,
+    ) -> (Vec<u8>, bool) {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.wave_size = Some(32);
+        let block = s.entry;
+        let zero = s.m.f32(0);
+        let args = vec![zero; args];
+        let ret = s.t.f32;
+        let out = s.op(block, name, attr, ret, opcode, &args);
+        keep(&mut s, out);
+        let detected = s.compute_derivatives;
+        if let Some(v) = validator18 {
+            s.compute_derivatives = v;
+        }
+        s.m.terminate(block, Term::Ret);
+        (s.finish(), detected)
+    }
+
+    /// Stores `x` in shared memory: the writer leaves out a call whose
+    /// result nothing reads.
+    fn keep(s: &mut Shader, x: V) {
+        let block = s.entry;
+        s.lds_dwords = 1;
+        let (lds, zero, i32t) = (s.lds(), s.m.i32(0), s.t.i32);
+        let at = s.m.element(block, lds, zero);
+        let bits = s.m.cast(block, Cast::Bitcast, x, i32t);
+        s.m.store(block, at, bits);
+    }
+
+    #[test]
+    fn compute_implicit_sample_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([32, 1, 1]);
+        s.wave_size = Some(32);
+        s.samplers = 1;
+        let block = s.entry;
+        let index = s.m.i32(0);
+        let texture = s.heap_handle(block, index, false, false, (2, 1033));
+        let sampler = s.sampler_handle(block, 0);
+        let zero = s.m.f32(0);
+        let fu = s.m.undef(s.t.f32);
+        let iu = s.m.undef(s.t.i32);
+        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+        let ret = s.t.res_ret;
+        let out = s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+        let x = s.m.extract(block, out, 0);
+        keep(&mut s, x);
+        assert!(s.compute_derivatives);
+        s.m.terminate(block, Term::Ret);
+        let mut dxil = s.finish();
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+
+        // The same module declared as validator 1.6 must be rejected.
+        let mut legacy = {
+            let mut s = Shader::new(false);
+            s.threads = Some([32, 1, 1]);
+            s.wave_size = Some(32);
+            s.samplers = 1;
+            let block = s.entry;
+            let index = s.m.i32(0);
+            let texture = s.heap_handle(block, index, false, false, (2, 1033));
+            let sampler = s.sampler_handle(block, 0);
+            let zero = s.m.f32(0);
+            let fu = s.m.undef(s.t.f32);
+            let iu = s.m.undef(s.t.i32);
+            let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+            let ret = s.t.res_ret;
+            let out = s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+            let x = s.m.extract(block, out, 0);
+            keep(&mut s, x);
+            s.compute_derivatives = false;
+            s.m.terminate(block, Term::Ret);
+            s.finish()
+        };
+        assert!(validator.validate(&mut legacy).is_err());
+    }
+
+    #[test]
+    fn compute_explicit_derivative_validates() {
+        // DerivCoarseX (83): rejected before validator 1.8 like the
+        // implicit-derivative samples.
+        let (mut dxil, detected) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(true));
+        assert!(detected);
+        let (mut legacy, _) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(false));
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+        assert!(validator.validate(&mut legacy).is_err());
+    }
+
+    #[test]
+    fn compute_dot3_stays_on_validator_1_6() {
+        // Dot3 (55) is arithmetic, not a gradient op: it must not bump the
+        // validator version, and the resulting 1.6 module validates.
+        let (mut dxil, detected) = compute_with_op(55, "dot3.f32", Attr::ReadNone, 6, None);
+        assert!(!detected);
+        let path = validator::Validator::default_path();
+        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        validator.validate(&mut dxil).unwrap();
+    }
 
     /// A program that sets a bit through the write marks' UAV, or (`heap`)
     /// through a UAV indexed from the heap: a vertex (`pixel` false, no

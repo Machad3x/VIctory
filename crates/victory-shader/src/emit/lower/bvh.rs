@@ -123,9 +123,9 @@ impl Lower<'_> {
         let not7 = self.s.m.i32(!7);
         let lo = self.s.m.bin(c, Bin::And, node, not7);
         let nodes = match self.descriptors.get(&((b, i), false)).copied() {
-            Some(src) if matches!(src, Source::Built { .. }) => {
-                // shortcut: the root address is taken to be 256-byte aligned
-                // (the descriptor drops its low byte, not known here).
+            Some(src)
+                if matches!(src, Source::Built { .. }) && self.root_address(src).is_none() =>
+            {
                 let (k, dynamic) = self.built_offset(src)?;
                 let three = self.s.m.i32(3);
                 let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
@@ -134,20 +134,12 @@ impl Lower<'_> {
                 if let Some(d) = dynamic {
                     at = self.s.m.bin(c, Bin::Add, at, d);
                 }
-                // A root view is title memory there (bounds-checked).
-                match self.root_address(src) {
-                    Some((root_lo, root_hi)) => {
-                        self.s.flags |= super::flags::INT64;
-                        let base = wide64(self, root_lo, root_hi);
-                        let zero = self.s.m.i32(0);
-                        let at = wide64(self, at, zero);
-                        Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
-                    }
-                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
-                }
+                Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at)
             }
-            Some(_) => return Err("a BVH descriptor"),
-            None => {
+            Some(src) if !matches!(src, Source::Built { .. }) => {
+                return Err("a BVH descriptor");
+            }
+            _ => {
                 // base = (dword 0 | dword 1 bits 0-7 << 32) << 8.
                 let Operand::Scalar { code, .. } = *rsrc else {
                     return Err("a BVH descriptor");

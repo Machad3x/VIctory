@@ -1,8 +1,8 @@
 //! Host pipelines are made by workers, not by the title thread that first
 //! records a draw with them. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each (structurisation of the
-//! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and Grand
-//! Theft Auto VI's first world frame wants over 1,200 new pipelines: made
+//! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and the
+//! title's first world frame wants over 1,200 new pipelines: made
 //! on its recording threads, that frame took more than 30 s and the
 //! title's GPU watchdog ended the run (decision 0007, "Pipelines made off
 //! the title's threads").
@@ -14,9 +14,15 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! Passes over the screen ([`GraphicsState::screen_pass`]) go ahead of
+//! every other pipeline and have a longer budget of their own: the
+//! title fills its lighting tables (`PS_IntegrateEnvBRDF*`,
+//! `PS_AreaLightIlluminance`) with such draws once, at the world's first
+//! frame, behind more than a thousand other pipelines. Dropped, the tables
+//! stay empty for the whole run. Idea from Belobug's fork (18e57db).
+//!
+//! shortcut: both budgets are guesses; any other pass the title runs only
+//! once and whose pipeline takes longer than half a second is lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -82,6 +88,10 @@ impl Pending {
             skipped_shader,
             used: AtomicBool::new(false),
         }
+    }
+
+    fn screen(&self) -> bool {
+        self.graphics.as_ref().is_some_and(|g| g.screen_pass())
     }
 
     fn make(&self) {
@@ -180,6 +190,19 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
 
+/// The same for passes over the screen, below the title's 30 s GPU watchdog.
+const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+
+/// The queue a pipeline goes into, the first served first: passes over the
+/// screen a draw waits for, other draws' pipelines, early starts.
+fn lane(screen: bool, now: bool) -> usize {
+    match (now, screen) {
+        (true, true) => 0,
+        (true, false) => 1,
+        (false, _) => 2,
+    }
+}
+
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -235,12 +258,16 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    // The frame and what was waited of it: other pipelines, screen passes.
+    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
+    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let screen = p.screen();
+    let (of_frame, waited) = (&FRAME[usize::from(screen)], &WAITED_US[usize::from(screen)]);
+    if of_frame.swap(frame, Ordering::Relaxed) != frame {
+        waited.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let budget = if screen { SCREEN_BUDGET } else { BUDGET };
+    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -251,13 +278,12 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Pipelines for the workers, by [`lane`].
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 3]>, Condvar) =
+    (Mutex::new([const { VecDeque::new() }; 3]), Condvar::new());
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
@@ -286,7 +312,8 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    let lane = lane(p.screen(), now);
+    lock.lock().unwrap_or_else(|e| e.into_inner())[lane].push_back(p);
     work.notify_one();
 }
 
@@ -385,6 +412,16 @@ mod tests {
         assert_eq!(enqueue(&r, false), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
         WAITING.fetch_sub(3, Ordering::Relaxed);
+    }
+
+    /// A draw's screen pass is served before other draws' pipelines, those
+    /// before early starts.
+    #[test]
+    fn screen_passes_go_first() {
+        assert!(lane(true, true) < lane(false, true));
+        assert!(lane(false, true) < lane(true, false));
+        assert_eq!(lane(true, false), lane(false, false));
+        assert!(!Pending::new(Vec::new(), None).screen());
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

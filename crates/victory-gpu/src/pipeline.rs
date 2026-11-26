@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
+//! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -65,6 +65,8 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    partial: OnceLock<Option<host::HostPipeline>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -95,6 +97,8 @@ impl Shader {
             container: bytes.to_vec(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            partial: OnceLock::new(),
         }
     }
 
@@ -106,15 +110,53 @@ impl Shader {
     }
 }
 
+/// Tests: a shader whose translation is `translated` (its container is
+/// the host code), for host pipelines without a console program.
+#[cfg(all(test, windows))]
+pub(crate) fn translated_for_test(
+    stage: &'static str,
+    translated: Translated,
+) -> std::sync::Arc<Shader> {
+    let shader = Shader::new(stage, &translated.host.dxil);
+    let _ = shader.translated.set(Some(translated));
+    std::sync::Arc::new(shader)
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    pub(crate) threads: Option<[u32; 3]>,
 }
 
 #[cfg(windows)]
 impl Shader {
+    /// Compile the bounded form once, on the first incomplete dispatch of
+    /// this program. The pipeline library keys it by its own DXIL and root.
+    pub(crate) fn partial_dispatch(&self) -> Option<&host::HostPipeline> {
+        self.partial
+            .get_or_init(|| {
+                let options = victory_shader::emit::Options {
+                    view_marks: true,
+                    target: crate::shader_cache::host_target(),
+                };
+                let host = victory_shader::emit::translate_partial_dispatch(
+                    &self.container,
+                    options,
+                )
+                .inspect_err(
+                    |e| tracing::warn!(hash = %self.hash, error = %e, "partial dispatch refused"),
+                )
+                .ok()?;
+                let translated = with_resources(&self.container, host).ok()?;
+                let mut shader = Shader::new(self.stage, &self.container);
+                shader.translated = OnceLock::from(Some(translated));
+                host::HostPipeline::new(&[Arc::new(shader)], None)
+            })
+            .as_ref()
+    }
+
     /// The translation, made on first use (or taken from the cache); a
     /// shader that does not translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -178,7 +220,8 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
 fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
+    let target = crate::shader_cache::host_target();
+    let (host, cached) = crate::shader_cache::host_shader(container, target);
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
@@ -189,7 +232,7 @@ fn with_resources(
 ) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
+    let program = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -198,12 +241,19 @@ fn with_resources(
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used })
+    let threads = program.as_ref().and_then(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) => Some(cs.threads),
+        _ => None,
+    });
+    let used = program.map(|p| p.used).unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        threads,
+    })
 }
 
 #[repr(C)]
@@ -337,6 +387,16 @@ pub(crate) fn note_drop(this: This) {
             .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
+        // A pass the title runs once is lost if dropped here: name each
+        // pipeline dropped while being made, once.
+        if why == "being made" {
+            static NAMED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+            let name = format!("{:?}", pipeline(this).shaders);
+            let mut named = NAMED.lock().unwrap_or_else(|e| e.into_inner());
+            if named.get_or_insert_default().insert(name.clone()) {
+                tracing::info!(shaders = name, "first drop of a pipeline being made");
+            }
+        }
         note_why(why);
     }
 }
@@ -789,7 +849,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
+    /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
     /// topology, render target and depth formats: 0x2b0 bytes.
