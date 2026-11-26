@@ -1,6 +1,14 @@
-# VIctory
+# VIctory (NVIDIA RTX 3080 Ti fork)
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+> **This is a fork** of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)
+> for one machine: Ryzen 7 5700X, GeForce RTX 3080 Ti 12 GB (driver 621.24),
+> 32 GB RAM, Windows 11, resizable BAR on. It stacks open upstream pull
+> requests and a few local changes, each kept only after tests and a game run.
+> The work is theirs and upstream's; commits keep their authors. Nothing here
+> is tested on other hardware. No game files are included or distributed.
+> Details and measurements: [docs/fork-nvidia-3080ti.md](docs/fork-nvidia-3080ti.md).
+
+Runs the title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
@@ -8,7 +16,50 @@ the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-25)
+## Status of this fork (2026-11-25)
+
+**Not playable yet.** The title boots, runs its menus, loads the world and
+reaches play inside the prison cell of the first mission: about 1.5 frames per
+second, with rendering defects.
+
+| At the cell window (median of one 7-minute run) | |
+|---|---|
+| Frame time | about 670 to 690 ms (about 920 ms before the video-memory copies and the later changes) |
+| GPU step | about 300 ms |
+| Draws and dispatches dropped per frame | 0 in most reports |
+| Device removals in recent runs | none |
+
+What renders: the window with its wired glass, the yard with people, the
+character with hair and clothing, cutscenes, and in some runs the lit cell
+walls and poster. What does not yet: interior lighting varies from run to run
+(the walls are often black), colour banding, and a few shader programs that do
+not translate. In Series S mode the picture turns black after the opening card.
+
+### Running it on this fork
+
+Resizable BAR must be on for the two upload switches. A missed update in a
+copy shaders write corrupts memory silently: turn
+`VICTORY_GPU_UPLOAD_WRITES` off first if something new looks broken.
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics --locked
+```
+
+```powershell
+.utotest.ps1 -Name run1 -Seconds 420 -Warm -Game <game dir>
+```
+
+`autotest.ps1` sets `VICTORY_GPU_UPLOAD=1`, `VICTORY_GPU_UPLOAD_WRITES=1`,
+`VICTORY_SUBMIT_MAX_RUNS=1` and a shader loop limit of 4096, presses Enter at
+the start, takes screenshots and prints a summary. It needs the diagnostics
+build (a release build ignores the key presses and the loop limit). The
+plain release steps under Getting started work too, without those settings.
+
+Changes in this fork are made with AI assistance (Claude Code).
+
+## Status of upstream (2026-11-25)
+
+As upstream describes it, on its own test machine.
 
 **Not playable yet, because of the framerate: about 1 frame per second in the
 world.** Nothing else keeps the game from working: the title boots, runs its

@@ -1,0 +1,305 @@
+# Fork notes: NVIDIA RTX 3080 Ti
+
+This fork stacks open upstream pull requests on `main` (940d32f, then merged
+with `main` at 67e8ae1) and a few local changes, aimed at one machine: Ryzen 7 5700X, RTX 3080 Ti 12 GB
+(driver 621.24), 32 GB RAM, Windows 11. Nothing here is tested elsewhere.
+
+## How the console and this host differ
+
+| | Xbox Series | RTX 3080 Ti |
+|---|---|---|
+| Memory | One GDDR6 pool; CPU and GPU use the same addresses | Separate video memory; the host keeps copies of title memory and writes GPU results back |
+| Waves | 64 and 32 lanes | 32 lanes only: wave64 programs need translation to two host waves |
+| Rectangle lists | A hardware primitive | Emulated with a geometry shader |
+| View descriptors | The title lays out 1,245,184 | Shader-visible heaps are capped at 1,000,000 |
+
+## Changes and why
+
+| Problem seen | Cause | Change |
+|---|---|---|
+| Black world, device removed | Raw loads through structured views read 0; view-address tables did not cover tables made afresh | #1762, #1906, #2098 |
+| Over-exposed, unlit picture | Wave64 lighting passes refused | #439 (replaces #1960 here) |
+| Dynamic descriptor slots dropped | Capped view heap left too little room | #1751, #1548 and a local change keeping room for view pairs |
+| Saw-tooth triangles on a tile grid | The fourth corner of a rectangle was added across the wrong diagonal | #2366 |
+| Stretched triangles and missing heads | The ray-tracing builder ran only in part: 5 of its 52 programs (wave64 in groups of more than 64 threads) did not translate, and the others wrote results computed from data never produced | b3efa1c from #2214 (console flow for groups of several console waves); offline all 52 programs translate and validate |
+| About 240 dispatches a frame dropped without a message, up to 2,171 while the world loads: the ray-tracing builder never finished its structures | The host took any user-data dword numbered 4 for a root view offset, so root constants with five or more dwords found no view | Local: only a root descriptor's entry takes a view offset |
+| Compute passes with implicit-derivative samples refused in the console flow | Such a sample is not valid in a split wave64 | Local: a gradient sample with the quad's gradients from lane reads |
+| Descriptors chosen by control flow refused | The choice was not followed through nested joins and selects | #2342 |
+| One-off passes lost at the world's first frame (lighting tables) | Their pipelines waited behind more than a thousand others, past the half-second budget | Local: passes over the screen go first and may be waited for up to 20 s (idea from Belobug's fork) |
+
+Other upstream pull requests in the stack: #688, #1065, #1763, #1800, #1883,
+#1989, #1993, #1750, #2062, #2088, #2136, #2175, #2242, #2289, #2324, #2325,
+#2229, #2332, #2342, #2345, #2346, #2348, #2355, #2377, #2382, #2402.
+
+## Last measured run
+
+6 minutes with the root view offset fix, against the same stack without it
+(two runs, 15 and 8 minutes), steady state in the world:
+
+| Mean of the last 20 reports | Without (2 runs) | With (1 run) |
+|---|---|---|
+| Draws and dispatches dropped per frame | 252-253 | 18 |
+| Copy-back per frame | 231-272 ms | 156 ms |
+| Time on the GPU per frame | 488-531 ms | 551 ms |
+| Frame time | 904-1000 ms | 901 ms |
+
+A later 10-minute run after a cache warm-up, with #2229 and #2402 added,
+kept 18 drops and about 0.9 s a frame; its screenshots show the walls around
+the cell window drawn (unlit), where earlier runs showed sky, and the yard
+with people outside.
+
+No device removal in either. Picture quality varies between moments of a run:
+runs with and without the fix both have dark and broken frames, and it is not
+the intended picture yet (interior walls, hair and window glass are missing).
+The screen-pass priority has not been exercised by a run without a pipeline
+cache.
+
+## Merge of upstream `main` (82 commits)
+
+Upstream's newer mechanisms replace some stacked changes (rectangle corners of
+#2366, two memory and copy changes). Offline, refused containers went from 260
+to 223; all 52 builder programs translate. In the game, the cell window shows
+its wired glass and the yard behind it, far closer to the intended picture.
+
+| Steady state, no pipeline being made | Before | Merged |
+|---|---|---|
+| Frame time | about 0.9 s | 0.9 to 1.1 s |
+| Title memory copied per frame | about 98 MB | about 400 MB |
+| Video memory used | not recorded | 10.9 of 11.8 GB (textures are given up past 90%) |
+
+The copies and the memory use are open problems. The runs so far had
+`VICTORY_SHADER_LOOP_LIMIT=4096` set by `autotest.ps1`: translated loops stop
+after 4,096 iterations instead of 2^20.
+
+## After the merge
+
+| Change | What it addresses |
+|---|---|
+| #2626 | The 16-bit packed colour formats: targets this driver cannot write are RGBA8 on the host, with texels converted. Replaces the stand-in that read four-bit colours as five-bit ones |
+| #2601 | Textures with host writes still pending are not given up |
+| #2598 | Giving up a texture leaves the dynamic slots of recorded lists alone |
+| #2576 | Read marks of forgotten slots are cleared before the submission runs |
+| #2611 | A buffered piece of a command stream runs before its memory wait is evaluated |
+
+A 10-minute run with these reached play inside the cell (about 7,000 draws a
+frame, 1.0 to 1.2 s, 29 dropped from seven programs that do not translate), with
+no device removal. The cutscenes looked better and the lighting followed the
+character; colour banding remains.
+
+Of the view heap, the title wrote 1,002,400 distinct slots in a 10-minute run,
+in 15,677 of its 32,768 blocks of 64: more than the host heap holds.
+
+### Frame time
+
+A frame is three steps in series: preparing (about 200 ms, title memory copies),
+the GPU (about 550 ms, each submission waited for) and the copy-back. At the
+window scene, copy-back was 181 ms in a run without #2280 and #2409 and 135 ms
+in one with them (means of 20 reports, one run each). The two runs also differ
+by #2626, #2601, #2598, #2576 and #2611, so the gain is not isolated.
+
+Title memory copied per frame stays near 400 MB. Some list reads memory with no
+host copy every frame, so what lists using title memory wrote (about 280 MB of
+views) is withheld and then copied again from title memory. The diagnostics
+build shows misses both on committed, mapped title memory, which the console
+would read, and on addresses with nothing there.
+
+Copies made for the missed pages (local branch `claude/demand-copies`) did not
+lower the frame time: unbounded they reached 11 GB and 18 s of copy-back a
+frame, and bounded to 512 MiB the budget filled while the world loaded, with
+the window scene still missing 70 to 90 pages a frame.
+
+## Copies in video memory
+
+Host copies of title buffers are in system memory, so shaders read them over
+PCIe. `autotest.ps1` sets `VICTORY_GPU_UPLOAD=1` (#2120: buffers the title makes
+without unordered access) and `VICTORY_GPU_UPLOAD_WRITES=1` (#2130: the others,
+with a mirror in system memory that the CPU reads). Both need resizable BAR.
+
+Window scene, means of 20 reports, one run each:
+
+| | Frame | Preparing | GPU | Copy-back |
+|---|---|---|---|---|
+| Neither | 919 ms | 203 | 577 | 135 |
+| #2120 | 881 ms | 189 | 557 | 131 |
+| #2130, mirror always written | 869 ms | 288 | 296 | 282 |
+| #2130, lazy mirror | 792 ms | 270 | 334 | 183 |
+
+The GPU step is much shorter; the CPU pays part of it back. A copy shaders
+write must reach title memory through the mirror, so a missed update there
+corrupts memory silently: set `VICTORY_GPU_UPLOAD_WRITES=0` first when
+something new looks broken. `victory-gpu` tests pass with both switches on.
+
+## Copy-back on several threads
+
+Local change: the marked pages of a submission go back to title memory on up to
+six threads, each page on one thread (about 2,000 pages of 64 KiB a frame).
+Same scene and switches, medians of 30 and 35 reports, one run each:
+
+| | Frame | Copy-back | Marked pages |
+|---|---|---|---|
+| One thread | 777 ms | 184 ms | 166 ms |
+| Several | 690 ms | 124 ms | 111 ms |
+
+Two reports of the second run fell in a burst of streaming (1.4 to 2.0 GB
+copied a frame), which its means include and its medians do not.
+
+## Refresh threads and smaller per-draw costs
+
+| Change | What it addresses |
+|---|---|
+| #2051 | A submission's refreshes copy on several threads. Ported: mirrored copies and ranges with bytes saved for a copy-back still copy at once |
+| #1978 | No texture layouts or name copies per draw for unchanged answers |
+| #2102 | Per-list and per-submission sets hash with FxHash |
+| #2724 | Texture reads at a computed table entry keep their read mark |
+
+One run with the four (`-Warm`), the character moved during it, so the scene
+numbers are indicative: median window frame 717 ms (690 in the run before),
+copies 84 ms for 414 MB (95 ms), copy-back 122 ms. No device removal, the same
+seven programs untranslated, and rooms of up to 13,600 draws a frame were
+walked through.
+
+## Descriptors read as data
+
+#2363, with the record count and format derived from the view (the pull
+request's head copies host-layout words there). The program that failed with
+"a descriptor read only as data" translates, leaving six untranslated. One run:
+median window frame 733 ms (717 before, within the spread between runs), and
+the window scene showed the lit block wall, the poster and the shirt lettering.
+
+## Permlane and half sums
+
+#1737 (`v_permlane16_b32`, `v_permlanex16_b32`) and a local change: whole-wave
+16-bit float sums in a wave64 program split in halves. One 7-minute run each,
+window scene medians:
+
+| | Before | After |
+|---|---|---|
+| Programs not translated in the run | 6 | 4 |
+| Draws and dispatches dropped per frame | 15 | 1 |
+| Shader containers refused offline | 223 | 218 |
+| Frame time | 717-733 ms (two runs) | 669 ms |
+| GPU step | 327-347 ms | 310 ms |
+
+No device removal. The cell walls were as dark in this run as in some earlier
+ones; the lighting at the window still differs from run to run.
+
+## Geometry, depth twins and texture decoding
+
+| Change | What it addresses |
+|---|---|
+| #2729 | One rectangle corner order across vertex streams |
+| #2737 | Depth textures and their writable twins copy directly; D32 twins exist |
+| #2736, #2735 | Faster tiled texture copies and BC7 BCPack decoding |
+| #2786 | Texture refresh workers are kept between submissions |
+| #2365, #2382 | Whole-wave sections: a scalar's halves kept apart, better refusal reasons |
+
+Window scene, median of one run: 659 ms a frame, GPU step 308 ms (669 and
+310 before), no device removal.
+
+## Whole-wave sections in partial groups
+
+Local change: wave64 compute programs with a whole-wave section run in groups
+that are not whole console waves (1, 32 and 36 threads here, among them the
+exposure pass's average luminance and a deferred lighting pass). Offline,
+refused containers went from 218 to 214. In one run, three programs stay
+untranslated and the window scene's typical frame dropped none. The GPU step
+settled at 304 to 320 ms, after a first part of the run at up to 460 ms
+(median 331 ms, against 308 before).
+
+## Partial image stores, restored masks, first-lane reads
+
+| Change | What it addresses |
+|---|---|
+| #332 | `image_store` with partial channel masks translates |
+| #2816 | A wave64 mask restored dword by dword is recognised as that mask; a test that expected a refusal now runs on the GPU and takes the right lanes |
+| #2831 | Dwords read from the first lane outside a waterfall are one lane's |
+
+Offline, refused containers went from 214 to 213. One 7-minute run each,
+window scene medians:
+
+| | Before | After |
+|---|---|---|
+| Frame time | 694 ms | 670 ms |
+| GPU step | 331 ms | 307 ms |
+| Copy-back | 120 ms | 112 ms |
+
+No device removal, the same three programs untranslated, and the window,
+yard and character drawn as intended; the cell walls were black in this run.
+
+## Series S
+
+One 7-minute run with `-Console series-s`, before the three changes above:
+the title reached play (3,800 to 5,800 draws a frame, 0.5 to 1.9 s) with no
+device removal, but the picture turned grey and then black after the opening
+card. Seen in its log, none confirmed as the cause: four compute programs
+whose whole-wave sections do not translate besides the two water ones, one
+refused for a partial-channel image store (#332 addresses that), and a
+1920x1080 target in format 67 with no host texture (#2832 addresses that;
+not ported, it overlaps #2626 here).
+
+## Thread-count dispatches and placed texture writes
+
+| Change | What it addresses |
+|---|---|
+| #2841 | `DispatchX` with the thread-dimensions flag (0x20) counts threads, not groups: the ray-tracing builder dispatches this way and ran many times its groups |
+| Local | The bounded form's entry guard numbers console lanes in its own block (with the console flow, #2841 alone panicked at world load) |
+| #1273 | Unordered views of textures the title placed bind the texture instead of a null view |
+| Local, as #2851 | A null shader view has no aliased copy (#1273 alone ended the process at world load) |
+
+One 7-minute run, window scene medians:
+
+| | Before | After |
+|---|---|---|
+| Frame time | 670 ms | 688 ms |
+| GPU step | 307 ms | 299 ms |
+| Copy-back | 112 ms | 138 ms |
+
+No device removal, the same three programs untranslated. The picture is the
+closest to the intended one so far: the cell walls, the poster, the shirt
+lettering and the hair are lit. Interior lighting has differed between runs
+before, and this is one run. The longer copy-back is not explained yet, and
+blocky patches remain along the bottom.
+
+## Wide indirect dispatches
+
+| Change | What it addresses |
+|---|---|
+| Local, after avatarmanz 84eae352 | Indirect dispatches of more than 65,535 groups run whole: the title's tile lists are a group per tile, and the cut tiles were the lowest of the picture. This driver runs them without spreading them over z (upstream issue 2256) |
+| #2850 | Constant buffers of a reused descriptor table are refreshed |
+
+The blocky patches along the bottom of the window scene are gone in the
+screenshots of one 7-minute run (they were in the run before). Window scene
+medians: 692 ms a frame, GPU step 297 ms (675 and 314 the run before). The
+cell walls were black in both of these runs.
+
+## Tried and left out
+
+| Change | Result here |
+|---|---|
+| #2849 (guarded pages opened in runs) | One `VirtualProtect` cannot span two views: the tracker test ended in an access violation until such runs open page by page; no measured gain (the guard lock swings from 114 to 330 ms between runs) |
+| #2848 (frame-path costs) | With its shared heap lock, a descriptor test failed in 3 of 20 runs of the suite |
+| #2755 (title-page dirty marks coalesced within a wave) | GPU step 337 ms with it, 308 ms in the same build without it (one run each) |
+| Without the memory performance commits (#1993, #2136, #2175 and related) | Crash at world entry, 2 of 2 runs |
+| #2121 (paged view heap) | Black picture: the host pages ran out, indirect draws dropped |
+| #2388 | Refuses 19 builder programs that translate today: their descriptors are two pointers read from memory, taken for a loaded descriptor |
+| #2341, #2374, #2380 | Dark pictures in runs that had them; the cause was not isolated |
+
+## Open problems
+
+- About 1 frame per second.
+- Three programs of the world scene do not translate: two whole-wave sections
+  of split wave64 programs and barycentrics read directly.
+- Interior lighting has differed from run to run (walls black in many).
+- Tests failing on this GPU:
+  `emit::stride_tests::a_heap_buffer_read_where_no_buffer_view_is_reads_zeros`
+  (view heap cap).
+- The multi-wave barriers of #2214 are called undefined by D3D12 in its own
+  review when reached from different places in one group; the pull request is
+  a draft.
+
+## Testing
+
+`cargo test -p victory-shader -p victory-gpu --lib`, then `autotest.ps1 -Name
+<run> -Game <dir>` (5 minutes; `-Warm` after translator changes).
+
+Changes are made with AI assistance (Claude Code).

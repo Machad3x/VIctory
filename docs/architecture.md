@@ -42,13 +42,17 @@ title's), so a run finds them under the names it gives them itself.
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
 
 Everything except `victory-game` is platform-level and can be tested with
 any Xbox Series title.
+
+How `victory-gpu` gives the host GPU the title's buffers, which on the
+console share one pool of memory with the CPU, is in
+[GPU memory](gpu-memory.md).
 
 ## Import resolution
 
@@ -97,7 +101,11 @@ runs both, again where a bound on the index of a register-relative move
 (`v_movrel*`) is proven on the per-lane form, so the move names only the
 registers it can reach. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
-comes from (table, heap, root descriptor or constant). A descriptor a
+comes from (table, heap, root descriptor or constant). What a region that
+`s_cbranch_execz` skips when no lane would run it sets in scalar registers
+(a descriptor, a table address's high half) is the region's after it:
+scalar writes are the wave's, so the per-lane branch of structurisation does
+not hold for them. A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
 to the per-lane load or choice that gives each lane its own (a mask's
 `v_cndmask_b32`, or an if/else whose arms each set it: traced on the paths
@@ -105,3 +113,12 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+On a 32-lane host, eligible wave64 compute programs run in two 32-lane
+halves. In a single-wave thread group, the console's control flow uses
+group barriers for cross-half exchanges and shared LDS accesses.
+`ds_permute_b32`, which is not translated yet, and whole-wave sections in
+partial groups can prevent splitting (`ds_bpermute_b32` does not: it
+gathers within each 32-lane half).
+Translation refuses programs by name if their required wave size falls
+outside the host's range.
