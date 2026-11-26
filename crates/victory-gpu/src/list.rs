@@ -1391,42 +1391,67 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
+/// `BeginQuery(heap, type, index)`: occlusion queries are recorded into
+/// the host list, in order with the draws; the others are answered when
 /// resolved.
-extern "system" fn begin_query(_this: This, _heap: This, _kind: u32, _index: u32) {
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(feature = "diagnostics")]
-    crate::query::counts::begin(_this as usize, _heap as usize, _kind, _index);
+    crate::query::counts::begin(this as usize, heap as usize, kind, index);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::query::host(heap, kind, index, 1)
+        && list.begin_query(&host.heap, kind, index)
+    {
+        host.began(index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
 }
-extern "system" fn end_query(_this: This, _heap: This, _kind: u32, _index: u32) {
+/// `EndQuery(heap, type, index)`: ends a query begun in the same list; an
+/// end without its begin is dropped, so the query has no host result.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(feature = "diagnostics")]
-    crate::query::counts::end(_this as usize, _heap as usize, _kind, _index);
+    crate::query::counts::end(this as usize, heap as usize, kind, index);
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::query::host(heap, kind, index, 1)
+        && let Some(ended) = list.end_query(&host.heap, index)
+    {
+        host.ended(index, ended);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
 }
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// each query's result into the buffer once the list has run. Occlusion
+/// queries that ran on the host GPU give its results ([`host_resolve`]);
+/// all others get stand-ins: timestamps (type 2) are the GPU clock then,
+/// occlusion counts (0) say a million samples passed and binary occlusion
+/// (1) visible, so nothing is culled by a query that has no result.
+/// shortcut: timestamp and statistics queries do not run on the host GPU;
+/// results are plausible values (time spans come out as the submission's
+/// length).
+/// shortcut: the results reach title memory when the submission has run;
+/// GPU commands later in the same submission that read the buffer see its
+/// earlier bytes.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
+    use crate::query::{BINARY_OCCLUSION, OCCLUSION};
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
     #[cfg(feature = "diagnostics")]
     crate::query::counts::resolve(
-        _heap as usize,
+        heap as usize,
         kind,
-        _first,
+        first,
         count,
         crate::resource::buffer_bytes(buffer).map(|(p, _)| (p as u64).wrapping_add(offset) as usize),
     );
@@ -1435,7 +1460,7 @@ extern "system" fn resolve_queries(
     };
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
-        BINARY => (Written::Value(1), 8),
+        BINARY_OCCLUSION => (Written::Value(1), 8),
         TIMESTAMP => (Written::GpuTimestamp, 8),
         PIPELINE_STATISTICS => (Written::Value(0), 88),
         _ => (Written::Value(0), 16),
@@ -1446,15 +1471,72 @@ extern "system" fn resolve_queries(
     if end > size {
         return;
     }
+    #[cfg(windows)]
+    let measured = host_resolve(this, heap, kind, first, count);
+    #[cfg(not(windows))]
+    let measured = {
+        let _ = (heap, first);
+        None::<(Vec<bool>, usize)>
+    };
     for i in 0..u64::from(count) {
+        // Where the host's result for this query will be, if it has one.
+        let result = measured
+            .as_ref()
+            .filter(|(ran, _)| ran[i as usize])
+            .map(|(_, results)| results + (i * 8) as usize);
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
             // SAFETY: inside the buffer, checked above.
             let at = unsafe { data.add((offset + i * bytes + piece * 8) as usize) };
-            let what = if piece == 0 { what } else { Written::Value(0) };
+            let what = match result {
+                Some(raw) => Written::HostValue(raw),
+                None if piece == 0 => what,
+                None => Written::Value(0),
+            };
             defer_write(this, at as u64, what, 8);
         }
     }
+}
+
+/// Resolves on the host GPU the occlusion queries of `[first, first +
+/// count)` whose last run there was of type `kind`: which ones, and where
+/// the results (8 bytes each) will be once the list has run, query
+/// `first`'s first. None if none is.
+///
+/// The results go into read-back memory of the list, never into a title
+/// buffer's host copy, whose state the title's commands decide.
+#[cfg(windows)]
+fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32) -> Option<(Vec<bool>, usize)> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+    let (list, queries) = (host_list(this)?, crate::query::host(heap, kind, first, count)?);
+    let measured: Vec<bool> = (first..first + count).map(|i| queries.measured(i, kind)).collect();
+    if !measured.contains(&true) {
+        return None;
+    }
+    // shortcut: one buffer per resolve; arena if resolves per frame grow
+    let (back, results) = list.readback(crate::host::host()?, u64::from(count) * 8)?;
+    list.keep(&queries.heap);
+    let mut from = 0;
+    // Only runs that ran: resolving a query never ended is invalid.
+    for run in measured.chunk_by(|a, b| a == b) {
+        let n = run.len() as u32;
+        if run[0] {
+            // SAFETY: an open list, a live heap kept until the list is
+            // reset, and the list's read-back buffer (copy destination).
+            unsafe {
+                list.list.ResolveQueryData(
+                    &queries.heap,
+                    D3D12_QUERY_TYPE(kind as i32),
+                    first + from,
+                    n,
+                    &back,
+                    u64::from(from) * 8,
+                )
+            };
+        }
+        from += n;
+    }
+    Some((measured, results as usize))
 }
 
 /// IUnknown 3, object 4, device child 1, allocator 2.
@@ -1820,6 +1902,9 @@ mod state {
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            if let Some(list) = super::host_list(this) {
+                list.missed_draw();
+            }
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1901,6 +1986,10 @@ extern "system" fn execute_indirect(
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         // An unknown signature may draw.
+        #[cfg(windows)]
+        if let Some(list) = host_list(this) {
+            list.missed_draw();
+        }
         #[cfg(feature = "diagnostics")]
         crate::query::counts::draw_dropped();
         return;
@@ -1926,12 +2015,23 @@ extern "system" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
+    // A dropped dispatch marks too: its queries merely stay visible.
+    // shortcut: indirect draws that ran mark as well (the GPU clamp may cut
+    // records unseen by the CPU), so their queries are never measured; mark
+    // only clamped ones if the title culls by such queries.
+    let dispatch = args.last().is_some_and(|a| matches!(a, [2 | 105, ..]));
+    #[cfg(windows)]
+    if !(ran && dispatch)
+        && let Some(list) = host_list(this)
+    {
+        list.missed_draw();
+    }
     if ran {
         return;
     }
     // Dispatches (12 bytes, types 2 and 105) pass no samples.
     #[cfg(feature = "diagnostics")]
-    if !args.last().is_some_and(|a| matches!(a, [2 | 105, ..])) {
+    if !dispatch {
         crate::query::counts::draw_dropped();
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

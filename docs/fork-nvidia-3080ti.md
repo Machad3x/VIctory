@@ -673,7 +673,11 @@ two later runs of nearly the same build gave 54 (`gpu207`) and 76 ms
   `gpu207` and lit in the same moment of `gpu208`.
 - Queries, counted in `gpu208`: 59 occlusion queries a frame, resolved with one
   call, each ended in the list that began it, none with a dropped draw inside.
-  Their results are still made up.
+  Their results were made up then; occlusion and binary occlusion queries
+  now run on the host GPU (ported from
+  [#159](https://github.com/Marvisak/VIctory/pull/159);
+  `VICTORY_NO_HOST_QUERIES=1` restores the made-up results; not yet run in
+  the game).
 
 ## Tried and left out
 

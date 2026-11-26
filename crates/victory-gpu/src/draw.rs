@@ -528,6 +528,8 @@ impl State {
             self.target_formats.clear();
             self.target_formats.resize(handles.len(), None);
         }
+        // The index is for diagnostics.
+        #[allow(clippy::unused_enumerate_index)]
         for (_slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1403,6 +1405,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "mesh");
         }
@@ -1779,6 +1782,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "draw");
         }
@@ -1903,6 +1907,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "indexed");
         }

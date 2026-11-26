@@ -1002,6 +1002,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Occlusion queries begun in the list and not ended yet: host heap,
+    /// type, index, and whether a draw since was not run on the host.
+    queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32, bool)>>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -1380,6 +1383,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                queries: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 rebind: false.into(),
@@ -1540,6 +1544,8 @@ impl Host {
         // textures written or evicted) so reads in it are not wiped after it.
         crate::shadow::clear_forgotten_reads();
         let mut removed_in = None;
+        // A wait that failed: query results may not be resolved yet.
+        let mut unwaited = false;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let mut ended = Waited::Done;
@@ -1572,7 +1578,10 @@ impl Host {
                             },
                         );
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        unwaited = true;
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             match ended {
@@ -1750,6 +1759,11 @@ impl Host {
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
+                let what = match what {
+                    // Visible: a zero not yet resolved would hide the object.
+                    crate::queue::Written::HostValue(_) if unwaited => crate::queue::Written::Value(1 << 20),
+                    what => what,
+                };
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -2091,6 +2105,12 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The host closes no list with queries running; their title ends,
+        // in a later list, are dropped (`end_query`).
+        for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            // SAFETY: an open list and a query begun in it.
+            unsafe { self.list.EndQuery(&heap, kind, index) };
+        }
         for (from, to, bytes) in &self.deferred().read_backs {
             // SAFETY: an open list; buffers of ours it holds.
             unsafe {
@@ -2126,6 +2146,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -2632,6 +2653,43 @@ impl HostList {
             self.keep(&old);
         }
         Some(made)
+    }
+
+    /// Begins occlusion query `index` of `heap` unless it is running in
+    /// the list already. Whether it began.
+    pub(crate) fn begin_query(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) -> bool {
+        let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+        if queries.iter().any(|(h, _, i, _)| h == heap && *i == index) {
+            return false;
+        }
+        let kind = D3D12_QUERY_TYPE(kind as i32);
+        // SAFETY: an open list and a live heap, kept until the list is reset.
+        unsafe { self.list.BeginQuery(heap, kind, index) };
+        queries.push((heap.clone(), kind, index, false));
+        drop(queries);
+        self.keep(heap);
+        true
+    }
+
+    /// Ends query `index` of `heap` if it began in this list, as the type
+    /// it began as. That type, if the result is usable: a query with a draw
+    /// inside that the host did not run counts too few samples, and the
+    /// title would cull by it what the draw shows.
+    pub(crate) fn end_query(&self, heap: &ID3D12QueryHeap, index: u32) -> Option<u32> {
+        let mut queries = self.queries.lock().unwrap_or_else(|e| e.into_inner());
+        let at = queries.iter().position(|(h, _, i, _)| h == heap && *i == index)?;
+        let (_, kind, _, missed) = queries.swap_remove(at);
+        // SAFETY: an open list and a query begun in it.
+        unsafe { self.list.EndQuery(heap, kind, index) };
+        (!missed).then_some(kind.0 as u32)
+    }
+
+    /// A draw the title recorded was not run on the host: the queries
+    /// running around it did not see it.
+    pub(crate) fn missed_draw(&self) {
+        for q in self.queries.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            q.3 = true;
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

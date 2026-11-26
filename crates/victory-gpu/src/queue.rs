@@ -468,6 +468,9 @@ pub(crate) enum Written {
     GpuTimestamp,
     /// The CPU's performance counter.
     SystemTimestamp,
+    /// What the host GPU resolved into a list's read-back memory at this
+    /// address (8 bytes of a query's result), read once the list has run.
+    HostValue(usize),
 }
 
 impl Written {
@@ -475,6 +478,9 @@ impl Written {
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
         let value = match self {
             Written::Value(v) => v,
+            // SAFETY: the list's mapped read-back memory, which lives until
+            // the list is reset; the submission that wrote it has run.
+            Written::HostValue(from) => unsafe { (from as *const u64).read_volatile() },
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
