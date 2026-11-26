@@ -480,6 +480,8 @@ change, and the setting was put back.
 
 | Change | Result here |
 |---|---|
+| A second heap slot sync during the GPU wait | Preparing 161 ms against 154, frame 445 against 406, title threads waited longer to write views (one run). A slot's view copy now retired with its resource stayed from it |
+| Refreshes of copies in video memory through the copy pool | Refresh batches 69 ms against 64 (one run) |
 | #2849 (guarded pages opened in runs) | One `VirtualProtect` cannot span two views: the tracker test ended in an access violation until such runs open page by page; no measured gain (the guard lock swings from 114 to 330 ms between runs) |
 | #2848 (frame-path costs) | With its shared heap lock, a descriptor test failed in 3 of 20 runs of the suite |
 | #2755 (title-page dirty marks coalesced within a wave) | GPU step 337 ms with it, 308 ms in the same build without it (one run each) |
