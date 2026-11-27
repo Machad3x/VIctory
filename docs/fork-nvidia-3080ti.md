@@ -1196,6 +1196,33 @@ Medians of the last 15 frames:
 The dark interior is still intermittent. Lit runs bind the 7 lighting
 compute pipelines; dark runs do not.
 
+## Pipelined submission, memory system and queue signals
+
+Merged from the `pipeline`, `memsys` and `queue-signals` work, all behind
+switches that are off by default except where noted:
+
+- Submissions split into submit and retire with an owned ticket; a retire
+  thread behind `VICTORY_PIPELINE=1`, predicted label values behind
+  `VICTORY_PREDICT_LABELS=1`. Stale-page pins replace mutex guards.
+- Memory system rewrite behind `VICTORY_MEMSYS=1` (`VICTORY_MEMSYS_POOL=0`
+  in the runs below); `VICTORY_MEMSYS_ALIAS=1` shares one copy per physical
+  page. A buffer now finds every copy holding its physical pages.
+- Lost lists (submitted again after their descriptor slots were taken back)
+  keep their waits and label writes in queue order; a fence Signal goes
+  through the held path while work is held. The safety valve logs the word's
+  value and its last writer, and queues stuck on a fence Wait are reported.
+- Diagnostics: `VICTORY_STACKS=crash` prints every thread's stack at the
+  first unhandled exception (diagnostics builds).
+
+Runs (Series X profile, 250 s, streaming client attached): serial memory
+system 278 to 316 ms a frame (prep/sync/GPU/settle medians 151/45/88/60 ms)
+against 414 ms before; `VICTORY_PIPELINE=1` 312 to 320 ms, with predicted
+labels 285 to 301 ms: neutral, because 27 of about 29 submissions still
+overlap copies the one in flight uses. The queue-signal build ran 280 to
+328 ms with no regression. An intermittent hang (the title's own watchdog
+ends the process after 30 s without a frame) follows a compute queue stuck on
+a label value; it is still open.
+
 ## Open problems
 
 - About 1 frame per second.
