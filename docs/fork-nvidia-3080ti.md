@@ -1367,6 +1367,16 @@ the release returns, a title change waits at most 2 s for the tables (not
 on the retire thread), library saves are flushed and summed and a library
 that does not match its sum is not loaded, stale staging files are removed.
 
+`gpu316` reached the world with no hang, then stopped on the title's own
+assertion (int3 at `+0x187fb`): its heap's free found a block header in
+title memory (`0xd00049105`) not marked in use. That frame its lists
+missed 97 private and 117 mapped pages and wrote 268 pages in place, and
+the page tables had waited their whole 100 ms for the opening thread.
+With `VICTORY_RT_MEMORY` the copies of lists that missed went back to title
+memory (so that ray-tracing structures were whole); they are withheld again,
+as without it. In-place writes cannot be withheld, so page tables now wait
+up to 2 s a frame for runs being opened, within the frame's one allowance.
+
 ## Open problems
 
 - About 1 frame per second.
