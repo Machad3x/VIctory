@@ -4745,7 +4745,9 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        // A null description makes a view of the whole resource in its own
+        // format: the same typed UAV that removes the device on NVIDIA.
+        return !typeless && uav_store_ok(own, unordered, typed_store);
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.

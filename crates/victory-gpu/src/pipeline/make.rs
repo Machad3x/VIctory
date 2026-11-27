@@ -304,8 +304,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         if p.graphics.is_none() && compute_waits() {
-            // Made here, or waited for while a worker makes it.
-            p.make();
+            // `start` queued it (or made it when there are no workers). Wait
+            // for the worker: building it here stalls the title's thread.
+            wait_for(p);
         } else {
             wait(p, crate::frame::current());
         }
@@ -368,6 +369,16 @@ fn shared_budget() -> bool {
 /// The frame a budget belongs to, and what was waited of it (of passes over
 /// the screen too); the two slots are distinct.
 static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+
+/// Waits until a worker has made `p`, without a frame budget. `start` has
+/// queued it, or made it itself when there are no workers.
+fn wait_for(p: &Pending) {
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        held = done.wait(held).unwrap_or_else(|e| e.into_inner());
+    }
+}
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
@@ -712,7 +723,7 @@ mod tests {
             let p = p.clone();
             let began = began.clone();
             std::thread::spawn(move || {
-                p.made.get_or_init(|| {
+                p.make_with(|| {
                     began.store(true, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(100));
                     None

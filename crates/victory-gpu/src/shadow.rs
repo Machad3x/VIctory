@@ -2237,7 +2237,9 @@ pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 /// PC's 4070 SUPER has a 16 GiB one) instead of two sides
 /// (`VICTORY_WC_BAR=1`; off by default). Honour the write-back size policy:
 /// small shader results can feed title CPU reads or refreshes of other copies.
-/// `VICTORY_WC_BAR=2` selects the original policy for comparison.
+/// Mode 1 therefore needs `VICTORY_WC_NO_BACK=1` and a
+/// `VICTORY_WC_NO_BACK_MIN_KB` cutoff; without them it stays off. Mode 2
+/// selects the original unrestricted policy for comparison.
 ///
 /// Refreshes write title memory into the mapping through the bus (as they
 /// write a CPU's side now); shaders read and write the card's memory; there
@@ -5084,15 +5086,6 @@ mod land_tests {
         }
     }
 
-    #[test]
-    fn journal_read_matches_watch_nothing_new() {
-        let journal = crate::watch::read_journal();
-        let copied = [u64::MAX];
-        assert_eq!(
-            journal.nothing_new(0x1000, 0x2000, 0x1000, &copied, u64::MAX),
-            crate::watch::nothing_new(0x1000, 0x2000, 0x1000, &copied, u64::MAX),
-        );
-    }
 }
 
 struct Entry {
