@@ -173,10 +173,13 @@ struct Shared {
     pairs: fx::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
-    /// The view pair of each run in place it names, by run id, and the
-    /// generation of what is in place it names ([`crate::inplace::generation`]).
-    run_pairs: fx::Map<u64, u32>,
+    /// The view pair of each run in place it names, by run id and whether
+    /// stores go through it, the generation of what is in place it names
+    /// ([`crate::inplace::generation`]), and whether it names runs
+    /// load-only ([`crate::inplace::table_load_only`]).
+    run_pairs: fx::Map<(u64, bool), u32>,
     in_place: u64,
+    load_only: bool,
     /// The number of [`WANTED`] regions it was written with.
     wanted: usize,
     layout: Arc<Layout>,
@@ -190,7 +193,6 @@ unsafe impl Send for Shared {}
 static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
 
 fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
-    // Its holder waits for the opening thread (`inplace::wait_private`).
     crate::inplace::order::tables();
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -301,8 +303,10 @@ pub(crate) fn withholding() -> bool {
 /// from them, and its copies went back over the title's own data (gpu316:
 /// the title's heap check failed in the frame its lists missed 97 private
 /// pages; drops1 before: an AABB's infinities in a pointer the title
-/// followed). What such a list writes in place lands still: misses are
-/// kept rare instead (`crate::inplace::wait_private`).
+/// followed). Its stores in place are dropped the same way: tables written
+/// while a miss withholds or memory is still being opened name in-place
+/// runs load-only (`crate::inplace::table_load_only`). Only a list's first
+/// miss of memory no table knew was missing stores in place.
 pub(crate) fn withholds() -> bool {
     true
 }
@@ -637,6 +641,7 @@ impl Shared {
             generation: u64::MAX,
             run_pairs: fx::Map::default(),
             in_place: u64::MAX,
+            load_only: false,
             wanted: 0,
             layout: Arc::default(),
         })
@@ -783,7 +788,9 @@ impl Shared {
             })
             .collect();
         let addrs = |w: &[(usize, usize, bool)]| w.iter().map(|&(_, at, _)| at).collect::<Vec<_>>();
-        let mut asked = false;
+        // Not waited for here: the submission holds the tables, the heaps
+        // and the held work, which title threads would wait behind; the next
+        // submission waits before it takes any (`crate::queue::execute`).
         for w in &wanted {
             let (mut own, mut private) = (Vec::new(), Vec::new());
             for (&(page, at, p), held) in w.iter().zip(crate::inplace::cover(&addrs(w))) {
@@ -792,18 +799,19 @@ impl Shared {
                 }
             }
             crate::inplace::ask(own, false);
-            asked |= crate::inplace::ask(private, true);
+            crate::inplace::ask(private, true);
         }
-        if asked {
-            crate::inplace::wait_private();
-        }
+        // Memory still being opened (a list may miss), or a miss withholds:
+        // stores through the runs are dropped, as withheld.
+        let writable = !crate::inplace::table_load_only();
+        self.load_only = !writable;
         for (b, w) in wanted.iter().enumerate() {
             let first = blocks[b] * BLOCK;
             for (&(page, _, private), held) in w.iter().zip(crate::inplace::cover(&addrs(w))) {
                 let Some((placed, offset)) = held else {
                     continue;
                 };
-                let pair = match self.run_pairs.get(&placed.id) {
+                let pair = match self.run_pairs.get(&(placed.id, writable)) {
                     Some(&pair) => pair,
                     None => {
                         let Some(pair) = heap.pair() else {
@@ -811,8 +819,8 @@ impl Shared {
                             ONCE.call_once(|| tracing::warn!("no descriptor slots for title memory in place: it reads as missing"));
                             continue;
                         };
-                        heap.raw_pair_at(pair, Some(&placed.buffer), placed.len as u64);
-                        self.run_pairs.insert(placed.id, pair);
+                        heap.raw_pair_of(pair, Some(&placed.buffer), placed.len as u64, writable);
+                        self.run_pairs.insert((placed.id, writable), pair);
                         pair
                     }
                 };
@@ -831,8 +839,8 @@ impl Shared {
                 named_private += u64::from(private);
             }
         }
-        self.run_pairs.retain(|id, &mut pair| {
-            let keep = runs.iter().any(|r| r.id == *id);
+        self.run_pairs.retain(|&(id, _), &mut pair| {
+            let keep = runs.iter().any(|r| r.id == id);
             if !keep {
                 heap.raw_pair_at(pair, None, 0);
                 heap.free_pair(pair);
@@ -901,6 +909,9 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     let Some(host) = crate::host::host() else {
         return true;
     };
+    // From the first look: `named` waits for the tables' lock, which a
+    // submission holds while it prepares.
+    let started = std::time::Instant::now();
     // What lists ran with is dropped on this thread, the title's: the runs'
     // heaps go before its change is tried.
     if !named() || host.between_submissions(|| drop(drop_runs_taking(dead))).is_some() {
@@ -915,7 +926,6 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     DROPS.lock().unwrap_or_else(|e| e.into_inner()).push((dead.to_vec(), tx));
     // A retire in flight serves it before the next submission prepares.
     let _ = crate::host::after_retire_in_flight(Box::new(serve_drops));
-    let started = std::time::Instant::now();
     loop {
         // What the server took from the lists' layouts: dropped here.
         if let Ok(ran) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
@@ -1371,6 +1381,9 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let stale = s.generation != now;
         let stale = stale || counting() && s.wanted != wanted().len();
         let stale = stale || crate::inplace::backstop() && s.in_place != crate::inplace::generation();
+        // Named load-only while memory is opened or a miss withholds, and
+        // writable again once neither holds.
+        let stale = stale || crate::inplace::backstop() && s.load_only != crate::inplace::table_load_only();
         if stale {
             s.rewrite(heap, now);
         }

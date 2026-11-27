@@ -234,16 +234,21 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// All waiting for pipelines allowed per presented frame, over all threads
-/// and classes, well under the title's 30 s watchdog: what else a frame
-/// waits for (page tables, copies) keeps room.
+/// All waiting allowed per presented frame, over all threads and classes,
+/// well under the title's 30 s watchdog: for pipelines, and for title
+/// memory being opened in place ([`Class::Memory`]). What else a frame
+/// waits for (copies, the GPU) keeps room.
 pub(crate) const ALLOWANCE: Duration = Duration::from_secs(10);
 
 /// Of it, the most for pipelines that are not urgent.
 const BUDGET: Duration = Duration::from_millis(500);
 
+/// Of it, the most for title memory being opened in place, well under the
+/// 2 s a title change waits for the page tables (`crate::memory`).
+const MEMORY_MOST: Duration = Duration::from_millis(500);
+
 /// Of it, what is kept for passes over the screen and the builder: other
-/// compute pipelines leave it.
+/// compute pipelines and memory waits leave it.
 const SCREEN_RESERVE: Duration = Duration::from_secs(3);
 
 /// The most one pipeline is waited for, over all frames: past it, only
@@ -261,6 +266,8 @@ pub(crate) enum Class {
     /// Other compute pipelines.
     Urgent,
     Other,
+    /// Title memory being opened in place (`crate::inplace::wait_private`).
+    Memory,
 }
 
 /// Time some title thread waited: waits on several recording threads at
@@ -300,18 +307,29 @@ impl Waited {
     }
 }
 
-/// What waits used of a presented frame's allowance: in all, and by
-/// pipelines that are not urgent.
+/// What waits used of a presented frame's allowance: in all, and by the
+/// classes with a cap of their own (pipelines that are not urgent, title
+/// memory being opened). One clock: presents.
 #[derive(Clone, Copy, Debug)]
 struct Spent {
     frame: u64,
     all: Waited,
     other: Waited,
+    memory: Waited,
 }
 
 impl Spent {
     const fn new() -> Spent {
-        Spent { frame: u64::MAX, all: Waited::new(), other: Waited::new() }
+        Spent { frame: u64::MAX, all: Waited::new(), other: Waited::new(), memory: Waited::new() }
+    }
+
+    /// The share of its own `class` has, and its cap.
+    fn own(&mut self, class: Class) -> Option<(&mut Waited, Duration)> {
+        match class {
+            Class::Other => Some((&mut self.other, BUDGET)),
+            Class::Memory => Some((&mut self.memory, MEMORY_MOST)),
+            _ => None,
+        }
     }
 
     /// What `class` may still wait in `frame` (a new frame starts anew).
@@ -321,10 +339,13 @@ impl Spent {
         }
         let used = self.all.now();
         let all = |cap: Duration| cap.saturating_sub(used);
-        match class {
+        let left = match class {
             Class::Screen | Class::Builder => all(ALLOWANCE),
-            Class::Urgent => all(ALLOWANCE - SCREEN_RESERVE),
-            Class::Other => all(ALLOWANCE - SCREEN_RESERVE).min(BUDGET.saturating_sub(self.other.now())),
+            Class::Urgent | Class::Other | Class::Memory => all(ALLOWANCE - SCREEN_RESERVE),
+        };
+        match self.own(class) {
+            Some((w, cap)) => left.min(cap.saturating_sub(w.now())),
+            None => left,
         }
     }
 
@@ -334,8 +355,8 @@ impl Spent {
         let took = self.left(frame, class).min(most);
         if !took.is_zero() {
             self.all.begin();
-            if class == Class::Other {
-                self.other.begin();
+            if let Some((w, _)) = self.own(class) {
+                w.begin();
             }
         }
         took
@@ -348,8 +369,8 @@ impl Spent {
             return;
         }
         self.all.end();
-        if class == Class::Other {
-            self.other.end();
+        if let Some((w, _)) = self.own(class) {
+            w.end();
         }
     }
 
@@ -358,8 +379,8 @@ impl Spent {
     fn spend(&mut self, frame: u64, class: Class, waited: Duration) {
         if self.frame == frame {
             self.all.closed += waited;
-            if class == Class::Other {
-                self.other.closed += waited;
+            if let Some((w, _)) = self.own(class) {
+                w.closed += waited;
             }
         }
     }
@@ -391,7 +412,8 @@ fn lane(class: Class, now: bool) -> usize {
     match (now, class) {
         (true, Class::Screen | Class::Builder) => 0,
         (true, Class::Urgent) => 1,
-        (true, Class::Other) => 2,
+        // Memory waits queue no pipeline.
+        (true, Class::Other | Class::Memory) => 2,
         (false, _) => 3,
     }
 }
@@ -479,14 +501,14 @@ pub(crate) fn wait_all(ps: &[Arc<Pending>]) -> Duration {
 /// frame's allowance with the pipeline waits, as the builder's (its lists
 /// read that memory: run whole, or wait). The frame and what it may wait;
 /// [`memory_wait_done`] after.
-pub(crate) fn memory_wait(most: Duration) -> (u64, Duration) {
+pub(crate) fn memory_wait() -> (u64, Duration) {
     let frame = frame();
-    (frame, spent().take(frame, Class::Builder, most))
+    (frame, spent().take(frame, Class::Memory, MEMORY_MOST))
 }
 
 /// The wait [`memory_wait`] gave `took` in `frame` ended.
 pub(crate) fn memory_wait_done(frame: u64, took: Duration) {
-    spent().done(frame, Class::Builder, took);
+    spent().done(frame, Class::Memory, took);
 }
 
 /// Whether `p` has shaders (one with none is never made).
@@ -850,11 +872,17 @@ mod tests {
     #[test]
     fn memory_waits_share_the_allowance() {
         let mut s = Spent::new();
-        let took = s.take(9, Class::Builder, Duration::from_secs(2));
-        assert_eq!(took, Duration::from_secs(2));
-        s.done(9, Class::Builder, took);
-        s.spend(9, Class::Urgent, ALLOWANCE);
-        assert_eq!(s.take(9, Class::Builder, Duration::from_secs(2)), Duration::ZERO, "none left");
+        assert_eq!(s.left(9, Class::Memory), MEMORY_MOST, "a cap of its own");
+        s.spend(9, Class::Memory, MEMORY_MOST);
+        assert_eq!(s.take(9, Class::Memory, ALLOWANCE), Duration::ZERO, "spent this frame");
+        assert_eq!(s.left(9, Class::Screen), ALLOWANCE - MEMORY_MOST, "on the one clock");
+        assert!(MEMORY_MOST * 4 <= Duration::from_secs(2), "well under a title change's wait");
+        let mut s = Spent::new();
+        s.left(9, Class::Screen);
+        s.spend(9, Class::Urgent, ALLOWANCE - SCREEN_RESERVE);
+        assert_eq!(s.left(9, Class::Memory), Duration::ZERO, "the screen reserve is left");
+        assert_eq!(s.left(9, Class::Screen), SCREEN_RESERVE);
+        assert_eq!(s.left(10, Class::Memory), MEMORY_MOST, "a present starts it anew");
     }
 
     /// The builder's pipelines go to the front of the screen passes' queue

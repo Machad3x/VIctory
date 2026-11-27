@@ -1034,6 +1034,14 @@ impl HostHeap {
     /// (a multiple of 4) of `buffer`, which they hold; null views for no
     /// buffer.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
+        self.raw_pair_of(index, buffer, bytes, true);
+    }
+
+    /// [`HostHeap::raw_pair_at`]; not `writable`, the unordered access view
+    /// is a null one: loads read the buffer, stores and atomics through the
+    /// pair are dropped (title memory in place named load-only,
+    /// `crate::inplace::table_load_only`).
+    pub(crate) fn raw_pair_of(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64, writable: bool) {
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
         // a longer copy's rest reads 0 through it.
@@ -1067,10 +1075,10 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&srv), self.cpu(index));
             host.device
-                .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
+                .CreateUnorderedAccessView(buffer.filter(|_| writable), None, Some(&uav), self.cpu(index + 1));
         }
         self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
+        self.keep(index + 1, buffer.filter(|_| writable).map(|b| (b.clone(), None)));
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
         // Writes through these are title memory's, marked in its page table.

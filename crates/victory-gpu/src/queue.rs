@@ -123,6 +123,12 @@ pub(crate) extern "system" fn execute(this: This, count: u32, lists: *const This
         let _in = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::TitleExecNs);
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Title memory still being opened in place, waited for before any
+        // lock (the page tables, the heaps, the held work): its tables then
+        // name it, and no title thread waits behind the wait.
+        if crate::inplace::rt_memory() {
+            crate::inplace::wait_private();
+        }
         let mut held = held();
         let mut skipped = 0;
         for &l in lists {

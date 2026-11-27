@@ -124,8 +124,11 @@ pub(crate) fn backstop() -> bool {
     *ON || rt_memory()
 }
 
-/// Whether the title's private memory no copy holds is named in place too,
-/// and nothing is withheld (`VICTORY_RT_MEMORY=1`).
+/// Whether the title's private memory no copy holds is named in place too
+/// (`VICTORY_RT_MEMORY=1`). Lists that missed memory are withheld as
+/// without it (`crate::memory::withholds`), and a table written while a
+/// miss withholds or memory is still being opened names in-place runs
+/// load-only ([`table_load_only`]).
 pub(crate) fn rt_memory() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RT_MEMORY").is_some_and(|v| v == "1"));
@@ -154,15 +157,9 @@ const LONGEST: usize = 2 * MOST;
 /// protection of the title's, lets go of that much, and opening it again
 /// takes ~2 ms.
 pub(crate) const CHUNK: usize = 128;
-/// The longest page tables wait in one frame for the worker to open
-/// private runs ([`wait_private`]), in microseconds, within the frame's
-/// pipeline allowance (`crate::pipeline::memory_wait`): opening 256 MiB
-/// took 70 ms where measured, but the world's streaming asks hundreds of
-/// runs a frame (gpu316: 342 opened in 3.5 s), and 100 ms left lists
-/// missing memory that wrote into the title's (its heap check failed).
-const PRIVATE_WAIT_US: u64 = 2_000_000;
-/// Microseconds page tables waited for the worker since the last frame
-/// line.
+/// Microseconds submissions waited for the worker since the last frame
+/// line (counted only: what a frame may wait is the pipeline allowance's,
+/// `crate::pipeline::memory_wait`).
 static WAITED_US: AtomicU64 = AtomicU64::new(0);
 
 /// Our own view's `[at, at + len)` open in place: a heap over it and one
@@ -621,25 +618,23 @@ pub(crate) fn run_for(at: usize, len: usize, private: bool) -> Option<(Arc<Run>,
     }
 }
 
-/// Waits for the worker to open the private runs asked of it: a page
-/// table written for a submission names them before it runs (the
-/// builder's first list reads no zeros). All the tables of a frame wait
-/// [`PRIVATE_WAIT_US`] at most between them; one that stops waiting is
-/// counted, and the pages not open miss for its submission. True if none
-/// is left waiting. Called with the page tables' lock held, which the
-/// worker never takes ([`order`]).
+/// Waits for the worker to open the private runs asked of it, before a
+/// title submission takes any lock (`crate::queue::execute`): its page
+/// tables then name them (the builder's lists read no zeros there), and
+/// title threads are not held behind the wait. What a frame waits comes
+/// from its pipeline allowance (`crate::pipeline::memory_wait`, one clock);
+/// a table written with runs still being opened names in-place runs
+/// load-only ([`table_load_only`]). True if none is left waiting.
 pub(crate) fn wait_private() -> bool {
     debug_assert!(!order::ranges_held(), "waiting for the opening thread while holding the ranges");
     if PRIVATE_PENDING.load(Ordering::Relaxed) == 0 {
         return true;
     }
     let started = std::time::Instant::now();
-    // Within the frame's one allowance, shared with the pipeline waits:
-    // 100 ms of its own ran out in the world's streaming (gpu316: 100.1 ms
-    // waited in the frame its lists missed 97 private pages, wrote 268 in
-    // place, and the title's heap check failed).
-    let left = std::time::Duration::from_micros(PRIVATE_WAIT_US.saturating_sub(WAITED_US.load(Ordering::Relaxed)));
-    let (frame, took) = crate::pipeline::memory_wait(left);
+    // gpu316: 100 ms of its own ran out in the world's streaming, the
+    // frame its lists missed 97 private pages, wrote 268 in place, and the
+    // title's heap check failed.
+    let (frame, took) = crate::pipeline::memory_wait();
     let done = wait_pending(took);
     crate::pipeline::memory_wait_done(frame, took);
     let waited = started.elapsed().as_micros() as u64;
@@ -650,6 +645,16 @@ pub(crate) fn wait_private() -> bool {
         RT[3].fetch_add(1, Ordering::Relaxed);
     }
     done
+}
+
+/// Whether a page table written now names in-place runs load-only (stores
+/// through them dropped, as withheld): a list that missed withholds this
+/// frame and the next (`crate::memory::withholding`), or memory is still
+/// being opened, so a list may miss. What a list that read zeros stores in
+/// place cannot be withheld after it ran (gpu316: the title's heap header
+/// overwritten); load-only, it is not stored at all.
+pub(crate) fn table_load_only() -> bool {
+    crate::memory::withholding() || PRIVATE_PENDING.load(Ordering::Relaxed) != 0 || with_runs(|r| !r.asked.is_empty())
 }
 
 /// Signalled (under [`SETTLED_LOCK`]) when no private run is left asked of
@@ -1033,8 +1038,9 @@ fn forget_private(start: usize, id: u64) -> Option<Arc<Run>> {
 /// dropped from the page tables once no submission runs (waited for: a
 /// submission reading memory the title frees is the title's race), so
 /// that its heap goes and the system unlocks the pages. The caller tries
-/// its change again while that settles.
-fn release_private(start: usize, id: u64) {
+/// its change again while that settles. False if the tables still name
+/// it ([`crate::memory::drop_runs_wait`]): its heap locks the pages.
+fn release_private(start: usize, id: u64) -> bool {
     // Released by the registry: nothing to forget there.
     PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     // An open under way ends first (it registered before opening), and its
@@ -1052,7 +1058,7 @@ fn release_private(start: usize, id: u64) {
     }
     // It, or a run let go for a tracker whose heap a table still holds, and
     // the runs it replaced.
-    crate::memory::drop_runs_wait(&dead());
+    crate::memory::drop_runs_wait(&dead())
 }
 
 /// A tracker is about to guard `[at, at + len)`: the open runs over
@@ -1862,6 +1868,23 @@ mod tests {
         // the addresses taken again by another test's allocation.
     }
 
+    /// A table written while memory is still being opened (asks pending)
+    /// names in-place runs load-only: a list may miss, and what it stores
+    /// in place could not be withheld after it ran.
+    #[test]
+    fn a_table_with_memory_being_opened_names_runs_load_only() {
+        let _one = worker_tests();
+        let key = (0x6f00_0000_0000, 0x6f00_0001_0000, true);
+        let before = table_load_only();
+        with_runs(|r| r.asked.insert(key));
+        assert!(table_load_only(), "an ask pending");
+        with_runs(|r| r.asked.remove(&key));
+        PRIVATE_PENDING.fetch_add(1, Ordering::Relaxed);
+        assert!(table_load_only(), "a private open pending");
+        asked_done();
+        assert_eq!(table_load_only(), before, "neither: as before (a miss may withhold)");
+    }
+
     /// Pages a table could not name are asked of the opening thread, which
     /// works out what opens there; the table only looks up open runs. An
     /// ask is made once until done, and not again where nothing opened.
@@ -1882,9 +1905,11 @@ mod tests {
         assert!(wait_pending(WORKER_WAIT), "worked out and done");
         let held = cover(&addrs);
         if held.iter().all(Option::is_some) {
-            // One run, the pages at their offsets in it.
+            // The pages at their offsets in the run holding them (one opened
+            // here may join an open neighbour: offsets from its start).
             let offsets: Vec<usize> = held.iter().map(|h| h.as_ref().unwrap().1).collect();
-            assert_eq!(offsets, [0, PAGE, 2 * PAGE, 3 * PAGE]);
+            let from = offsets[0];
+            assert_eq!(offsets, [from, from + PAGE, from + 2 * PAGE, from + 3 * PAGE]);
         } else {
             // The host opens no private memory here: nothing to open, not
             // asked again.

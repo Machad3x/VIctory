@@ -55,8 +55,10 @@ const SETTLE: Duration = Duration::from_millis(100);
 // (`crate::inplace::title_memory_own_gone` handles their going).
 
 /// How a holder lets its range go; called once, outside the registry's
-/// lock, on the thread about to change the memory.
-pub(crate) type Release = Box<dyn FnOnce() + Send>;
+/// lock, on the thread about to change the memory. False if the holder
+/// could not let go in time (a page table still names it): the change then
+/// meets the memory locked, and the title its error, said here.
+pub(crate) type Release = Box<dyn FnOnce() -> bool + Send>;
 
 /// A registered range, given back with [`Pin::forget`] when its holder lets
 /// it go on its own (the range is then no longer released for it).
@@ -309,8 +311,17 @@ fn release(at: usize, len: usize) -> usize {
     };
     let n = released.len();
     let ids: Vec<u64> = released.iter().map(|(id, _)| *id).collect();
-    for (_, release) in released {
-        release();
+    let failed = released.into_iter().map(|(_, release)| !release()).filter(|&f| f).count();
+    if failed > 0 {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+            tracing::warn!(
+                at = format_args!("{at:#x}"),
+                len,
+                failed,
+                "title memory still held in place when the runtime changes it: the change meets it locked"
+            );
+        }
     }
     if n > 0 {
         let mut g = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
@@ -350,6 +361,7 @@ mod tests {
         let n = n.clone();
         Box::new(move || {
             n.fetch_add(1, Ordering::Relaxed);
+            true
         })
     }
 
@@ -429,7 +441,10 @@ mod tests {
     fn a_slow_release_still_has_its_settle() {
         use windows_sys::Win32::Foundation::SetLastError;
         let base = 0x7900_0000_0000;
-        let _p = pin(base, 0x1_0000, Box::new(|| std::thread::sleep(SETTLE + Duration::from_millis(50))));
+        let _p = pin(base, 0x1_0000, Box::new(|| {
+            std::thread::sleep(SETTLE + Duration::from_millis(50));
+            true
+        }));
         let calls = AtomicUsize::new(0);
         // Refused once as locked after the release, then done.
         let late = || {
@@ -599,6 +614,7 @@ mod tests {
                 s.store(1, Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 d.store(1, Ordering::SeqCst);
+                true
             }),
         );
         let first = std::thread::spawn(move || release(base, 0x1000));
@@ -681,6 +697,7 @@ mod tests {
             BYTES,
             Box::new(move || {
                 holder.lock().unwrap().take();
+                true
             }),
         );
         let mut old = 0;
