@@ -181,6 +181,7 @@ pub(crate) struct Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
+        FRUITLESS_STALE.store(true, Ordering::Relaxed);
         if self.private {
             // The heap goes right after: the system unlocks the pages.
             locked_ranges().remove(&(self.at, self.id));
@@ -229,6 +230,22 @@ struct Runs {
     /// The range the worker is opening now: a view going over it is kept
     /// mapped until the open ends ([`title_memory_own_gone`]).
     opening: Option<(usize, usize)>,
+    /// Pages page tables could not name, asked of the worker to work out
+    /// and open ([`ask`]), by (start, end, private); and those the worker
+    /// found nothing to open in, not asked again until memory there or the
+    /// open runs change ([`FRUITLESS_STALE`]).
+    asked: std::collections::BTreeSet<(usize, usize, bool)>,
+    fruitless: std::collections::BTreeSet<(usize, usize, bool)>,
+}
+
+/// A run went (room in the budget, pages no longer locked): what the worker
+/// found nothing to open in may open now.
+static FRUITLESS_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What the worker found nothing to open in over `[start, end)` may be
+/// asked again.
+fn unfruitless(r: &mut Runs, start: usize, end: usize) {
+    r.fruitless.retain(|&(s, e, _)| e <= start || end <= s);
 }
 
 static RUNS: Mutex<Option<Runs>> = Mutex::new(None);
@@ -650,26 +667,121 @@ fn wait_pending(limit: std::time::Duration) -> bool {
     let (mut settled, _) = SETTLED.wait_timeout_while(settled, limit, pending).unwrap_or_else(|e| e.into_inner());
     !pending(&mut settled)
 }
+/// What the opening thread is asked: a range to open, or pages a page
+/// table could not name, to work out what opens there ([`ask`]).
+enum Work {
+    Open(usize, usize, bool),
+    Cut(Vec<(usize, usize)>, bool, (usize, usize, bool)),
+}
+
 /// Sends `[at, at + len)` to the opening thread.
 fn worker(at: usize, len: usize, private: bool) {
-    type Work = (usize, usize, bool);
-    static WORK: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Work>>> = std::sync::OnceLock::new();
-    let work = WORK.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Work>();
-        let _ = std::thread::Builder::new()
-            .name("victory-in-place".into())
-            .spawn(move || {
-                order::worker();
-                rx.into_iter().for_each(|(at, len, private)| open_run(at, len, private))
-            });
-        Mutex::new(tx)
-    });
-    if work.lock().unwrap_or_else(|e| e.into_inner()).send((at, len, private)).is_err() {
+    if !send(Work::Open(at, len, private)) {
         with_runs(|r| r.pending.remove(&(at, len)));
         if private {
             asked_done();
         }
     }
+}
+
+/// Hands `work` to the opening thread, started on first use; false if it
+/// is gone.
+fn send(work: Work) -> bool {
+    static WORK: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Work>>> = std::sync::OnceLock::new();
+    let tx = WORK.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Work>();
+        let _ = std::thread::Builder::new()
+            .name("victory-in-place".into())
+            .spawn(move || {
+                order::worker();
+                rx.into_iter().for_each(|w| match w {
+                    Work::Open(at, len, private) => open_run(at, len, private, private),
+                    Work::Cut(pages, private, key) => cut_and_open(pages, private, key),
+                })
+            });
+        Mutex::new(tx)
+    });
+    tx.lock().unwrap_or_else(|e| e.into_inner()).send(work).is_ok()
+}
+
+/// What a page table names in place for each of `addrs` (a page's address
+/// in our view, or the title's own for private memory): the open run
+/// holding the page, and the page's offset in it. One lock, and no query
+/// of memory: the submitting thread queried memory for every run of every
+/// table it wrote (`VirtualQuery`, whose cost grows with the region it
+/// describes), and held the title's submissions for seconds (gpu312 to
+/// gpu315, the title's 30 s watchdog).
+pub(crate) fn cover(addrs: &[usize]) -> Vec<Option<(Arc<Run>, usize)>> {
+    with_runs(|r| addrs.iter().map(|&a| holding(&r.open, a, PAGE)).collect())
+}
+
+/// Pages a page table could not name (no run open over them), as (page,
+/// address) in page order: asked of the opening thread, which works out what
+/// opens there (it queries memory, off the submitting thread) and opens it.
+/// Asked once until done, and not again where it found nothing to open
+/// until memory there or the open runs change. True if asked now (a private
+/// ask is waited for by [`wait_private`]).
+pub(crate) fn ask(pages: Vec<(usize, usize)>, private: bool) -> bool {
+    let (Some(&(_, first)), Some(&(_, last))) = (pages.first(), pages.last()) else {
+        return false;
+    };
+    let key = (first.min(last), first.max(last) + PAGE, private);
+    let stale = FRUITLESS_STALE.swap(false, Ordering::Relaxed);
+    let asked = with_runs(|r| {
+        if stale {
+            r.fruitless.clear();
+        }
+        !r.fruitless.contains(&key) && r.asked.insert(key)
+    });
+    if !asked {
+        return false;
+    }
+    if private {
+        PRIVATE_PENDING.fetch_add(1, Ordering::Relaxed);
+    }
+    if !send(Work::Cut(pages, private, key)) {
+        with_runs(|r| r.asked.remove(&key));
+        if private {
+            asked_done();
+        }
+        return false;
+    }
+    true
+}
+
+/// On the opening thread: what of `pages` ([`ask`]) can open, cut into runs
+/// (one allocation each, as [`private_runs`] and [`per_view`] cut them),
+/// opened one by one.
+fn cut_and_open(pages: Vec<(usize, usize)>, private: bool, key: (usize, usize, bool)) {
+    let _asked = Asked(private);
+    let pieces: Vec<Vec<(usize, usize)>> = if private {
+        let candidates: Vec<usize> = pages.iter().map(|&(page, _)| page).collect();
+        let picked = private_pages(&candidates);
+        private_runs(&picked).into_iter().map(<[_]>::to_vec).collect()
+    } else {
+        runs(&pages, 0).into_iter().flat_map(|run| per_view(run, allocation_end)).map(<[_]>::to_vec).collect()
+    };
+    let mut open = false;
+    for piece in pieces {
+        let (at, len) = (piece[0].1, piece.len() * PAGE);
+        let go = with_runs(|r| {
+            if holding(&r.open, at, len).is_some() {
+                open = true;
+                return false;
+            }
+            !r.refused.contains(&(at, len)) && r.pending.insert((at, len))
+        });
+        if go {
+            open_run(at, len, private, false);
+            open |= with_runs(|r| holding(&r.open, at, len).is_some());
+        }
+    }
+    with_runs(|r| {
+        r.asked.remove(&key);
+        if !open {
+            r.fruitless.insert(key);
+        }
+    });
 }
 
 /// A private run asked of the worker is no longer waited for, however
@@ -689,9 +801,10 @@ impl Drop for Asked {
 /// until rewritten); on the opening thread. `private`: the title's own
 /// memory, committed by the title (nothing is committed here), registered
 /// with `crate::pinned` so that the title's changes let it go first.
-fn open_run(at: usize, len: usize, private: bool) {
+/// `counted`: asked by itself, so counted as waited for ([`Asked`]).
+fn open_run(at: usize, len: usize, private: bool, counted: bool) {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
-    let _asked = Asked(private);
+    let _asked = Asked(counted);
     let _opening = private.then(|| PRIVATE_OPENING.lock().unwrap_or_else(|e| e.into_inner()));
     let started = std::time::Instant::now();
     // Set before the checks: a view going from here on stays mapped until
@@ -1052,6 +1165,7 @@ fn unrefuse(r: &mut Runs, start: usize, end: usize) {
     for key in hit {
         r.refused.remove(&key);
     }
+    unfruitless(r, start, end);
 }
 
 /// `[start, end)` joins `ranges` (start to end, disjoint), merged with
@@ -1187,6 +1301,7 @@ pub fn title_memory_own_gone(at: usize, len: usize, unmap: Box<dyn FnMut() -> i3
         let over: Vec<usize> = r.open.range(..end).filter(|(s, run)| **s + run.len > at).map(|(s, _)| *s).collect();
         let runs: Vec<Arc<Run>> = over.into_iter().filter_map(|s| r.open.remove(&s)).collect();
         r.refused.retain(|&(s, n)| s + n <= at || end <= s);
+        unfruitless(r, at, end);
         let opening = r.opening.is_some_and(|(s, n)| s < end && at < s + n);
         if runs.is_empty() && !opening {
             return Some(unmap);
@@ -1737,6 +1852,41 @@ mod tests {
         assert!(locked_ranges().keys().all(|&(s, _)| s != at), "unregistered");
         // The free's own answer says it was freed: a query here could find
         // the addresses taken again by another test's allocation.
+    }
+
+    /// Pages a table could not name are asked of the opening thread, which
+    /// works out what opens there; the table only looks up open runs. An
+    /// ask is made once until done, and not again where nothing opened.
+    #[test]
+    fn pages_no_run_holds_are_worked_out_by_the_opening_thread() {
+        let _one = worker_tests();
+        use windows_sys::Win32::System::Memory as mem;
+        let len = 4 * PAGE;
+        // SAFETY: plain allocation, freed below.
+        let at = unsafe { mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+        let _unreport = Unreport(at, len);
+        let pages: Vec<(usize, usize)> = (0..4).map(|k| (at / PAGE + k, at + k * PAGE)).collect();
+        let addrs: Vec<usize> = pages.iter().map(|&(_, a)| a).collect();
+        assert!(cover(&addrs).iter().all(Option::is_none), "nothing open yet");
+        assert!(ask(pages.clone(), true), "asked");
+        assert!(wait_pending(WORKER_WAIT), "worked out and done");
+        let held = cover(&addrs);
+        if held.iter().all(Option::is_some) {
+            // One run, the pages at their offsets in it.
+            let offsets: Vec<usize> = held.iter().map(|h| h.as_ref().unwrap().1).collect();
+            assert_eq!(offsets, [0, PAGE, 2 * PAGE, 3 * PAGE]);
+        } else {
+            // The host opens no private memory here: nothing to open, not
+            // asked again.
+            assert!(!ask(pages.clone(), true), "fruitless");
+        }
+        // The heap goes with the last reference (a table's, here this one).
+        drop(held);
+        // SAFETY: our allocation.
+        assert_ne!(crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
+        assert!(ask(Vec::new(), true) == false, "no pages, no ask");
     }
 
     /// The title protects private memory while a run over it opens, then

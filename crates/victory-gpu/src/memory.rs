@@ -743,50 +743,60 @@ impl Shared {
         let mut backstopped = vec![0u32; owner.len()];
         let mut runs: Vec<Arc<crate::inplace::Run>> = Vec::new();
         let (mut named, mut named_private) = (0u64, 0u64);
-        // Private memory the runtime reported (`VICTORY_RT_MEMORY`), per
-        // block: pages no copy and no other tracker holds, at their own
-        // address. Their runs are asked of the worker first and waited
-        // for, so that this table names them: the submission it is
-        // written for reads no zeros there.
+        // Per block, the pages no copy holds: those our views of sections
+        // show (at our view's address), and private memory the runtime
+        // reported (`VICTORY_RT_MEMORY`) that no tracker holds (at its own
+        // address). Nothing here queries memory: what no open run holds is
+        // asked of the opening thread, which works out what opens
+        // (`crate::inplace::ask`); private asks are waited for, so that
+        // this table names them and its submission reads no zeros there.
         let unowned = |b: usize, first: usize, page: usize| owner.get(b * BLOCK + (page - first)).is_some_and(|o| o.is_none());
-        let pages: Vec<Vec<(usize, usize)>> = blocks
+        let rt = crate::inplace::rt_memory();
+        let wanted: Vec<Vec<(usize, usize, bool)>> = blocks
             .iter()
             .enumerate()
             .map(|(b, &l1)| {
-                if b == 0 || !crate::inplace::rt_memory() {
+                // Block 0 is the null one.
+                if b == 0 {
                     return Vec::new();
                 }
                 let first = l1 * BLOCK;
-                let tracked = crate::watch::tracked_pages(first, first + BLOCK);
-                let candidates: Vec<usize> = crate::inplace::reported(first, first + BLOCK)
+                let mut w: Vec<(usize, usize, bool)> = crate::watch::own_views_in(first, first + BLOCK)
                     .into_iter()
-                    .filter(|&page| unowned(b, first, page) && tracked.binary_search(&page).is_err())
+                    .filter(|&(page, _)| unowned(b, first, page))
+                    .map(|(page, at)| (page, at, false))
                     .collect();
-                crate::inplace::private_pages(&candidates)
+                if rt {
+                    let tracked = crate::watch::tracked_pages(first, first + BLOCK);
+                    w.extend(
+                        crate::inplace::reported(first, first + BLOCK)
+                            .into_iter()
+                            .filter(|&page| unowned(b, first, page) && tracked.binary_search(&page).is_err())
+                            .map(|page| (page, page * crate::watch::PAGE, true)),
+                    );
+                }
+                w
             })
             .collect();
-        // Cut once: each cut queries the memory's regions.
-        let private: Vec<Vec<&[(usize, usize)]>> = pages.iter().map(|p| crate::inplace::private_runs(p)).collect();
+        let addrs = |w: &[(usize, usize, bool)]| w.iter().map(|&(_, at, _)| at).collect::<Vec<_>>();
         let mut asked = false;
-        for &run in private.iter().flatten() {
-            asked |= crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE, true).is_none();
+        for w in &wanted {
+            let (mut own, mut private) = (Vec::new(), Vec::new());
+            for (&(page, at, p), held) in w.iter().zip(crate::inplace::cover(&addrs(w))) {
+                if held.is_none() {
+                    if p { private.push((page, at)) } else { own.push((page, at)) }
+                }
+            }
+            crate::inplace::ask(own, false);
+            asked |= crate::inplace::ask(private, true);
         }
         if asked {
             crate::inplace::wait_private();
         }
-        // Block 0 is the null one.
-        for (b, &l1) in blocks.iter().enumerate().skip(1) {
-            let first = l1 * BLOCK;
-            let free: Vec<(usize, usize)> =
-                crate::watch::own_views_in(first, first + BLOCK).into_iter().filter(|&(page, _)| unowned(b, first, page)).collect();
-            // One run per section's view: a heap is opened on one.
-            let mapped = crate::inplace::runs(&free, 0)
-                .into_iter()
-                .flat_map(|run| crate::inplace::per_view(run, crate::inplace::allocation_end))
-                .map(|run| (run, false));
-            let own = private[b].iter().map(|&run| (run, true));
-            for (run, private) in mapped.chain(own) {
-                let Some((placed, offset)) = crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE, private) else {
+        for (b, w) in wanted.iter().enumerate() {
+            let first = blocks[b] * BLOCK;
+            for (&(page, _, private), held) in w.iter().zip(crate::inplace::cover(&addrs(w))) {
+                let Some((placed, offset)) = held else {
                     continue;
                 };
                 let pair = match self.run_pairs.get(&placed.id) {
@@ -809,14 +819,12 @@ impl Shared {
                         runs.len() - 1
                     }
                 };
-                for (k, &(page, _)) in run.iter().enumerate() {
-                    let entry = b * BLOCK + (page - first);
-                    dwords[LEVEL1 + 2 * entry] = pair;
-                    dwords[LEVEL1 + 2 * entry + 1] = crate::inplace::entry_base((page << 16) as u64, offset + k * crate::watch::PAGE);
-                    backstopped[entry] = index as u32 + 1;
-                }
-                named += run.len() as u64;
-                named_private += if private { run.len() as u64 } else { 0 };
+                let entry = b * BLOCK + (page - first);
+                dwords[LEVEL1 + 2 * entry] = pair;
+                dwords[LEVEL1 + 2 * entry + 1] = crate::inplace::entry_base((page << 16) as u64, offset);
+                backstopped[entry] = index as u32 + 1;
+                named += 1;
+                named_private += u64::from(private);
             }
         }
         self.run_pairs.retain(|id, &mut pair| {
