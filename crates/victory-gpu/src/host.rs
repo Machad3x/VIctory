@@ -2013,7 +2013,8 @@ impl Host {
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         {
-            (batch.flight_prev, batch.flight_prev_copies) = crate::copystat::flight_writes(&flight);
+            let last = crate::copystat::flight_writes(&flight);
+            (batch.flight_prev, batch.flight_prev_copies, batch.flight_prev_used) = (last.writes, last.copies, last.used);
             for (staging, _) in &textures {
                 let (at, len) = staging.title_range();
                 batch.touch(at, len, crate::copystat::C::RangeStaging);
@@ -2472,11 +2473,16 @@ impl Host {
             crate::copystat::flight_end(
                 f,
                 batch.flight_touched,
-                batch.flight_real,
-                batch.flight_shared,
                 [ns(sent - started), t.sync_heaps_ns, ns(waited_at - sent), ns(copying.elapsed())],
                 writes,
                 copies,
+                crate::copystat::Mine {
+                    real: batch.flight_real,
+                    shared: batch.flight_shared,
+                    used: batch.flight_used.clone(),
+                    marked: batch.flight_marked,
+                    hazard: batch.flight_hazard,
+                },
             );
         }
         // The submission has run and the next waits for our lock. Host
@@ -3561,6 +3567,8 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     batch.touch(*address, *len, C::RangeGpuWrite);
+                    #[cfg(feature = "diagnostics")]
+                    batch.prep_write(shadow, *marked);
                     batch.gpu_write(*address, *len);
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -3631,6 +3639,16 @@ struct Batch {
     flight_real: bool,
     #[cfg(feature = "diagnostics")]
     flight_shared: bool,
+    /// Overlap hazards: the copies the last title submission used (sorted)
+    /// and this one uses; whether this one marks pages, and met a hazard.
+    #[cfg(feature = "diagnostics")]
+    flight_prev_used: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    flight_used: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    flight_marked: bool,
+    #[cfg(feature = "diagnostics")]
+    flight_hazard: bool,
 }
 
 impl Batch {
@@ -3646,12 +3664,24 @@ impl Batch {
         crate::copystat::add(c, 1);
     }
 
+    /// Overlap hazards: a range the submission's shaders write, of a copy
+    /// the last one wrote (its snapshot or marks would meet that one's).
+    #[cfg(feature = "diagnostics")]
+    fn prep_write(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, marked: bool) {
+        self.flight_marked |= marked;
+        if self.flight_prev_copies.binary_search(&(std::sync::Arc::as_ptr(shadow) as usize)).is_ok() {
+            crate::copystat::add(if marked { crate::copystat::C::PrepMarkedWritten } else { crate::copystat::C::PrepSnapshotWritten }, 1);
+            self.flight_hazard = true;
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         #[cfg(feature = "diagnostics")]
         let same = self.flight_prev_copies.binary_search(&(std::sync::Arc::as_ptr(shadow) as usize)).is_ok();
         #[cfg(feature = "diagnostics")]
         {
             self.flight_shared |= same;
+            self.flight_used.push(std::sync::Arc::as_ptr(shadow) as usize);
         }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
@@ -3665,7 +3695,13 @@ impl Batch {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        self.touch(address, len, if same { crate::copystat::C::RangeSame } else { crate::copystat::C::RangeAlias });
+        {
+            self.touch(address, len, if same { crate::copystat::C::RangeSame } else { crate::copystat::C::RangeAlias });
+            if self.flight_prev_used.binary_search(&(std::sync::Arc::as_ptr(shadow) as usize)).is_ok() {
+                crate::copystat::add(crate::copystat::C::PrepDirtyInUse, 1);
+                self.flight_hazard = true;
+            }
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
