@@ -370,14 +370,30 @@ fn shared_budget() -> bool {
 /// the screen too); the two slots are distinct.
 static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
 
-/// Waits until a worker has made `p`, without a frame budget. `start` has
-/// queued it, or made it itself when there are no workers.
+/// Waits for a worker to make `p`, capped below the title's 30 s watchdog.
+/// `start` queued it, or made it itself when there are no workers.
 fn wait_for(p: &Pending) {
+    let started = Instant::now();
+    let cap = screen_budget();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
-        held = done.wait(held).unwrap_or_else(|e| e.into_inner());
+        let rest = cap.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
+    drop(held);
+    if p.made.get().is_none() {
+        // A long queue: make it here rather than drop the dispatch.
+        p.make();
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(
+        crate::copystat::C::PipelineWaitUs,
+        started.elapsed().as_micros() as u64,
+    );
 }
 
 /// Waits for `p` while frame `frame` has budget left.

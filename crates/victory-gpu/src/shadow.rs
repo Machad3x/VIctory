@@ -2237,9 +2237,10 @@ pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 /// PC's 4070 SUPER has a 16 GiB one) instead of two sides
 /// (`VICTORY_WC_BAR=1`; off by default). Honour the write-back size policy:
 /// small shader results can feed title CPU reads or refreshes of other copies.
-/// Mode 1 therefore needs `VICTORY_WC_NO_BACK=1` and a
-/// `VICTORY_WC_NO_BACK_MIN_KB` cutoff; without them it stays off. Mode 2
-/// selects the original unrestricted policy for comparison.
+/// Mode 1 needs `VICTORY_WC_NO_BACK=1`; `VICTORY_WC_NO_BACK_MIN_KB` defaults
+/// to 0, which leaves every copy on the card, so set a size to keep small
+/// shader results from going stale. `VICTORY_WC_BAR=1` alone stays off;
+/// mode 2 selects the original unrestricted policy for comparison.
 ///
 /// Refreshes write title memory into the mapping through the bus (as they
 /// write a CPU's side now); shaders read and write the card's memory; there
