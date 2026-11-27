@@ -558,6 +558,46 @@ pub(crate) fn video_memory() -> Option<[(f64, f64); 2]> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// A submission is noted as sent when it goes to the GPU and as done
+    /// once it was waited for (`crate::memsys::sent`, `done`): pages of
+    /// destroyed pooled buffers wait for that.
+    #[test]
+    fn a_submission_is_noted_as_sent_and_then_as_done() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        list.close();
+        let before = crate::memsys::done();
+        host.execute(&[&list]);
+        // With submissions held off, the last one sent has run.
+        let submitted = no_submissions().unwrap();
+        assert!(*submitted >= 1);
+        assert_eq!(crate::memsys::sent(), *submitted, "the last submission sent");
+        assert_eq!(crate::memsys::done(), *submitted, "and waited for");
+        assert!(crate::memsys::done() > before, "ours among them");
+    }
+
+    /// A list of our own run at once is waited for: what it copied is
+    /// there when `run_now` returns.
+    #[test]
+    fn a_list_run_now_has_run_when_it_returns() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (src, s) = host.shared_buffer(4).unwrap();
+        let (dst, d) = host.shared_buffer(4).unwrap();
+        // SAFETY: four mapped bytes each.
+        unsafe { s.write_bytes(0xAB, 4) };
+        // SAFETY: an open list of ours and two live buffers.
+        let ran = host.run_now(&mut |list| unsafe { list.CopyBufferRegion(&dst, 0, &src, 0, 4) });
+        assert!(ran);
+        // SAFETY: as above, the copy waited for.
+        assert_eq!(unsafe { std::slice::from_raw_parts(d, 4) }, [0xAB; 4]);
+    }
+
     #[test]
     fn legal_states_are_texture_states_with_writes_alone() {
         assert_eq!(super::legal_for(0x2, 0x10 | 0x80), 0x10);
@@ -3283,6 +3323,11 @@ impl Drop for Batch {
         self.current.clear();
         self.gpu_writes.clear();
         self.late.clear();
+        // Tests: the thread a batch with the mark's room ended on.
+        #[cfg(test)]
+        if self.gpu_writes.capacity() >= batch::MARK {
+            *batch::ENDED_ON.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
+        }
         if self.refreshes.capacity() == 0 && self.current.capacity() == 0 && self.gpu_writes.capacity() == 0 {
             return;
         }
@@ -5450,8 +5495,131 @@ fn pump() {
     }
 }
 
+impl Host {
+    /// Records a list of our own with `record`, runs it now, after
+    /// whatever the queue holds, and waits for it: for work between
+    /// submissions that is more than copies ([`Host::copy_now`]), such as
+    /// `crate::memsys::diff`'s compares. Buffers start and end in the
+    /// common state unless `record` moves them back itself. False when
+    /// nothing ran (no list on this host, or the run failed; logged).
+    pub(crate) fn run_now(&self, record: &mut dyn FnMut(&ID3D12GraphicsCommandList)) -> bool {
+        struct Runner {
+            allocator: ID3D12CommandAllocator,
+            list: ID3D12GraphicsCommandList,
+            fence: ID3D12Fence,
+            event: HANDLE,
+            value: u64,
+        }
+        // SAFETY: D3D12 objects are free-threaded; the event is waited on
+        // under the mutex only.
+        unsafe impl Send for Runner {}
+        static RUNNER: OnceLock<Option<Mutex<Runner>>> = OnceLock::new();
+        let runner = RUNNER.get_or_init(|| {
+            // SAFETY: plain creation; the list is closed until used.
+            let made = unsafe {
+                (|| -> windows::core::Result<Runner> {
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                    list.Close()?;
+                    let fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+                    let event = CreateEventW(None, false, false, None)?;
+                    Ok(Runner { allocator, list, fence, event, value: 0 })
+                })()
+            };
+            match made {
+                Ok(r) => Some(Mutex::new(r)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no list of our own to run between submissions");
+                    None
+                }
+            }
+        });
+        let Some(runner) = runner else {
+            return false;
+        };
+        let mut r = runner.lock().unwrap_or_else(|e| e.into_inner());
+        r.value += 1;
+        let value = r.value;
+        // SAFETY: the allocator's last list finished (each call waits);
+        // what `record` names is live (the caller's).
+        let ran = unsafe {
+            r.allocator.Reset().and_then(|()| {
+                r.list.Reset(&r.allocator, None)?;
+                record(&r.list);
+                r.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(r.list.cast()?)]);
+                self.queue.Signal(&r.fence, value)?;
+                r.fence.SetEventOnCompletion(value, r.event)?;
+                Ok(wait_for_submission(
+                    || {
+                        // A removed device signals the event and completes
+                        // every fence at u64::MAX: not a list that ran.
+                        WaitForSingleObject(r.event, WAIT_SLICE_MS) != WAIT_TIMEOUT
+                            && (value..u64::MAX).contains(&r.fence.GetCompletedValue())
+                    },
+                    || self.device.GetDeviceRemovedReason().is_err(),
+                    |secs| tracing::warn!(secs, "a list of our own still on the GPU"),
+                ))
+            })
+        };
+        // The runner stays locked through a failure report, which takes
+        // none of it: its allocator may still be in use on the GPU.
+        match ran {
+            Ok(Waited::Done) => true,
+            Ok(Waited::Removed) => fail(format_args!("host GPU device removed during a list of our own")),
+            Ok(Waited::Stalled) => fail(format_args!(
+                "host GPU has not finished a list of our own in {STALL_SECS} s and reports no removal: the \
+                 GPU has most likely faulted or hung"
+            )),
+            Err(e) => {
+                tracing::warn!(error = %e, "a list of our own did not run");
+                false
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
+    /// Room in `gpu_writes` no real batch has: names the batch of
+    /// `a_batch_released_later_is_recycled_on_the_releasing_thread`.
+    pub(super) const MARK: usize = 54_321;
+    /// The thread that batch ended on.
+    pub(super) static ENDED_ON: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+    /// A submission's batch ends on the releasing thread
+    /// (`release_later`), a little after the next submission began: its
+    /// lists are emptied and kept from there too.
+    #[test]
+    fn a_batch_released_later_is_recycled_on_the_releasing_thread() {
+        // Submissions take and leave spares: none meanwhile.
+        let _quiet = super::tests::no_submissions();
+        let mut batch = super::Batch::default();
+        batch.gpu_writes.reserve(MARK);
+        batch.gpu_write(0x1000, 0x100);
+        batch.late.push((1, 2, 3));
+        super::release_later(Box::new(batch));
+        let kept = || {
+            let spares = super::SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            // Batches of other tests may have filled the spares first.
+            let ours = spares.iter().any(|s| s.gpu_writes.capacity() >= MARK && s.gpu_writes.is_empty() && s.late.is_empty());
+            ours || spares.len() == super::SPARES
+        };
+        let mut ended_on = None;
+        for _ in 0..500 {
+            ended_on = *ENDED_ON.lock().unwrap_or_else(|e| e.into_inner());
+            if ended_on.is_some() && kept() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ended_on.is_some(), "the batch ended");
+        assert_ne!(ended_on, Some(std::thread::current().id()), "on the releasing thread, not here");
+        assert!(kept(), "its lists were kept for the next batch");
+    }
+
     /// A batch that ended leaves its lists and tables, emptied, to the
     /// next: nothing of the old one's copies or ranges is in it.
     #[test]
