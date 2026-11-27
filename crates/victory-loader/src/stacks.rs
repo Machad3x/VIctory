@@ -6,7 +6,7 @@
 //! address 0 then shows who waited on what.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
@@ -71,7 +71,9 @@ const CRASH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// the text, for the crash log. Taken on a thread of its own and waited for
 /// [`CRASH_DEADLINE`] at most: a thread suspended while it holds a lock the
 /// unwinder or the new thread's start needs (the loader's) would hang the
-/// filter, and the run would never end.
+/// filter, and the run would never end. Past it no thread is suspended any
+/// more and the one that is, is resumed: the rest of the crash path may
+/// need a lock it holds (the heap's, stdio's).
 pub(crate) fn dump_stacks_on_crash() -> Option<String> {
     if !ON_CRASH.swap(false, Ordering::Relaxed) {
         return None;
@@ -86,11 +88,113 @@ pub(crate) fn dump_stacks_on_crash() -> Option<String> {
     match rx.recv_timeout(CRASH_DEADLINE) {
         Ok(text) => Some(text),
         Err(_) => {
+            GIVE_UP.store(true, Ordering::SeqCst);
+            resume_suspended();
             let late = format!("VIctory: the stacks took longer than {CRASH_DEADLINE:?}; left out\n");
             eprint!("{late}");
             Some(late)
         }
     }
+}
+
+/// The thread the dump has suspended (its handle), if any, for the crash
+/// filter to resume when it stops waiting; and whether it did.
+static SUSPENDED: AtomicUsize = AtomicUsize::new(0);
+static GIVE_UP: AtomicBool = AtomicBool::new(false);
+
+/// Suspends `thread` for the dump, published in [`SUSPENDED`]: false (and
+/// not suspended) once the filter gave up, or took it back meanwhile.
+fn suspend(thread: HANDLE) -> bool {
+    if GIVE_UP.load(Ordering::SeqCst) {
+        return false;
+    }
+    // One suspended at a time, whichever dump (a scheduled one, a crash).
+    while SUSPENDED.compare_exchange(0, thread as usize, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if GIVE_UP.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::yield_now();
+    }
+    // SAFETY: a thread of this process that is not this one.
+    if unsafe { SuspendThread(thread) } == u32::MAX {
+        SUSPENDED.store(0, Ordering::SeqCst);
+        return false;
+    }
+    if SUSPENDED.load(Ordering::SeqCst) != thread as usize {
+        // The filter resumed it, maybe before the suspend: once more.
+        // SAFETY: suspended above.
+        unsafe { ResumeThread(thread) };
+        return false;
+    }
+    true
+}
+
+/// Resumes `thread` unless the filter already did.
+fn resume(thread: HANDLE) {
+    if SUSPENDED.compare_exchange(thread as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        // SAFETY: suspended by `suspend`.
+        unsafe { ResumeThread(thread) };
+    }
+}
+
+/// The filter's side: resumes the thread the dump holds suspended.
+fn resume_suspended() {
+    let thread = SUSPENDED.swap(0, Ordering::SeqCst);
+    if thread != 0 {
+        // SAFETY: a thread handle the dump holds open while it is published.
+        unsafe { ResumeThread(thread as HANDLE) };
+    }
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(class: u32, info: *mut c_void, len: u32, returned: *mut u32) -> i32;
+}
+
+/// `SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX` (ntddk).
+#[repr(C)]
+struct HandleEntry {
+    object: usize,
+    process: usize,
+    handle: usize,
+    access: u32,
+    trace: u16,
+    kind: u16,
+    attributes: u32,
+    reserved: u32,
+}
+
+/// This process's open handles, sorted: listed by the system, so no
+/// value is probed (an invalid one raises under strict handle checks).
+fn open_handles() -> Vec<u64> {
+    const EXTENDED_HANDLE_INFORMATION: u32 = 64;
+    const LENGTH_MISMATCH: i32 = 0xc000_0004_u32 as i32;
+    // SAFETY: a plain query.
+    let me = unsafe { GetCurrentProcessId() } as usize;
+    // Words: a count, a reserved word, then the entries.
+    let mut buffer: Vec<u64> = vec![0; 1 << 17];
+    loop {
+        let mut needed = 0u32;
+        let bytes = u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX);
+        // SAFETY: writes at most `bytes` into `buffer`.
+        let status = unsafe { NtQuerySystemInformation(EXTENDED_HANDLE_INFORMATION, buffer.as_mut_ptr().cast(), bytes, &mut needed) };
+        if status == LENGTH_MISMATCH && buffer.len() < 1 << 25 {
+            let more = (needed as usize / 8 + 4096).max(buffer.len() * 2);
+            buffer.resize(more, 0);
+            continue;
+        }
+        if status != 0 {
+            return Vec::new();
+        }
+        break;
+    }
+    let fit = (buffer.len() - 2) * 8 / size_of::<HandleEntry>();
+    let count = (buffer[0] as usize).min(fit);
+    // SAFETY: the system wrote `count` entries after the two header words.
+    let entries = unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(2).cast::<HandleEntry>(), count) };
+    let mut open: Vec<u64> = entries.iter().filter(|e| e.process == me).map(|e| e.handle as u64).collect();
+    open.sort_unstable();
+    open
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -149,6 +253,7 @@ fn dump_stacks_text() -> String {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    let open = open_handles();
     line(format!("VIctory: stacks of {} threads", ids.len()));
     for id in ids {
         // SAFETY: opens a thread of our own process.
@@ -169,7 +274,7 @@ fn dump_stacks_text() -> String {
             locate(start_of(thread)),
             locate(at.rip as usize),
             at.rsp,
-            at.handles()
+            at.handles(&open)
         ));
         for (i, pc) in frames.into_iter().enumerate() {
             line(format!("    #{i:<2} {}", locate(pc as usize)));
@@ -201,16 +306,12 @@ impl Default for Stopped {
 }
 
 impl Stopped {
-    /// Words near `rsp` that are open handles of this process, each once:
-    /// what a thread waiting in the kernel may wait on.
-    fn handles(&self) -> Vec<u64> {
-        use windows_sys::Win32::Foundation::GetHandleInformation;
+    /// Words near `rsp` that are in `open` (sorted), each once: what a
+    /// thread waiting in the kernel may wait on.
+    fn handles(&self, open: &[u64]) -> Vec<u64> {
         let mut found: Vec<u64> = Vec::new();
         for &w in &self.stack {
-            let mut flags = 0;
-            // Handles are small multiples of 4; pseudo handles are not open ones.
-            // SAFETY: a plain query; an invalid value fails.
-            if w != 0 && w < 1 << 32 && w % 4 == 0 && !found.contains(&w) && unsafe { GetHandleInformation(w as HANDLE, &mut flags) } != 0 {
+            if w != 0 && !found.contains(&w) && open.binary_search(&w).is_ok() {
                 found.push(w);
             }
         }
@@ -232,8 +333,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), Stopped) {
     };
     // Suspended first: a running thread may exit and free its TEB between
     // the query and the read below.
-    // SAFETY: a thread of this process that is not this one.
-    if unsafe { SuspendThread(thread) } == u32::MAX {
+    if !suspend(thread) {
         return (frames, (0, 0), Stopped::default());
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
@@ -247,8 +347,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), Stopped) {
         )
     };
     if status != 0 || info.teb.is_null() {
-        // SAFETY: suspended above.
-        unsafe { ResumeThread(thread) };
+        resume(thread);
         return (frames, (0, 0), Stopped::default());
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
@@ -277,8 +376,8 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), Stopped) {
                 &mut done,
             );
         }
-        ResumeThread(thread);
     }
+    resume(thread);
     (frames, (info.priority, info.base_priority), stopped)
 }
 
@@ -374,15 +473,25 @@ mod tests {
         let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id) };
         assert!(!thread.is_null());
         // In the wait once its stub is where it stays.
+        let open = open_handles();
+        assert!(open.binary_search(&(at as u64)).is_ok(), "the system lists the event");
         let mut stopped = Stopped::default();
         for _ in 0..200 {
             stopped = frames_of(thread).2;
-            if stopped.handles().contains(&(at as u64)) {
+            if stopped.handles(&open).contains(&(at as u64)) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(stopped.handles().contains(&(at as u64)), "{:x?} has {at:#x}", stopped.handles());
+        assert!(stopped.handles(&open).contains(&(at as u64)), "{:x?} has {at:#x}", stopped.handles(&open));
+        // The filter giving up resumes the thread the dump holds.
+        assert!(suspend(thread));
+        resume_suspended();
+        // SAFETY: as above; the previous count is 0 once resumed.
+        assert_eq!(unsafe { SuspendThread(thread) }, 0, "resumed");
+        // SAFETY: suspended just above.
+        unsafe { ResumeThread(thread) };
+        resume(thread);
         assert!(locate(stopped.rip as usize).starts_with("ntdll"), "{}", locate(stopped.rip as usize));
         // SAFETY: ours; the waiter returns, then both handles go.
         unsafe {
