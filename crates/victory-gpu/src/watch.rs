@@ -1169,7 +1169,7 @@ pub fn title_memory_own(at: usize, len: usize, own: usize) {
 
 /// The views of our own showing title pages `first..last` (page numbers),
 /// as (page, our view's address) in page order ([`title_memory_own`]).
-pub(crate) fn own_views(first: usize, last: usize) -> Vec<(usize, usize)> {
+pub(crate) fn own_views_in(first: usize, last: usize) -> Vec<(usize, usize)> {
     guards().own.range(first..last).map(|(&page, &own)| (page, own)).collect()
 }
 

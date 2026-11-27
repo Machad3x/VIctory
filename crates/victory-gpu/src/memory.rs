@@ -628,14 +628,14 @@ impl Shared {
         dwords: &mut [u32],
         blocks: &[usize],
         owner: &[Option<usize>],
-    ) -> (Vec<bool>, Vec<Arc<crate::inplace::Run>>) {
+    ) -> (Vec<u32>, Vec<Arc<crate::inplace::Run>>) {
         let mut backstopped = vec![0u32; owner.len()];
         let mut runs: Vec<Arc<crate::inplace::Run>> = Vec::new();
         let mut named = 0u64;
         // Block 0 is the null one.
         for (b, &l1) in blocks.iter().enumerate().skip(1) {
             let first = l1 * BLOCK;
-            let free: Vec<(usize, usize)> = crate::watch::own_views(first, first + BLOCK)
+            let free: Vec<(usize, usize)> = crate::watch::own_views_in(first, first + BLOCK)
                 .into_iter()
                 .filter(|&(page, _)| owner.get(b * BLOCK + (page - first)).is_some_and(|o| o.is_none()))
                 .collect();
