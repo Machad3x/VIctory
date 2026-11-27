@@ -934,6 +934,13 @@ fn root_signature(
     }
 }
 
+/// Whether pipelines with the same root signature blob share one object
+/// (on unless `VICTORY_ROOT_SHARE=0`).
+pub(crate) fn root_share() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_ROOT_SHARE"))
+}
+
 /// Root signatures by device and serialized blob: pipelines with the same
 /// layout share one, so switching between them keeps the list's root
 /// signature and its root arguments (`crate::draw`).
@@ -947,7 +954,7 @@ static ROOTS: std::sync::Mutex<Option<Roots>> = std::sync::Mutex::new(None);
 /// signature holds its device, so a device address is never reused while
 /// it is a key. `VICTORY_ROOT_SHARE=0` makes one per pipeline, as before.
 fn shared_root(device: &ID3D12Device, blob: &[u8]) -> windows::core::Result<ID3D12RootSignature> {
-    if !crate::switch::on_by_default("VICTORY_ROOT_SHARE") {
+    if !root_share() {
         // SAFETY: a serialized root signature.
         return unsafe { device.CreateRootSignature(0, blob) };
     }

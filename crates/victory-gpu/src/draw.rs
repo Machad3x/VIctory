@@ -387,6 +387,44 @@ fn root_view(list: &HostList, address: u64, srv: bool, uav: bool, writes: bool) 
     Some(gpu)
 }
 
+/// The GPU address of a zeroed scratch buffer of ours (`uav`: one shaders
+/// may write) for a root view left unbound, alive for good; `None` while
+/// there is no host buffer (tried again at the next call).
+/// Root views have no bounds: 64 MiB each, past any root view range ours
+/// take (1 MiB, [`root_view`]).
+/// shortcut: an unset view has no size to check against; what shaders write
+/// into the UAV one stays there for the next unbound read, and draws writing
+/// it have no UAV barrier between them (their writes race; nothing reads
+/// them as data).
+fn unbound_view(uav: bool) -> Option<u64> {
+    const UNBOUND_BYTES: u64 = 64 << 20;
+    static VIEWS: std::sync::OnceLock<[u64; 2]> = std::sync::OnceLock::new();
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if let Some(v) = VIEWS.get() {
+        return Some(v[usize::from(uav)]);
+    }
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(v) = VIEWS.get() {
+        return Some(v[usize::from(uav)]);
+    }
+    let made = crate::host::host().and_then(|host| {
+        // Committed in a default heap: zeroed; common, promoted per use.
+        let [read, write] = [host.uav_buffer(UNBOUND_BYTES)?, host.uav_buffer(UNBOUND_BYTES)?];
+        crate::host::name(&read, || "unbound root view (read)".into());
+        crate::host::name(&write, || "unbound root view (write)".into());
+        // SAFETY: live buffers, kept for good below.
+        let views = unsafe { [read.GetGPUVirtualAddress(), write.GetGPUVirtualAddress()] };
+        std::mem::forget((read, write));
+        Some(views)
+    });
+    let Some(views) = made else {
+        static FAILED: std::sync::Once = std::sync::Once::new();
+        FAILED.call_once(|| tracing::warn!("no scratch buffers for unbound root views: left as they are"));
+        return None;
+    };
+    Some(VIEWS.get_or_init(|| views)[usize::from(uav)])
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1103,13 +1141,24 @@ impl State {
                         self.root_args[usize::from(compute)].view(l, root, compute, 1, param, gpu);
                         continue;
                     }
+                    // Unbound: with root signatures shared, the slot would
+                    // keep another pipeline's view; zeros instead.
+                    let unbound = |args: &mut RootArgs| {
+                        if crate::pipeline::host::root_share()
+                            && let Some(gpu) = unbound_view(kind == 2)
+                        {
+                            args.view(l, root, compute, kind, param, gpu);
+                        }
+                    };
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
+                        unbound(&mut self.root_args[usize::from(compute)]);
                         continue;
                     };
                     let writes = kind == 2 && t.host.written_root_uavs.contains(&slot);
                     let Some(gpu) = root_view(list, address, kind == 1, kind == 2, writes) else {
+                        unbound(&mut self.root_args[usize::from(compute)]);
                         continue;
                     };
                     // The address is in live memory (`root_view` keeps it).
@@ -5264,6 +5313,19 @@ mod root_view_tests {
 #[cfg(test)]
 mod root_args_tests {
     use super::RootArgs;
+
+    /// Unbound root views get one of two scratch buffers, the same each
+    /// time: one to read, one to write.
+    #[test]
+    fn unbound_root_views_read_and_write_scratch_buffers() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let (read, write) = (super::unbound_view(false), super::unbound_view(true));
+        assert!(read.is_some_and(|a| a != 0) && write.is_some_and(|a| a != 0));
+        assert_ne!(read, write);
+        assert_eq!(super::unbound_view(true), write);
+    }
 
     #[test]
     fn root_arguments_held_are_skipped_until_the_root_signature_is_set() {
