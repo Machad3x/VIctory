@@ -596,6 +596,8 @@ mod tests {
         memory.borrow_mut().insert(0x200, 1);
         go(&mut held);
         assert_eq!(*ran.borrow(), ["depth"], "the predicted one holds with memory at 0");
+        // Tickets retire in order: the first one's write is in memory first.
+        pending.borrow_mut().retired(1);
         held.push(2, Item::Segment("again", vec![ge(0x100, 9)]));
         pending.borrow_mut().sent(2, 0x100, None, 8);
         memory.borrow_mut().insert(0x100, 9);
