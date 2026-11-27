@@ -20,9 +20,12 @@
 //! `PS_AreaLightIlluminance`) with such draws once, at the world's first
 //! frame, behind more than a thousand other pipelines. Dropped, the tables
 //! stay empty for the whole run. Idea from Belobug's fork (18e57db).
-//! `VICTORY_COMPUTE_WAIT=1` makes compute pipelines wait in the same class,
-//! for a one-off dispatch that would be lost: with a cold cache frames then
-//! took 15 to 26 s against about 1 s, so it is off by default.
+//! Compute pipelines wait in the same class, for a one-off dispatch that
+//! would be lost (a compute pass keeps state from frame to frame). Runs
+//! gpu282 to gpu284 waited for none in the opening scene once warm, so it
+//! is not what lights the interior there. With a cold cache
+//! frames then took 15 to 26 s against about 1 s. `VICTORY_COMPUTE_WAIT=0`
+//! turns it off. (Idea from Biskwit/VIctory-reloaded 0b6c0e46.)
 //!
 //! shortcut: both budgets are guesses; any other draw the title runs only
 //! once and whose pipeline takes longer than half a second is lost.
@@ -212,10 +215,10 @@ const BUDGET: Duration = Duration::from_millis(500);
 // split it if a run loses one.
 const SCREEN_BUDGET: Duration = Duration::from_secs(20);
 
-/// Whether `VICTORY_COMPUTE_WAIT`'s value asks compute pipelines to be waited
-/// for like screen passes.
+/// Whether compute pipelines are waited for like screen passes (unless
+/// `VICTORY_COMPUTE_WAIT` is 0).
 fn waits_compute(value: Option<&std::ffi::OsStr>) -> bool {
-    value == Some("1".as_ref())
+    value.is_none_or(|v| v != "0")
 }
 
 /// The queue a pipeline goes into, the first served first: urgent pipelines
@@ -308,8 +311,33 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
+    drop(held);
     WAITERS.fetch_sub(1, Ordering::Relaxed);
-    waited.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = started.elapsed().as_micros() as u64;
+    waited.fetch_add(us, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if urgent && !p.screen() {
+        let dropped = p.made.get().is_none();
+        COMPUTE_WAITS[0].fetch_add(1, Ordering::Relaxed);
+        COMPUTE_WAITS[1].fetch_add(us, Ordering::Relaxed);
+        COMPUTE_WAITS[2].fetch_add(u64::from(dropped), Ordering::Relaxed);
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if dropped && LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+            let shaders: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
+            tracing::warn!(key = %p.key, ?shaders, waited_ms = us / 1000, "a dispatch's compute pipeline was not made in time: dropped");
+        }
+    }
+}
+
+/// Compute pipelines waited for, microseconds waited, and of them those not
+/// made in time all the same, since the last take.
+#[cfg(feature = "diagnostics")]
+static COMPUTE_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`COMPUTE_WAITS`], taken (for the frame report).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_compute_waits() -> [u64; 3] {
+    COMPUTE_WAITS.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
 }
 
 /// Title threads waiting for a pipeline now.
@@ -487,10 +515,10 @@ mod tests {
         assert!(!p.screen());
     }
 
-    /// Compute pipelines wait like screen passes only when asked to.
+    /// Compute pipelines wait like screen passes unless told not to.
     #[test]
-    fn compute_waits_only_when_asked() {
-        assert!(!waits_compute(None));
+    fn compute_waits_unless_told_not_to() {
+        assert!(waits_compute(None));
         assert!(!waits_compute(Some("0".as_ref())));
         assert!(waits_compute(Some("1".as_ref())));
     }

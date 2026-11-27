@@ -326,6 +326,9 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use make::take_compute_waits;
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

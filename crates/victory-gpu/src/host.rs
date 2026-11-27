@@ -4107,6 +4107,13 @@ impl Meter {
                 );
                 // Window caption updates leave the report counters intact.
                 let drops = crate::pipeline::take_drops();
+                let [waits, waited_us, late] = crate::pipeline::take_compute_waits();
+                if waits > 0 {
+                    tracing::info!(
+                        "compute pipelines waited for: {waits}, {} ms in all, {late} not made in time all the same",
+                        waited_us / 1000
+                    );
+                }
                 crate::frame::log();
                 log_gpu_times(report_frames);
                 crate::gpumeasure::log(report_frames);
