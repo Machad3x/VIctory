@@ -226,6 +226,13 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
+    struct Pumping(bool);
+    impl Drop for Pumping {
+        fn drop(&mut self) {
+            PUMPING.set(self.0);
+        }
+    }
+    let _pumping = Pumping(PUMPING.replace(true));
     let read = |address: u64, bytes: u8| {
         if !predicting() {
             return read_value(address, bytes);
@@ -251,16 +258,20 @@ fn pump(held: &mut Holding, why: Why) {
         host.execute(&lists);
         ran += at.elapsed();
         drop(lists);
-        for (list, lease) in segments {
-            if let Some(lease) = lease {
-                lease.finish();
+        after_retired(move || {
+            for (list, lease) in segments {
+                if let Some(lease) = lease {
+                    lease.finish();
+                }
+                crate::list::recycle(list);
             }
-            crate::list::recycle(list);
-        }
+        });
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+        after_retired(move || {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        });
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
@@ -291,6 +302,27 @@ fn pump(held: &mut Holding, why: Why) {
             pump_held_if_free(Why::Timer);
         });
     });
+}
+
+/// Runs `then` once every host submission sent so far is retired: the
+/// lists' leases and recycling, and title fence Signals queued behind
+/// them, which tell the title the work is done. Submissions retire
+/// inline, so that is now.
+#[cfg(windows)]
+fn after_retired(then: impl FnOnce()) {
+    then();
+}
+
+#[cfg(windows)]
+thread_local! {
+    static PUMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is running held work: a blocking fence wait here
+/// would never end.
+#[cfg(windows)]
+pub(crate) fn pumping_here() -> bool {
+    PUMPING.get()
 }
 
 /// Whether queue waits read what sent, unsettled submissions will write
