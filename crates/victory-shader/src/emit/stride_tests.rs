@@ -269,6 +269,8 @@ fn build(
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
         view_stores: lowered.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

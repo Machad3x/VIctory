@@ -279,6 +279,11 @@ pub(crate) enum C {
     /// Indirect clamps after a title barrier group ordering indirect
     /// arguments (access or sync) with no shader write recorded since.
     ClampsArgsOrdered,
+    /// Descriptor handles the programs of draws and dispatches take from
+    /// the resource heap (static counts per program, summed per draw), and
+    /// those of them that differ between lanes.
+    DescFetches,
+    DescFetchesNonuniform,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -295,13 +300,37 @@ pub(crate) static HANDLER_OPEN_MAX: AtomicU64 = AtomicU64::new(0);
 /// The longest wait of a title descriptor write for the shader-visible
 /// heaps' lock since the last line, nanoseconds.
 pub(crate) static MIRROR_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
-/// Distinct records (view entry and generation) held by the slots of the
-/// view heap that changed last, and the most seen; slots sharing another's
-/// descriptor now (`VICTORY_DESC_MAP`).
-// shortcut: one gauge for every view heap (the title has one large one).
-pub(crate) static DESC_KEYS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DESC_KEYS_PEAK: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DESC_SHARING: AtomicU64 = AtomicU64::new(0);
+/// Per view heap (by the host heap's number): the distinct records (view
+/// entry and generation) its slots hold now and at most, and its slots
+/// sharing another's descriptor now (`VICTORY_DESC_MAP`).
+static DESC_HEAPS: std::sync::Mutex<std::collections::BTreeMap<u32, [u64; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// View heap `heap` holds `records` distinct records and `sharing` slots
+/// share another's descriptor.
+pub(crate) fn desc_heap(heap: u32, records: u64, sharing: u64) {
+    let mut heaps = DESC_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let g = heaps.entry(heap).or_default();
+    *g = [records, g[1].max(records), sharing];
+}
+
+/// View heap `heap` is gone.
+pub(crate) fn desc_heap_gone(heap: u32) {
+    DESC_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&heap);
+}
+
+/// The view heaps' gauges, for the stat line: `#n records now/most, sharing`.
+fn desc_heaps() -> String {
+    let heaps = DESC_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if heaps.is_empty() {
+        return "none".into();
+    }
+    heaps
+        .iter()
+        .map(|(n, [now, most, sharing])| format!("#{n} {now}/{most}, {sharing} sharing"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// Nanoseconds since the first call.
 fn epoch_ns() -> u64 {
@@ -654,7 +683,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "  view slots by record per frame: {:.0} made from a record another slot holds, {:.0} from one no other holds; {:.0} copied, {:.0} shared, {:.0} stand-ins; check {:.0} same, {:.0} other; records held now {}, most {}; sharing now {}; clamps after an argument barrier {:.0}",
+        "  view slots by record per frame: {:.0} made from a record another slot holds, {:.0} from one no other holds; {:.0} copied, {:.0} shared, {:.0} stand-ins; check {:.0} same, {:.0} other; heaps (records now/most): {}; heap descriptor fetches {:.0} ({:.0} per lane); clamps after an argument barrier {:.0}",
         c[C::DescKeyHit as usize],
         c[C::DescKeyMiss as usize],
         c[C::DescCopied as usize],
@@ -662,9 +691,9 @@ pub(crate) fn log(frames: f64) {
         c[C::DescPromoted as usize],
         c[C::DescCheckSame as usize],
         c[C::DescCheckDiffer as usize],
-        DESC_KEYS.load(Relaxed),
-        DESC_KEYS_PEAK.load(Relaxed),
-        DESC_SHARING.load(Relaxed),
+        desc_heaps(),
+        c[C::DescFetches as usize],
+        c[C::DescFetchesNonuniform as usize],
         c[C::ClampsArgsOrdered as usize],
     );
     tracing::info!(

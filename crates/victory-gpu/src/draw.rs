@@ -1040,6 +1040,13 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            // Census: descriptor fetches each draw's programs make (each a
+            // slot map load more with `VICTORY_DESC_MAP=on`).
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::DescFetches, u64::from(t.host.heap_fetches));
+                crate::copystat::add(crate::copystat::C::DescFetchesNonuniform, u64::from(t.host.nonuniform_fetches));
+            }
             self.table_failed = false;
             // The view addresses exist before the stage's tables are made:
             // a table made afresh enters its views' addresses there.
@@ -3178,6 +3185,8 @@ uint ps() : SV_Target { return 1; }
                 heap_writes: false,
                 view_marks: false,
                 view_stores: false,
+                heap_fetches: 0,
+                nonuniform_fetches: 0,
             },
             used: Vec::new(),
             threads: None,
@@ -3512,6 +3521,8 @@ uint ps() : SV_Target { return 1; }
                     heap_writes: false,
                     view_marks: false,
                     view_stores: false,
+                    heap_fetches: 0,
+                    nonuniform_fetches: 0,
                 },
                 used,
                 threads: None,

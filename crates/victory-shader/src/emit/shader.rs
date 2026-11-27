@@ -102,6 +102,13 @@ pub fn set_slot_map(on: bool) -> bool {
     *SLOT_MAP.get_or_init(|| on)
 }
 
+/// The heap index of the host's raw SRV of the slot map (`emit`, "Slot
+/// map"), below the null raw unordered access view: shaders reach the map
+/// through the heap, so it costs no root parameter.
+pub fn slot_map_view() -> u32 {
+    heap_views() - 4
+}
+
 /// Runs `f` with the slot map on, on this thread (tests).
 #[cfg(test)]
 pub(crate) fn with_slot_map<R>(f: impl FnOnce() -> R) -> R {
@@ -207,6 +214,8 @@ pub(crate) struct Shader {
     pub root_uavs: Vec<(u8, V)>,
     /// Root UAVs among them that an operation may write ([`Shader::op`]).
     pub written_root_uavs: Vec<u8>,
+    /// The slot map's handle ([`Shader::slot_map_handle`]), once read.
+    pub slot_map_h: Option<V>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -308,6 +317,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            slot_map_h: None,
             written_root_uavs: Vec::new(),
             memory: None,
             memory_dirty: None,
@@ -529,6 +539,20 @@ impl Shader {
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.memory = Some(h);
+        h
+    }
+
+    /// The handle of the slot map's raw view, resource-heap index
+    /// [`slot_map_view`] (`emit`, "Slot map"), made in the entry block: no
+    /// root parameter, so a root signature at its 64 DWORDs takes it too.
+    pub fn slot_map_handle(&mut self) -> V {
+        if let Some(h) = self.slot_map_h {
+            return h;
+        }
+        let index = self.m.i32(slot_map_view());
+        let block = self.entry;
+        let h = self.heap_handle(block, index, false, false, (11, 0));
+        self.slot_map_h = Some(h);
         h
     }
 

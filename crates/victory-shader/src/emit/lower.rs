@@ -79,10 +79,8 @@ pub(crate) struct Lowered {
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
-    #[cfg(test)]
     pub nonuniform_handles: u32,
     /// Heap handles written.
-    #[cfg(test)]
     pub heap_handles: u32,
     #[cfg(test)]
     barrier_modes: Vec<Option<i64>>,
@@ -1830,9 +1828,7 @@ impl<'a> Lower<'a> {
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
             view_stores: self.s.view_stores,
-            #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
-            #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap").count() as u32,
             #[cfg(test)]
             barrier_modes: self
@@ -6146,9 +6142,9 @@ impl<'a> Lower<'a> {
     }
 
     /// The host slot of title heap index `index` (module notes, "Slot
-    /// map"), in the current block: its entry in the slot map, which
-    /// follows the view strides in their table; `index` itself without a
-    /// slot map and for samplers.
+    /// map"), in the current block: its entry in the slot map (a raw view
+    /// in the resource heap, of the table the view strides start); `index`
+    /// itself without a slot map and for samplers.
     fn host_slot(&mut self, index: V, sampler: bool) -> V {
         if sampler || !super::slot_map() {
             return index;
@@ -6159,8 +6155,15 @@ impl<'a> Lower<'a> {
         let at = self.s.m.bin(c, Bin::Add, index, base);
         let four = self.s.m.i32(4);
         let at = self.s.m.bin(c, Bin::Mul, at, four);
-        let table = self.s.root_srv_handle(VIEW_STRIDES);
-        self.raw_dword(table, at)
+        let table = self.s.slot_map_handle();
+        // Entries hold the host slot + 1; 0 (also what a null view reads) is
+        // the index itself.
+        let entry = self.raw_dword(table, at);
+        let c = self.cur;
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let own = self.s.m.cmp(c, pred::EQ, entry, zero);
+        let slot = self.s.m.bin(c, Bin::Sub, entry, one);
+        self.s.m.select(c, own, index, slot)
     }
 
     /// The heap index of a descriptor that may differ between lanes,
