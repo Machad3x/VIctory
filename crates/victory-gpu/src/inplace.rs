@@ -192,6 +192,46 @@ pub(crate) fn runs(pages: &[(usize, usize)]) -> Vec<&[(usize, usize)]> {
     out
 }
 
+/// `run` cut where an allocation ends (`end_of` gives the end of the one
+/// holding an address of our views): sections' views may lie side by
+/// side, and a heap is opened on one allocation.
+pub(crate) fn per_view(run: &[(usize, usize)], end_of: impl Fn(usize) -> usize) -> Vec<&[(usize, usize)]> {
+    let mut out = Vec::new();
+    let mut rest = run;
+    while let Some(&(_, own)) = rest.first() {
+        let end = end_of(own);
+        let n = rest.iter().take_while(|&&(_, o)| o.saturating_add(PAGE) <= end).count().max(1);
+        let (head, tail) = rest.split_at(n);
+        out.push(head);
+        rest = tail;
+    }
+    out
+}
+
+/// Where the allocation (a view) holding `at` ends; no end if Windows
+/// does not say.
+pub(crate) fn allocation_end(at: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |p: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        (n != 0).then_some(info)
+    };
+    let Some(first) = query(at) else {
+        return usize::MAX;
+    };
+    let mut end = first.BaseAddress as usize + first.RegionSize;
+    while let Some(info) = query(end)
+        && info.AllocationBase == first.AllocationBase
+        && info.State != MEM_FREE
+    {
+        end = info.BaseAddress as usize + info.RegionSize;
+    }
+    end
+}
+
 /// The open run holding `[at, at + len)` in `open`, and where the range
 /// starts in it.
 fn holding(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
@@ -447,6 +487,52 @@ mod tests {
         assert_eq!(lens, [3, 1, 1]);
         assert_eq!(found[1][0], (0x103, o + 9 * PAGE));
         assert!(runs(&[]).is_empty());
+    }
+
+    /// Two sections' views side by side: a run over both is cut where the
+    /// first ends.
+    #[test]
+    fn a_run_over_two_views_is_cut_between_them() {
+        let o = 0x7000_0000_0000usize;
+        let pages: Vec<(usize, usize)> = (0..5).map(|k| (0x200 + k, o + k * PAGE)).collect();
+        let end_of = |at: usize| if at < o + 2 * PAGE { o + 2 * PAGE } else { o + 64 * PAGE };
+        let cut = per_view(&pages, end_of);
+        let lens: Vec<usize> = cut.iter().map(|r| r.len()).collect();
+        assert_eq!(lens, [2, 3]);
+        assert_eq!(cut[1][0], (0x202, o + 2 * PAGE));
+        // One view: whole. No end known: whole.
+        assert_eq!(per_view(&pages, |_| o + 64 * PAGE).len(), 1);
+        assert_eq!(per_view(&pages, |_| usize::MAX).len(), 1);
+        assert!(per_view(&[], |_| 0).is_empty());
+    }
+
+    /// The real allocation end: two views of one section side by side are
+    /// two allocations.
+    #[test]
+    fn allocation_end_is_the_views_end() {
+        use windows_sys::Win32::System::Memory as mem;
+        const BYTES: usize = 4 * PAGE;
+        // SAFETY: plain section creation, closed below.
+        let section = unsafe {
+            mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE,
+                0,
+                BYTES as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: a view of our section, unmapped below.
+        let at = unsafe { mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, BYTES) }.Value as usize;
+        assert_ne!(at, 0);
+        assert_eq!(allocation_end(at + PAGE), at + BYTES);
+        // SAFETY: our view and handle.
+        unsafe {
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 
     #[test]

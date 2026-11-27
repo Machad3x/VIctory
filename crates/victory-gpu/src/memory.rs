@@ -639,7 +639,11 @@ impl Shared {
                 .into_iter()
                 .filter(|&(page, _)| owner.get(b * BLOCK + (page - first)).is_some_and(|o| o.is_none()))
                 .collect();
-            for run in crate::inplace::runs(&free) {
+            // One run per section's view: a heap is opened on one.
+            let pieces = crate::inplace::runs(&free)
+                .into_iter()
+                .flat_map(|run| crate::inplace::per_view(run, crate::inplace::allocation_end));
+            for run in pieces {
                 let Some((placed, offset)) = crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE) else {
                     continue;
                 };
@@ -736,7 +740,9 @@ fn drop_dead_runs() {
     if !dead.is_empty()
         && let Some(host) = crate::host::host()
     {
-        host.between_submissions(|| {
+        // A submission under way: the next frame's end tries again (the
+        // views gone wait for it: their runs are still held).
+        let _ = host.between_submissions(|| {
             for (_, s) in shared().iter_mut() {
                 s.drop_runs(&dead);
             }

@@ -603,6 +603,28 @@ pub(crate) mod tests {
         super::host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Work between submissions is put off while one runs, also when the
+    /// thread asking holds the lock itself: never a deadlock.
+    #[test]
+    fn work_between_submissions_waits_for_none() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let held = no_submissions();
+        assert!(host.between_submissions(|| ()).is_none(), "put off, not waited for");
+        drop(held);
+        // Other tests may be submitting meanwhile.
+        let mut got = None;
+        for _ in 0..2000 {
+            got = host.between_submissions(|| 7);
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(got, Some(7));
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
@@ -1579,14 +1601,20 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
-    /// Runs `f` with no submission running, and none starting meanwhile.
-    /// Not from inside a submission (the lock is not reentrant).
-    pub(crate) fn between_submissions<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _one = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        f()
+    /// Runs `f` with no submission running, and none starting meanwhile;
+    /// None, without running it, if a submission is under way (on this
+    /// thread too: the lock is not reentrant, so it is never waited for),
+    /// for the caller to try again later.
+    pub(crate) fn between_submissions<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let _one = match self.submitted.try_lock() {
+            Ok(one) => one,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(f())
     }
 
+    /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
