@@ -554,7 +554,10 @@ static FLIGHT_HEAP_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// What last wrote each bottom-of-pipe word (0 a value, 1 a query result,
 /// 2 a timestamp), the frame it did and the value (0 unless known ahead);
 /// words not written for two frames are dropped at each line.
-static LABELS: Mutex<Option<HashMap<u64, (u8, u64, u64)>>> = Mutex::new(None);
+static LABELS: Mutex<Option<HashMap<u64, Label>>> = Mutex::new(None);
+
+/// A bottom-of-pipe word's writer kind, frame and value ([`LABELS`]).
+type Label = (u8, u64, u64);
 
 /// Why a title submission would drain the one before (fence, sync
 /// executes, present); `None` for our own executes.
