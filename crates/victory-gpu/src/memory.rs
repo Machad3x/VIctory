@@ -189,7 +189,9 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
 #[cfg(windows)]
 pub(crate) fn release(key: usize) {
     shared().retain(|(k, _)| *k != key);
-    with_ran(|m| m.remove(&key));
+    if let Some(old) = with_ran(|m| m.remove(&key)) {
+        crate::host::release_later(Box::new(old));
+    }
 }
 
 /// Whether view heap `key` has a page table.
@@ -739,18 +741,42 @@ fn drop_dead_runs() {
     let dead = crate::inplace::dead();
     if !dead.is_empty()
         && let Some(host) = crate::host::host()
+        && host.between_submissions(|| drop_runs_now(&dead)).is_none()
     {
-        // A submission under way: the next frame's end tries again (the
-        // views gone wait for it: their runs are still held).
-        let _ = host.between_submissions(|| {
-            for (_, s) in shared().iter_mut() {
-                s.drop_runs(&dead);
-            }
-            // What lists ran with: all of them ran.
-            with_ran(|m| m.clear());
-        });
+        // A submission under way: the next one drops them before it
+        // prepares anything ([`drop_dead_runs_put_off`]).
+        DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     crate::inplace::settle();
+}
+
+/// Runs a frame's end could not drop, a submission running then.
+static DROP_PUT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// At a submission's start, holding the submission lock (none runs, none
+/// prepared yet): the dead runs a frame's end put off are dropped, so that
+/// their views are unmapped at the next frame's end whatever submissions
+/// overlap frame ends.
+pub(crate) fn drop_dead_runs_put_off() {
+    if DROP_PUT_OFF.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        drop_runs_now(&crate::inplace::dead());
+    }
+}
+
+/// [`Shared::drop_runs`] for every table; with no submission running.
+fn drop_runs_now(dead: &[u64]) {
+    if dead.is_empty() {
+        return;
+    }
+    for (_, s) in shared().iter_mut() {
+        s.drop_runs(dead);
+    }
+    // What lists ran with: all of them ran. Released off this thread: a
+    // layout may hold copies' last references.
+    let ran = with_ran(std::mem::take);
+    if !ran.is_empty() {
+        crate::host::release_later(Box::new(ran));
+    }
 }
 
 /// The layout each view heap's lists last ran with ([`prepare`]): what
@@ -1104,8 +1130,13 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         Some(s.layout.clone())
     })
     .flatten();
-    if let Some(l) = &layout {
-        with_ran(|m| m.insert(key, l.clone()));
+    // The layout replaced may hold copies' last references: released off
+    // the submitting thread, as in `rewrite`.
+    if let Some(l) = &layout
+        && let Some(old) = with_ran(|m| m.insert(key, l.clone()))
+        && !Arc::ptr_eq(&old, l)
+    {
+        crate::host::release_later(Box::new(old));
     }
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
@@ -1475,6 +1506,20 @@ mod tests {
         assert_eq!(look_up(&dwords, 0).0, 4, "the smallest copy is left out");
         let (weak, ..) = table(&copies, &pairs, 4, &[], &[true]);
         assert_eq!(weak, dwords, "a weak copy gets no block ahead of a larger one");
+    }
+
+    /// Dead runs a frame's end could not drop (a submission running) are
+    /// dropped by the next submission, before it prepares anything.
+    #[test]
+    fn dead_runs_put_off_are_dropped_at_the_next_submission() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert!(!DROP_PUT_OFF.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Reads 4 dwords of title memory at (`lo`, `hi`) through the page

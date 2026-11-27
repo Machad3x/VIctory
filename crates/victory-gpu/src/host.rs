@@ -1619,6 +1619,9 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // Before anything is prepared: page tables let go of title memory in
+        // place whose views went, if a frame's end could not.
+        crate::memory::drop_dead_runs_put_off();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
