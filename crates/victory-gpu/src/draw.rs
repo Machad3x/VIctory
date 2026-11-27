@@ -332,7 +332,6 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     }
 }
 
-#[cfg(feature = "diagnostics")]
 thread_local! {
     /// Why the draw or dispatch this thread last prepared cannot run.
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
@@ -343,12 +342,9 @@ thread_local! {
     static CLOSING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Notes why the draw or dispatch being prepared cannot run (diagnostics).
+/// Notes why the draw or dispatch being prepared cannot run.
 fn not_run(why: &'static str) {
-    #[cfg(feature = "diagnostics")]
     NOT_RUN.with(|w| w.set(why));
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = why;
 }
 
 /// Dispatches run on the host so far.
@@ -1220,6 +1216,11 @@ impl State {
                 if let Some((_, map)) = &self.memory {
                     map.program(&stage.shader.hash);
                 }
+                if crate::pipeline::is_builder(self.pipeline as This)
+                    && let Some((_, map)) = &self.memory
+                {
+                    map.builder();
+                }
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {
@@ -1467,18 +1468,23 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        // The acceleration-structure builder's frames run whole: its
+        // dispatches wait for all its pipelines (`pipeline::builder`).
+        crate::pipeline::wait_for_builder(self.pipeline as This);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::not_dispatched(self.pipeline as This, "no host pipeline");
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            crate::pipeline::not_dispatched(self.pipeline as This, "a graphics pipeline");
             return;
         }
         let (p, [x, y, z]) = if THREADS {
@@ -1512,6 +1518,7 @@ impl State {
         };
         if !self.bind_dispatch::<THREADS>(list, p, true, dims) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::not_dispatched(self.pipeline as This, NOT_RUN.with(|w| w.get()));
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -2145,15 +2152,20 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| {
+        let note = |what: &str| {
             crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
             list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
         };
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let note = |_: &str| {};
+        // Not run: said, if it is one of the BVH builder's
+        // (`pipeline::builder`).
+        let why = |what: &str| {
+            crate::pipeline::not_dispatched(pipeline, what);
+            note(what);
+        };
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the
@@ -2161,6 +2173,7 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
+        crate::pipeline::wait_for_builder(self.pipeline as This);
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -2249,10 +2262,12 @@ impl State {
             if !joined {
                 crate::indirect::done(list, &clamped);
             }
-            #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
+                    crate::pipeline::not_dispatched(pipeline, "no host pipeline");
+                    #[cfg(feature = "diagnostics")]
                     crate::pipeline::note_drop(self.pipeline as This);
+                    #[cfg(feature = "diagnostics")]
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(

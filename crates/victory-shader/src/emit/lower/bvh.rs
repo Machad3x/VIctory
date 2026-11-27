@@ -122,11 +122,25 @@ impl Lower<'_> {
         // The node's byte offset from the BVH's base: (pointer & !7) * 8.
         let not7 = self.s.m.i32(!7);
         let lo = self.s.m.bin(c, Bin::And, node, not7);
+        // Lanes whose node lies past what a buffer offset reaches.
+        let mut far = None;
         let nodes = match self.descriptors.get(&((b, i), false)).copied() {
             Some(src)
                 if matches!(src, Source::Built { .. }) && self.root_address(src).is_none() =>
             {
                 let (k, dynamic) = self.built_offset(src)?;
+                // A buffer offset is 32 bits: a node 4 GiB or more into the
+                // BVH (`node_fits_buffer`) is no byte of it and reads as a
+                // miss, not as the node its low bits name (#2368).
+                let k29 = self.s.m.i32(29);
+                let mut high = self.s.m.bin(c, Bin::LShr, node, k29);
+                if let Some(hi) = node_hi {
+                    high = self.s.m.bin(c, Bin::Or, high, hi);
+                }
+                let zero = self.s.m.i32(0);
+                let over = self.s.m.cmp(c, pred::NE, high, zero);
+                far = Some(over);
+                let lo = self.s.m.select(c, over, zero, lo);
                 let three = self.s.m.i32(3);
                 let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
                 let k = self.s.m.i32(k);
@@ -164,7 +178,7 @@ impl Lower<'_> {
         };
         // Inactive lanes may hold any pointer: they read nothing.
         let at = self.begin_guarded(guard);
-        let r = self.bvh_lanes(&nodes, node, &ray);
+        let r = self.bvh_lanes(&nodes, node, &ray, far);
         let r = match r {
             Ok(r) => r,
             Err(why) => {
@@ -180,8 +194,9 @@ impl Lower<'_> {
         Ok(())
     }
 
-    /// The four result dwords of `ray` against the node `node` points to.
-    fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray) -> Result<[V; 4], Why> {
+    /// The four result dwords of `ray` against the node `node` points to;
+    /// lanes of `far` get a miss of the pointer's type instead.
+    fn bvh_lanes(&mut self, nodes: &Nodes, node: V, ray: &Ray, far: Option<V>) -> Result<[V; 4], Why> {
         let w = self.node_dwords(nodes, 0, 16)?;
         let c = self.cur;
         let seven = self.s.m.i32(7);
@@ -210,9 +225,18 @@ impl Lower<'_> {
         let t6 = self.s.m.bin(c, Bin::And, ty, six);
         let is_box = self.s.m.cmp(c, pred::EQ, t6, four);
         let none = self.s.m.i32(INVALID);
+        // A triangle's miss: (+inf, 1, 0, 0).
+        let miss = [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0].map(|x| self.s.m.i32(x));
         Ok(std::array::from_fn(|k| {
             let x = self.s.m.select(c, is_box, boxes[k], none);
-            self.s.m.select(c, is_tri, tri[k], x)
+            let x = self.s.m.select(c, is_tri, tri[k], x);
+            match far {
+                Some(far) => {
+                    let m = self.s.m.select(c, is_tri, miss[k], none);
+                    self.s.m.select(c, far, m, x)
+                }
+                None => x,
+            }
         }))
     }
 
@@ -513,6 +537,14 @@ impl Lower<'_> {
             bj,
         ]
     }
+}
+
+/// Whether the node a pointer (`lo`, `hi`: its dwords) names lies within
+/// the 4 GiB a buffer offset reaches: its byte offset is `(pointer & !7) * 8`.
+/// The buffer path's `far` lanes are those for which this is false.
+#[cfg(test)]
+pub(crate) fn node_fits_buffer(lo: u32, hi: u32) -> bool {
+    lo >> 29 == 0 && hi == 0
 }
 
 /// `lo | hi << 32` as an `i64`.

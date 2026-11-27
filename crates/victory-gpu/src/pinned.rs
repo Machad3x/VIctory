@@ -24,6 +24,14 @@
 //! changing an overlapping range meanwhile waits for that release, then
 //! retries as above, instead of meeting the memory still locked.
 //!
+//! A holder registers before it opens its heap, and lets go (forgets its
+//! pin) right before its heap goes. So a change refused as locked by a heap
+//! the release did not find was registered after the release looked (a
+//! second look finds it), or forgotten over the range within [`SETTLE`]
+//! (`Pins::let_go`). Either way what is registered then is let go and the
+//! change tried again as above: a change racing an open or a let-go never
+//! meets the memory locked for good.
+//!
 //! Never change title memory through here from the guard handler or under
 //! `crate::watch`'s lock: a release may wait for a submission to finish.
 //!
@@ -34,20 +42,20 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError, SetLastError};
 
 /// How long a change refused after a release is tried again: the system
 /// unlocks released pages within milliseconds.
 const SETTLE: Duration = Duration::from_millis(100);
 
-// Holders: none yet at title addresses but the tests here (title memory in
-// place opens our own views of sections, which the title never changes:
-// `crate::inplace::title_memory_own_gone` handles their going). A
-// private-memory backstop would register here.
+// Holders: the runs over the title's private memory
+// (`crate::inplace`, `VICTORY_RT_MEMORY`), registered before their heaps are
+// opened and until those are gone. Runs over our own views of sections are
+// not: the title never changes those views
+// (`crate::inplace::title_memory_own_gone` handles their going).
 
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type Release = Box<dyn FnOnce() + Send>;
 
 /// A registered range, given back with [`Pin::forget`] when its holder lets
@@ -55,14 +63,19 @@ pub(crate) type Release = Box<dyn FnOnce() + Send>;
 #[must_use = "a pin forgotten by dropping stays registered until released"]
 pub(crate) struct Pin(u64);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Pin {
     /// The holder let its range go by itself: nothing to release any more.
     pub(crate) fn forget(self) {
         let mut pins = pins();
-        if let Some(key) = pins.by_id.remove(&self.0) {
-            pins.ranges.remove(&key);
+        if let Some(key) = pins.by_id.remove(&self.0)
+            && let Some((end, _)) = pins.ranges.remove(&key)
+        {
             PINS.fetch_sub(1, Ordering::Relaxed);
+            // Its heap goes right after: a change meeting it still locked
+            // tries again.
+            let now = Instant::now();
+            pins.let_go.retain(|&(_, _, when)| now.duration_since(when) < SETTLE);
+            pins.let_go.push((key.0, end, now));
         }
     }
 }
@@ -79,6 +92,8 @@ struct Pins {
     /// Pins whose release is running, by id: (start, end, the thread
     /// running it).
     releasing: BTreeMap<u64, (usize, usize, std::thread::ThreadId)>,
+    /// Pins forgotten by their holders within [`SETTLE`]: (start, end, when).
+    let_go: Vec<(usize, usize, Instant)>,
 }
 
 static REGISTRY: Mutex<Option<Pins>> = Mutex::new(None);
@@ -111,7 +126,6 @@ fn pins() -> Guard {
 }
 
 /// Registers that `[at, at + len)` is held in place, and how to let it go.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pin(at: usize, len: usize, release: Release) -> Pin {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let end = at.saturating_add(len);
@@ -137,14 +151,36 @@ pub fn title_memory_held() -> bool {
 pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
     let released = release(at, len);
     let mut worked = change();
-    if worked != 0 || released == 0 {
+    if worked != 0 {
         return worked;
+    }
+    if released == 0 {
+        // SAFETY: plain reads and writes of this thread's last error.
+        let error = unsafe { GetLastError() };
+        if error != ERROR_INVALID_PARAMETER {
+            return worked;
+        }
+        // A holder registered after the release looked, and opened its heap
+        // before the change (a pin comes before its heap): let go now. Or
+        // one let go just before, its heap going: tried again below.
+        if release(at, len) == 0 && !let_go_lately(at, len) {
+            // SAFETY: as above.
+            unsafe { SetLastError(error) };
+            return worked;
+        }
+        worked = change();
+        if worked != 0 {
+            return worked;
+        }
     }
     let start = Instant::now();
     let mut tries = 1;
     // SAFETY: plain reads of this thread's last error.
     while unsafe { GetLastError() } == ERROR_INVALID_PARAMETER && start.elapsed() < SETTLE {
         std::thread::yield_now();
+        // A holder registered since the last look (its heap opened before
+        // the last try) goes too.
+        release(at, len);
         worked = change();
         tries += 1;
         if worked != 0 {
@@ -159,6 +195,60 @@ pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i3
         }
     }
     worked
+}
+
+/// The runtime changes title memory at `[at, at + len)` with `change` (as
+/// [`title_memory_change`]), which mostly works on memory held in place too
+/// (committing again what is committed): the holders let go only if the
+/// host refuses it as locked (`ERROR_INVALID_PARAMETER`), and it is then
+/// tried again. For `XMemVirtualAlloc` at an address the title names: a
+/// commit with another protection over an open heap is refused.
+pub fn title_memory_retry(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
+    let worked = change();
+    // SAFETY: a plain read of this thread's last error.
+    if worked != 0 || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+        return worked;
+    }
+    // Nothing held now: a holder may still have let go just before.
+    if !title_memory_held() && !let_go_lately(at, len) {
+        // SAFETY: as above; the lookup may have changed it.
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        return worked;
+    }
+    title_memory_change(at, len, change)
+}
+
+/// The runtime's entries (`VirtualFree`, `VirtualProtect`, unmapping):
+/// [`title_memory_change`] when anything is held in place; with nothing
+/// held, `change` at once, and only if the host refuses it as locked is
+/// `len` worked out (`[at, at + len)`, the range changed) and the change
+/// tried again as [`title_memory_change`] does: a holder may have
+/// registered and opened its heap since the look, or let go just before,
+/// its heap still going. One atomic load a call while nothing is held.
+pub fn title_memory_change_from(at: usize, len: impl FnOnce() -> usize, mut change: impl FnMut() -> i32) -> i32 {
+    if title_memory_held() {
+        return title_memory_change(at, len(), change);
+    }
+    let worked = change();
+    // SAFETY: plain reads and writes of this thread's last error.
+    if worked != 0 || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+        return worked;
+    }
+    let len = len();
+    if !title_memory_held() && !let_go_lately(at, len) {
+        // SAFETY: as above; the lookups may have changed it.
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        return worked;
+    }
+    title_memory_change(at, len, change)
+}
+
+/// Whether a holder forgot a pin overlapping `[at, at + len)` within
+/// [`SETTLE`]: its heap may still lock the pages.
+fn let_go_lately(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    let now = Instant::now();
+    pins().let_go.iter().any(|&(s, e, when)| s < end && e > at && now.duration_since(when) < SETTLE)
 }
 
 /// Lets every holder of part of `[at, at + len)` go, after waiting for
@@ -315,6 +405,149 @@ mod tests {
         assert_eq!(title_memory_change(base, 0x1000, denied), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 2);
+    }
+
+    /// A holder registers after the release looked and opens its heap
+    /// before the change (a free racing an open): the refusal finds it on a
+    /// second look, lets it go, and the change works.
+    #[test]
+    fn a_pin_registered_during_the_change_is_let_go_and_tried_again() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7500_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        let calls = AtomicUsize::new(0);
+        let mut pinned = None;
+        let racing = || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                // The opener: registered, then its heap locks the pages.
+                pinned = Some(pin(base, 0x1_0000, counting(&n)));
+            }
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            i32::from(n.load(Ordering::Relaxed) == 1)
+        };
+        assert_eq!(title_memory_change(base, 0x1000, racing), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(n.load(Ordering::Relaxed), 1, "let go once");
+        assert!(pinned.is_some());
+    }
+
+    /// A holder forgot its pin just before the change, its heap still
+    /// going: the refusal is tried again; elsewhere it is the answer.
+    #[test]
+    fn a_change_right_after_a_let_go_is_tried_again() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7600_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        pin(base, 0x1_0000, counting(&n)).forget();
+        let calls = AtomicUsize::new(0);
+        let late = |at_least: usize| {
+            let calls = &calls;
+            move || {
+                let k = calls.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: plain write of this thread's last error.
+                unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+                i32::from(k >= at_least)
+            }
+        };
+        assert_eq!(title_memory_change(base + 0x8000, 0x1000, late(1)), 1);
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
+        pin(base, 0x1_0000, counting(&n)).forget();
+        assert_eq!(title_memory_retry(base, 0x1000, late(2)), 1, "the retry path too");
+        assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
+        assert_eq!(title_memory_change(base + 0x1_0000, 0x1000, late(1)), 0, "not over it");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 0, "forgotten pins are not released");
+    }
+
+    /// The runtime's entry with nothing held: a change refused as locked
+    /// right after a holder let go is tried again, the range worked out only
+    /// then; one with nothing let go there is the answer, tried once.
+    #[test]
+    fn the_entry_with_nothing_held_tries_again_after_a_let_go() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7700_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        let calls = AtomicUsize::new(0);
+        let late = |at_least: usize| {
+            let calls = &calls;
+            move || {
+                let k = calls.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: plain write of this thread's last error.
+                unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+                i32::from(k >= at_least)
+            }
+        };
+        let asked = AtomicUsize::new(0);
+        let len = || {
+            asked.fetch_add(1, Ordering::Relaxed);
+            0x1000
+        };
+        // Other tests may hold pins meanwhile (the registry is shared): the
+        // range is asked then too.
+        assert_eq!(title_memory_change_from(base + 0x2_0000, len, late(0)), 1);
+        calls.store(0, Ordering::Relaxed);
+        pin(base, 0x1_0000, counting(&n)).forget();
+        assert_eq!(title_memory_change_from(base, len, late(1)), 1, "let go just before: tried again");
+        assert!(calls.swap(0, Ordering::Relaxed) >= 2);
+        assert_eq!(title_memory_change_from(base + 0x2_0000, len, late(5)), 0, "nothing there: the answer");
+        assert!(calls.load(Ordering::Relaxed) <= 3, "not tried for long");
+    }
+
+    /// A holder registers after both looks of a change and opens its heap
+    /// before the second try: the settle loop looks again, lets it go, and
+    /// the change works.
+    #[test]
+    fn a_pin_registered_before_the_second_try_is_let_go_in_the_settle_loop() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7800_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        // Let go just before: the second try happens.
+        pin(base, 0x1_0000, counting(&n)).forget();
+        let calls = AtomicUsize::new(0);
+        let mut pinned = None;
+        let racing = || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                pinned = Some(pin(base, 0x1_0000, counting(&n)));
+            }
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            i32::from(n.load(Ordering::Relaxed) == 1)
+        };
+        assert_eq!(title_memory_change(base, 0x1000, racing), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 1, "let go in the loop");
+        assert!(pinned.is_some());
+    }
+
+    /// A change that works on memory held in place leaves the holder; one
+    /// the host refuses as locked lets it go and is tried again; any other
+    /// refusal is the answer.
+    #[test]
+    fn a_change_refused_as_locked_lets_go_and_is_tried_again() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, SetLastError};
+        let base = 0x7400_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        let _p = pin(base, 0x1_0000, counting(&n));
+        // Committing again what is committed: nothing let go.
+        assert_eq!(title_memory_retry(base, 0x1000, || 1), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 0);
+        // Refused for another reason: the answer, and nothing let go.
+        let denied = || {
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+            0
+        };
+        assert_eq!(title_memory_retry(base, 0x1000, denied), 0);
+        assert_eq!(n.load(Ordering::Relaxed), 0);
+        // Refused as locked while the holder has it: let go, then done.
+        let held = n.clone();
+        let locked = move || {
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            i32::from(held.load(Ordering::Relaxed) == 1)
+        };
+        assert_eq!(title_memory_retry(base, 0x1000, locked), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 1, "let go once");
     }
 
     /// A second thread changing the range while the first is still

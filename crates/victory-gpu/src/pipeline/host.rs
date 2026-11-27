@@ -1127,6 +1127,7 @@ float4 ps(Vertex input) : SV_Target { return input.color; }
             super::super::hand_out(
                 shaders,
                 Some(graphics),
+                &[],
                 &super::super::PIPELINE_IIDS[0],
                 &mut pipeline
             ),

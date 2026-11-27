@@ -154,6 +154,15 @@ pub extern "system" fn XMemVirtualAlloc(
         )
     };
     let mut at = allocate(&mut parameter);
+    // At an address the title names, over memory the GPU side holds in
+    // place (a commit with another protection): refused as locked, so the
+    // GPU side lets go first (`victory_gpu::title_memory_retry`).
+    if at.is_null() && !base.is_null() {
+        victory_gpu::title_memory_retry(base as usize, size, || {
+            at = allocate(&mut parameter);
+            i32::from(!at.is_null())
+        });
+    }
     // A 32-bit request that found no room below 4 GiB: the guards there
     // make way for it.
     if at.is_null() && constrained && highest < FOUR_GIB {
@@ -181,6 +190,12 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    }
+    // Committed private memory shaders may reach by address alone (the
+    // BVH builder's scratch): the GPU side may name it in place
+    // (`VICTORY_RT_MEMORY`).
+    if !at.is_null() && !placeholder && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_private(at as usize, size);
     }
     at
 }

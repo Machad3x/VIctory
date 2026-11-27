@@ -431,6 +431,7 @@ impl Drop for Holding {
 
 #[cfg(not(feature = "diagnostics"))]
 fn guards() -> Held {
+    crate::inplace::order::guards();
     Held(GUARDS.lock().unwrap_or_else(|e| e.into_inner()), Holding::new())
 }
 
@@ -458,6 +459,7 @@ impl std::ops::DerefMut for Held {
 #[track_caller]
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
+    crate::inplace::order::guards();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
     Held(Some(guard), std::time::Instant::now(), line, Holding::new())
 }
@@ -570,6 +572,11 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     if pages.is_empty() {
         return None;
     }
+    // Pages open in place cannot be guarded: their runs are let go first,
+    // before the lock (`crate::inplace::make_way`, which never waits).
+    if let (Some(&first), Some(&last)) = (pages.first(), pages.last()) {
+        crate::inplace::make_way(first * PAGE, (last + 1 - first) * PAGE);
+    }
     install();
     // Once, outside the guard handler, so its pushes never allocate.
     reserve(&SAVE_POOL, SAVE_POOL_MAX);
@@ -676,6 +683,13 @@ impl Drop for Tracked {
             open(&mut g, page);
         }
     }
+}
+
+/// The pages of `first..last` (page numbers) some tracker holds, in order:
+/// they are guarded, so they cannot be opened in place
+/// (`crate::inplace`'s private memory, which has no other mapping).
+pub(crate) fn tracked_pages(first: usize, last: usize) -> Vec<usize> {
+    guards().holders.range(first..last).filter(|(_, holders)| !holders.is_empty()).map(|(&page, _)| page).collect()
 }
 
 /// Whether a tracker holds page `page`, there or at another mapping of it.
@@ -987,7 +1001,10 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
+    // No guard on a page a heap in place locks (`crate::inplace::locked`):
+    // it could not be set, and is left out, so the page stays changed
+    // until the heap is gone.
+    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p) && !crate::inplace::locked(p)).collect();
     let mut i = 0;
     while i < pages.len() {
         if g.protected.contains(&pages[i]) {

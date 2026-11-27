@@ -848,6 +848,25 @@ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
     run_cases(true, 4, true);
 }
 
+/// The buffer path's bound (#2368's counterexamples): a pointer whose node
+/// lies 4 GiB or more into the BVH has no 32-bit buffer offset, and the
+/// test agrees with the 64-bit offset `(pointer & !7) * 8`.
+#[test]
+fn nodes_past_4_gib_do_not_fit_a_buffer_offset() {
+    use super::lower::bvh::node_fits_buffer;
+    for (lo, hi, fits) in [
+        (0x1fff_fffdu32, 0u32, true), // 4 GiB - 64 bytes
+        (0x2000_0005, 0, false),      // 4 GiB: the low bits alone name node 0
+        (0x0000_0005, 1, false),      // 32 GiB
+        (0xffff_fffd, 0, false),
+        (5, 0, true),
+    ] {
+        let offset = ((u64::from(hi) << 32 | u64::from(lo)) & !7) * 8;
+        assert_eq!(offset < 1 << 32, fits, "pointer {hi:#x}:{lo:#x}");
+        assert_eq!(node_fits_buffer(lo, hi), fits, "pointer {hi:#x}:{lo:#x}");
+    }
+}
+
 /// A BVH built from a root SRV uses the descriptor's aligned base and
 /// both words of the node pointer, even beyond the first 4 GiB.
 #[test]

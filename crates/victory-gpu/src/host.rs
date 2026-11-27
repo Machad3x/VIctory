@@ -2426,7 +2426,7 @@ impl Host {
         // builder in one list, run light13).
         let missed: Vec<bool> = runs
             .iter()
-            .map(|list| list.deferred().missed.iter().any(|check| check()))
+            .map(|list| crate::memory::withholds() && list.deferred().missed.iter().any(|check| check()))
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();

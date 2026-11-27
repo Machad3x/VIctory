@@ -26,7 +26,7 @@ mod ds;
 mod interp;
 mod side_effect;
 use side_effect::has_side_effect;
-mod bvh;
+pub(super) mod bvh;
 mod marks;
 
 mod half_round;

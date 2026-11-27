@@ -268,9 +268,14 @@ for hot data.
   `VirtualAlloc`s) is out of scope: its pages with no copy stay misses,
   as without the switch. A heap there would lock the title's addresses,
   so its `VirtualProtect`/`VirtualFree` and the write guards would fail
-  (`crate::pinned` is how such a holder would let go first). The opening
-  thread refuses any range that is not one mapped view. The
-  misses-by-kind frame line says how much private memory misses.
+  (`crate::pinned` is how such a holder lets go first). The opening
+  thread refuses any range that is not one mapped view, with one
+  registered exception: `VICTORY_RT_MEMORY=1` asks for private runs as
+  such, and the thread opens one only if it lies wholly in private memory
+  the runtime reported (`title_memory_private`) and is committed
+  read-write throughout (`inplace::private_open`); the run is registered
+  with `crate::pinned` before its heap opens. The misses-by-kind frame
+  line says how much private memory misses.
 - **Runs.** A page-table rewrite cuts the uncovered pages into runs of
   pages our view shows one after another, one per section view, at most
   256 MiB. A run not open yet is asked of the `victory-in-place` thread

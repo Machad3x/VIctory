@@ -1223,6 +1223,75 @@ overlap copies the one in flight uses. The queue-signal build ran 280 to
 ends the process after 30 s without a frame) follows a compute queue stuck on
 a label value; it is still open.
 
+## Title memory in place (off by default)
+
+Shaders that reach title memory through the page table read zeros where no
+host copy holds it, and their writes there are dropped. Two switches name
+such memory in place instead: a host heap is opened over the pages
+(`OpenExistingHeapFromAddress1`), one buffer is placed over it, and the
+page-table entry names a raw view of that buffer. Nothing is copied.
+
+| Switch | What is named in place |
+|---|---|
+| `VICTORY_INPLACE_BACKSTOP=1` | Pages no copy holds that show physical pages, through a view of our own of the section. |
+| `VICTORY_RT_MEMORY=1` | The above, and committed read-write private memory no copy and no tracker holds, at its own address, in runs of at most 8 MiB. Nothing is withheld. |
+| `VICTORY_INPLACE_MB` | Most megabytes open at once: 1024, or 8192 with `VICTORY_RT_MEMORY`. |
+
+`VICTORY_RT_MEMORY` is for the title's acceleration-structure builder. Its
+inputs, scratch and output are private memory it reaches by computed
+addresses (`gpu287`, `gpu288`: about 12,000 pages in whole 256 MiB regions).
+Every builder list read zeros there and had its writes dropped, so the ray
+pass walked structures no shader built.
+
+A heap over process memory locks its pages: `VirtualProtect`, `VirtualFree`,
+unmapping, and a commit with another protection fail with
+`ERROR_INVALID_PARAMETER` while it lives. So:
+
+- Each private run registers how to let it go (`victory_gpu::pinned`). The
+  title's `VirtualFree`, `VirtualProtect` and unmapping let it go first and
+  retry for up to 100 ms. `VirtualAlloc` and `XMemVirtualAlloc` at an address
+  the title names run first and let go only if refused as locked.
+- Letting go drops the run from the page tables and from the layouts lists
+  last ran with, once no submission runs (waited for up to 2 s).
+- The backstop opens only views of ours. Private runs are the one exception:
+  asked as such, wholly in private memory the runtime reported, committed
+  read-write throughout, within one allocation (a range across two was
+  refused by the host with `E_INVALIDARG`, `gpu308`). Anything else is
+  refused. The check runs again once the run is registered and once its heap
+  is open.
+- The builder's dispatches are never held back. A builder dispatch first
+  waits for every pipeline the builder has created, queued ahead of all
+  others, up to 20 s a frame. Holding them back while pipelines were still
+  being made left a cross-queue wait after them unmet, and the title's 30 s
+  watchdog ended the run (`gpu307`, `gpu308`).
+- A run is locked and registered before its heap is opened. A change of the
+  title's that comes during the open waits for it to end, then lets the run
+  go (a test stops an open there and frees the memory every time). A change
+  refused as locked with nothing released looks again: a run registered
+  after the first look, or one let go within 100 ms, is let go or waited
+  out, and the change is tried again.
+- A tracker made over such memory lets the runs there go without waiting. A
+  page a live run still locks gets no guard and stays changed. The run stays
+  registered until its heap is gone, so the title's `VirtualFree` there
+  still drops it from the tables first.
+- Runs are opened on a worker thread when the runtime reports the memory
+  (`XMemVirtualAlloc`, or a miss in committed private memory not reported
+  yet). A page table that still finds one pending waits, at most 100 ms a
+  frame for all tables, woken when the worker is done (no polling).
+- A miss in memory reported already costs one lookup. It rewrites the page
+  tables at most once a frame. What the host refused stays refused until the
+  title commits there again (`XMemVirtualAlloc` or its own `VirtualAlloc`).
+- Debug builds assert the lock order: the guard lock is never taken while
+  holding the locked ranges, and the opening thread never takes the page
+  tables' lock.
+
+The frame line `ray tracing memory (VICTORY_RT_MEMORY)` counts pages named,
+runs open, opened and let go, page-table waits, and for builder lists the
+pages written in place, copied back, withheld and missed.
+
+`VICTORY_RT_MEMORY` has not been run with the game yet: it passes the unit
+tests only.
+
 ## Open problems
 
 - About 1 frame per second.
