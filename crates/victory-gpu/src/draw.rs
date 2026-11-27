@@ -425,6 +425,35 @@ fn unbound_view(uav: bool) -> Option<u64> {
     Some(VIEWS.get_or_init(|| views)[usize::from(uav)])
 }
 
+/// Whether unbound root views get [`unbound_view`]'s buffers (on unless
+/// `VICTORY_UNBOUND_SCRATCH=0`: left as they are, the last view bound).
+fn unbound_scratch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on_by_default("VICTORY_UNBOUND_SCRATCH"))
+}
+
+/// Warns once per pipeline and root parameter that a root view the title
+/// set (`kind`: 0 CBV, 1 SRV, 2 UAV) has no host address: where `address`
+/// lies among title memory.
+fn unbound_once(pipeline: &str, slot: u8, kind: u8, address: u64) {
+    static SEEN: std::sync::Mutex<Option<crate::fx::Set<(String, u8, u8)>>> = std::sync::Mutex::new(None);
+    let key = (pipeline.to_owned(), slot, kind);
+    if !SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key) {
+        return;
+    }
+    let kind = ["CBV", "SRV", "UAV"][usize::from(kind.min(2))];
+    tracing::warn!(
+        pipeline,
+        slot,
+        kind,
+        address = format_args!("{address:#x}"),
+        aligned_256 = address % 256 == 0,
+        aligned_16 = address % 16 == 0,
+        whereabouts = %crate::shadow::whereabouts(address),
+        "a root view outside title buffers: scratch bound unless VICTORY_UNBOUND_SCRATCH=0"
+    );
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1145,6 +1174,7 @@ impl State {
                     // keep another pipeline's view; zeros instead.
                     let unbound = |args: &mut RootArgs| {
                         if crate::pipeline::host::root_share()
+                            && unbound_scratch()
                             && let Some(gpu) = unbound_view(kind == 2)
                         {
                             args.view(l, root, compute, kind, param, gpu);
@@ -1158,6 +1188,7 @@ impl State {
                     };
                     let writes = kind == 2 && t.host.written_root_uavs.contains(&slot);
                     let Some(gpu) = root_view(list, address, kind == 1, kind == 2, writes) else {
+                        unbound_once(&p.name, slot, kind, address);
                         unbound(&mut self.root_args[usize::from(compute)]);
                         continue;
                     };

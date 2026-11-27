@@ -2088,6 +2088,39 @@ fn holding(map: &BTreeMap<(u64, usize), Entry>, address: u64, end: u64) -> Optio
     )
 }
 
+/// Where `address` lies, for a warning when [`find`] has no copy for it:
+/// the nearest title buffers around it, the nearest title texture below
+/// it, and the memory's state.
+pub(crate) fn whereabouts(address: u64) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (below, above) = {
+        let map = buffers();
+        let below = map.range(..(address.saturating_add(1), 0)).next_back().map(|(&(start, _), e)| (start, e.end));
+        let above = map.range((address.saturating_add(1), 0)..).next().map(|(&(start, _), _)| start);
+        (below, above)
+    };
+    let texture = crate::resource::texture_below(address);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    let asked = unsafe { VirtualQuery(address as usize as *const _, &mut info, size_of_val(&info)) };
+    let memory = if asked == 0 {
+        "unknown".to_owned()
+    } else {
+        format!(
+            "state {:#x} type {:#x} protect {:#x}, region {:#x}+{:#x}",
+            info.State, info.Type, info.Protect, info.BaseAddress as usize, info.RegionSize
+        )
+    };
+    format!(
+        "buffer below {:x?} (start, end), buffer above {:x?}, texture below {:x?} (start, count), below the lowest mapped {}, memory {memory}",
+        below,
+        above,
+        texture,
+        address < LOWEST_MAPPED
+    )
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {

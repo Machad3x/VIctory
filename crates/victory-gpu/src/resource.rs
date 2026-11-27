@@ -2048,6 +2048,14 @@ fn textures_at_changes(at: u64) -> &'static std::sync::atomic::AtomicU64 {
     &TEXTURES_AT_CHANGES[bucket as usize]
 }
 
+/// The start of the nearest title texture at or below memory `at`, and how
+/// many start there (diagnosis of root views outside title buffers).
+#[cfg(windows)]
+pub(crate) fn texture_below(at: u64) -> Option<(u64, usize)> {
+    let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    map.range(..=at).next_back().map(|(&start, r)| (start, r.len()))
+}
+
 /// [`TEXTURES_AT`] changed at memory `at` (called under its lock).
 #[cfg(windows)]
 fn textures_at_changed(at: u64) {
