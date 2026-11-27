@@ -111,8 +111,13 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     }
     if event.is_null() {
         // A null event blocks until the value is reached.
+        #[cfg(windows)]
+        debug_assert!(
+            !crate::queue::pumping_here() && !crate::host::submitting_here(),
+            "a blocking fence wait inside held work or a host submission never ends"
+        );
         let since = std::time::Instant::now();
-        let mut warned = false;
+        let mut warn_at = WARN_EVERY;
         while fence.value.load(Ordering::Acquire) < value {
             waiters = fence
                 .moved
@@ -125,9 +130,17 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             // Held work may be what signals it: pumped without our lock.
             drop(waiters);
             crate::queue::pump_held_if_free(crate::queue::Why::Fence);
-            if !warned && since.elapsed() >= std::time::Duration::from_secs(10) {
-                warned = true;
-                tracing::warn!(value, "a blocking fence wait has lasted 10 s");
+            if since.elapsed() >= warn_at {
+                warn_at += WARN_EVERY;
+                tracing::warn!(value, secs = since.elapsed().as_secs(), "a blocking fence wait is still waiting");
+            }
+            // Nothing signals it on a removed device: the run ends with the cause.
+            #[cfg(windows)]
+            if let Some(host) = crate::host::host()
+                // SAFETY: a plain query.
+                && unsafe { host.device.GetDeviceRemovedReason() }.is_err()
+            {
+                crate::host::fail(format_args!("host GPU device removed while the title waited for fence value {value}"));
             }
             waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
         }
@@ -164,6 +177,9 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
     });
     S_OK
 }
+
+/// How often a blocking fence wait still waiting says so.
+const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Events the title waited on for a fence value, and their summed waits in
 /// microseconds (the held-work frame line: work held back shows here as the
