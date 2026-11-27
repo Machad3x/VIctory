@@ -1379,8 +1379,24 @@ table written while a miss withholds, or while title memory is still being
 opened, names its in-place runs load-only (a null unordered access view:
 loads read, stores are dropped). The title's submission waits for runs
 being opened before it takes any lock, at most 500 ms a frame from the
-frame's one allowance; texture read-backs of a list that missed are
-withheld with its copies.
+frame's one allowance.
+
+`gpu317` (8ab67967, the first run without Sunshine streaming) stayed alive
+the whole 252 s with no title heap assertion and no watchdog, and reached
+the gameplay window scene: 4,900 draws a frame at about 850 ms a frame (178
+ms preparing, 106 to 317 ms on the GPU, 62 ms copying back, 250 MB of
+copies a frame). The interior is still dark; only the window's light
+shows. The review after it found load-only tables with no miss leaving
+partial results visible (their copies went back, atomics read 0): a list
+that ran on a load-only table is now withheld as a miss is, without
+opening the miss window. Load-only and writable flips remake the runs'
+pairs in place (one pair a run, counted on the frame line) instead of
+rewriting the table. Texture read-backs go back again (a copy the title
+commanded, of a texture any list may have rendered). A title change over
+memory a table still names after its 2 s wait is reported done and queued
+until the tables let the memory go (an allocation there waits for it).
+Still open: a list's first miss of memory no table knew of stores in place;
+a retire whose fence wait could not be set leaves the next table writable.
 
 ## Open problems
 
