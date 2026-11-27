@@ -40,8 +40,8 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
 /// unlocks released pages within milliseconds.
 const SETTLE: Duration = Duration::from_millis(100);
 
-// Holders come with title memory in place (#2112, #2734): until then only
-// the tests here register pins.
+// Holders: title memory in place (`crate::inplace`, the backstop) and the
+// tests here.
 
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory.

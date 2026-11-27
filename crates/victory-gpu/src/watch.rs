@@ -1164,6 +1164,13 @@ pub fn title_memory_own(at: usize, len: usize, own: usize) {
     for k in 0..len / PAGE {
         g.own.insert(at / PAGE + k, own + k * PAGE);
     }
+    crate::inplace::views_changed();
+}
+
+/// The views of our own showing title pages `first..last` (page numbers),
+/// as (page, our view's address) in page order ([`title_memory_own`]).
+pub(crate) fn own_views(first: usize, last: usize) -> Vec<(usize, usize)> {
+    guards().own.range(first..last).map(|(&page, &own)| (page, own)).collect()
 }
 
 /// A write through views of our own into pages one tracker's copy writes
@@ -1244,6 +1251,8 @@ fn own_views() -> bool {
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    // Page tables naming it in place name it anew.
+    crate::inplace::views_changed();
     let mut g = guards();
     // What it showed is gone already: nothing to keep. The other mappings
     // of it did not change: marked, their copies lost shaders' writes.

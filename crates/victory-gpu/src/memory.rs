@@ -42,6 +42,10 @@
 //! their own at the frame's end, one for each contiguous run up to
 //! [`DEMAND_RUN`] pages ([`crate::shadow::demand`]), up to
 //! `VICTORY_DEMAND_COPIES_MB` MiB (512) made in all.
+//! With `VICTORY_INPLACE_BACKSTOP=1` (off by default) a page no copy holds
+//! that shows physical pages through a view of our own is named in place
+//! instead ([`crate::inplace`]): shaders read and write the title's bytes,
+//! nothing is copied, and it is no miss.
 //! shortcut: a page two copies share without either holding all of it is
 //! the larger one's.
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
@@ -137,6 +141,11 @@ struct Layout {
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
+    /// Entries no copy holds that name title memory in place
+    /// ([`crate::inplace::backstop`]; empty without it), and the runs they
+    /// name, kept while the table may run.
+    backstopped: Vec<bool>,
+    runs: Vec<Arc<crate::inplace::Run>>,
 }
 
 /// A view heap's page table, shared by every list using title memory with
@@ -154,6 +163,10 @@ struct Shared {
     pairs: fx::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
+    /// The view pair of each run in place it names, by run id, and the
+    /// generation of what is in place it names ([`crate::inplace::generation`]).
+    run_pairs: fx::Map<u64, u32>,
+    in_place: u64,
     /// The number of [`WANTED`] regions it was written with.
     wanted: usize,
     layout: Arc<Layout>,
@@ -327,6 +340,7 @@ pub(crate) fn log_frame() {
     }
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
+    crate::inplace::log_frame();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
@@ -529,6 +543,8 @@ impl Shared {
             null,
             pairs: fx::Map::default(),
             generation: u64::MAX,
+            run_pairs: fx::Map::default(),
+            in_place: u64::MAX,
             wanted: 0,
             layout: Arc::default(),
         })
@@ -539,6 +555,8 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        // Read first: a change while writing is named at the next rewrite.
+        let in_place = crate::inplace::generation();
         let copies = crate::shadow::all();
         let live: fx::Set<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
@@ -572,7 +590,13 @@ impl Shared {
         let wanted: Vec<usize> = if counting() { wanted().iter().copied().collect() } else { Vec::new() };
         self.wanted = wanted.len();
         let weak: Vec<bool> = named.iter().map(|c| c.demanded()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null, &wanted, &weak);
+        let (mut dwords, blocks, owner) = table(&ranges, &slots, self.null, &wanted, &weak);
+        let (backstopped, runs) = if crate::inplace::backstop() {
+            self.backstop(heap, &mut dwords, &blocks, &owner)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.in_place = in_place;
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
@@ -582,12 +606,76 @@ impl Shared {
             copies: named,
             blocks,
             owner,
+            backstopped,
+            runs,
         });
         // The old one may hold copies' last references: releasing those here
         // would be on the submitting thread, with the heaps locked.
         crate::host::release_later(Box::new(std::mem::replace(&mut self.layout, layout)));
         self.generation = now;
         stats(|s| s.tables += 1);
+    }
+
+    /// Entries of the table's blocks that no copy holds and that show
+    /// physical pages through a view of our own: named in place
+    /// ([`crate::inplace`]) in `dwords`, those of runs no longer named given
+    /// back. The entries named, and the runs.
+    fn backstop(
+        &mut self,
+        heap: &HostHeap,
+        dwords: &mut [u32],
+        blocks: &[usize],
+        owner: &[Option<usize>],
+    ) -> (Vec<bool>, Vec<Arc<crate::inplace::Run>>) {
+        let mut backstopped = vec![false; owner.len()];
+        let mut runs: Vec<Arc<crate::inplace::Run>> = Vec::new();
+        let mut named = 0u64;
+        // Block 0 is the null one.
+        for (b, &l1) in blocks.iter().enumerate().skip(1) {
+            let first = l1 * BLOCK;
+            let free: Vec<(usize, usize)> = crate::watch::own_views(first, first + BLOCK)
+                .into_iter()
+                .filter(|&(page, _)| owner.get(b * BLOCK + (page - first)).is_some_and(|o| o.is_none()))
+                .collect();
+            for run in crate::inplace::runs(&free) {
+                let Some((placed, offset)) = crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE) else {
+                    continue;
+                };
+                let pair = match self.run_pairs.get(&placed.id) {
+                    Some(&pair) => pair,
+                    None => {
+                        let Some(pair) = heap.pair() else {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| tracing::warn!("no descriptor slots for title memory in place: it reads as missing"));
+                            continue;
+                        };
+                        heap.raw_pair_at(pair, Some(&placed.buffer), placed.len as u64);
+                        self.run_pairs.insert(placed.id, pair);
+                        pair
+                    }
+                };
+                for (k, &(page, _)) in run.iter().enumerate() {
+                    let entry = b * BLOCK + (page - first);
+                    dwords[LEVEL1 + 2 * entry] = pair;
+                    dwords[LEVEL1 + 2 * entry + 1] = crate::inplace::entry_base((page << 16) as u64, offset + k * crate::watch::PAGE);
+                    backstopped[entry] = true;
+                }
+                named += run.len() as u64;
+                if !runs.iter().any(|r| r.id == placed.id) {
+                    runs.push(placed);
+                }
+            }
+        }
+        self.run_pairs.retain(|id, &mut pair| {
+            let keep = runs.iter().any(|r| r.id == *id);
+            if !keep {
+                heap.raw_pair_at(pair, None, 0);
+                heap.free_pair(pair);
+            }
+            keep
+        });
+        crate::inplace::named(named);
+        (backstopped, runs)
     }
 }
 
@@ -604,7 +692,7 @@ fn demand_budget() -> Option<u64> {
 
 /// Whether missed pages are counted, and missed regions get blocks.
 fn counting() -> bool {
-    cfg!(feature = "diagnostics") || demand_budget().is_some()
+    cfg!(feature = "diagnostics") || demand_budget().is_some() || crate::inplace::backstop()
 }
 
 /// Level-1 indices of the 256 MiB regions with no copy that shaders marked.
@@ -923,6 +1011,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let now = crate::shadow::generation();
         let stale = s.generation != now;
         let stale = stale || counting() && s.wanted != wanted().len();
+        let stale = stale || crate::inplace::backstop() && s.in_place != crate::inplace::generation();
         if stale {
             s.rewrite(heap, now);
         }
@@ -1003,7 +1092,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                if entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none()) {
+                let held = l.owner.get(entry).is_some_and(|o| o.is_some()) || l.backstopped.get(entry) == Some(&true);
+                if entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || !held {
                     return true;
                 }
             }
@@ -1011,7 +1101,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         })
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let Layout { copies, blocks, owner, backstopped, .. } = &*layout(key);
+        // Pages shaders wrote in place: there already.
+        let mut landed: Vec<usize> = Vec::new();
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the read-back bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
@@ -1041,6 +1133,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     // A page no copy holds is a miss, byte for byte or not.
                     Some(Some(_)) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) => writes.push((*k, at)),
+                    _ if backstopped.get(entry) == Some(&true) => landed.push(at as usize),
                     _ => {
                         pages += 1;
                         #[cfg(feature = "diagnostics")]
@@ -1055,6 +1148,14 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         if counting() {
             measure_misses(&missed_at, &missed_in);
+        }
+        if !landed.is_empty() {
+            crate::inplace::written(landed.len() as u64);
+            // Trackers of other kinds over them (texture stagings) take
+            // title memory again.
+            for at in landed {
+                crate::watch::retake(at, crate::watch::PAGE);
+            }
         }
         #[cfg(feature = "diagnostics")]
         name_missing(&missed_at, &missed_in, &users.lock().unwrap_or_else(|e| e.into_inner()));
