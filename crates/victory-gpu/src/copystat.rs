@@ -223,9 +223,56 @@ pub(crate) enum C {
     StaleLockWaitNs,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
+    /// Bytes of taken pages refreshed, by who wrote the page (a copy-back
+    /// of ours this frame or the one before, else the title) and where the
+    /// refresh went (video memory of a mirrored copy, else host memory).
+    RefreshOursVideo,
+    RefreshOursHost,
+    RefreshTitleVideo,
+    RefreshTitleHost,
+    /// Refresh copies made at once on the preparing thread (bytes, time),
+    /// and bytes queued for the copy pool.
+    RefreshSerialBytes,
+    RefreshSerialUs,
+    RefreshPoolBytes,
 }
-const COUNTERS: usize = C::VideoBytes as usize + 1;
+const COUNTERS: usize = C::RefreshPoolBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+/// Title pages (64 KiB index) our copy-backs wrote, and the frame.
+static OURS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// A copy-back wrote title memory `[at, at + len)`.
+pub(crate) fn ours_wrote(at: usize, len: usize) {
+    use crate::watch::PAGE;
+    let frame = crate::queue::presented();
+    let mut map = OURS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    for p in at / PAGE..(at + len).div_ceil(PAGE) {
+        map.insert(p, frame);
+    }
+}
+
+/// A refresh of taken title memory `[a, b)`, into video memory or not.
+pub(crate) fn refresh_cause(a: usize, b: usize, video: bool) {
+    use crate::watch::PAGE;
+    let now = crate::queue::presented();
+    let mut ours = 0;
+    if let Some(map) = OURS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        for p in a / PAGE..b.div_ceil(PAGE) {
+            if map.get(&p).is_some_and(|&f| f + 1 >= now) {
+                ours += (b.min((p + 1) * PAGE) - a.max(p * PAGE)) as u64;
+            }
+        }
+    }
+    let (o, t) = if video {
+        (C::RefreshOursVideo, C::RefreshTitleVideo)
+    } else {
+        (C::RefreshOursHost, C::RefreshTitleHost)
+    };
+    add(o, ours);
+    add(t, (b - a) as u64 - ours);
+}
 
 /// The guard handler's longest single wait for the guard lock since the
 /// last line, nanoseconds.
@@ -577,7 +624,7 @@ pub(crate) fn log(frames: f64) {
         c[C::StaleLockWaitNs as usize] / 1e6,
     );
     tracing::info!(
-        "  null UAV barriers per frame: title buffer barriers {:.0} read to read, {:.0} begin only, {:.0} other; {:.0} the title's own; {:.0} for barrier groups; {:.0} indirect clamps ({:.0} with no shader write since the one before); {:.1} MB refreshed into video memory only",
+        "  null UAV barriers per frame: title buffer barriers {:.0} read to read, {:.0} begin only, {:.0} other; {:.0} the title's own; {:.0} for barrier groups; {:.0} indirect clamps ({:.0} with no shader write since the one before); {:.1} MB refreshed into video memory only; taken pages refreshed: written by our copy-backs {:.1} MB to video memory, {:.1} MB to host, by the title {:.1} MB to video memory, {:.1} MB to host; refresh copies made at once {:.1} MB in {:.2} ms, {:.1} MB queued for the pool",
         c[C::BarriersReadRead as usize],
         c[C::BarriersBeginOnly as usize],
         c[C::BarriersOther as usize],
@@ -586,7 +633,20 @@ pub(crate) fn log(frames: f64) {
         c[C::Clamps as usize],
         c[C::ClampsNoWrite as usize],
         mb(c[C::VideoBytes as usize]),
+        mb(c[C::RefreshOursVideo as usize]),
+        mb(c[C::RefreshOursHost as usize]),
+        mb(c[C::RefreshTitleVideo as usize]),
+        mb(c[C::RefreshTitleHost as usize]),
+        mb(c[C::RefreshSerialBytes as usize]),
+        ms(c[C::RefreshSerialUs as usize]),
+        mb(c[C::RefreshPoolBytes as usize]),
     );
+    {
+        let now = crate::queue::presented();
+        if let Some(map) = OURS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.retain(|_, f| *f + 1 >= now);
+        }
+    }
     if crate::indirect::windows_on() {
         tracing::info!(
             "  clamp windows per frame: {:.0} holding {:.0} indirect draws; {:.0} indirect draws alone as they may store",

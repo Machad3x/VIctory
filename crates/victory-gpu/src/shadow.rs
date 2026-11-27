@@ -213,6 +213,8 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
         return false;
     }
     let _writing = crate::watch::writing_ours(at, merged.len());
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::ours_wrote(at, merged.len());
     write_spans(at, merged, runs);
     true
 }
@@ -887,6 +889,8 @@ impl Shadow {
             // title's stay guarded, with nothing to take again.
             let own = t.write_unseen(from, to);
             let opened = own.is_none().then(|| crate::watch::writing_ours(from, to - from));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::ours_wrote(from, to - from);
             for c in stretch {
                 if let Some((host, runs, _)) = &c.back {
                     let _spans = write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);
@@ -1070,7 +1074,11 @@ impl Shadow {
             // Cut to the range: next to it shaders may be writing the copy.
             let mut copied: usize = runs
                 .into_iter()
-                .map(|(a, b)| if busy { self.copy_under_writes(a, b) } else { self.copy_queued(a, b) })
+                .map(|(a, b)| {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::refresh_cause(a, b, self.vram.is_some());
+                    if busy { self.copy_under_writes(a, b) } else { self.copy_queued(a, b) }
+                })
                 .sum();
             for (a, b) in unmapped {
                 // SAFETY: inside the mapping (`take_split` cuts to the buffer).
@@ -1135,10 +1143,16 @@ impl Shadow {
             return 0;
         }
         if self.vram.is_some() || self.tracked.as_ref().is_some_and(|t| t.has_saved(from, to)) {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
             return self.copy(from, to);
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::RefreshPoolBytes, (to - from) as u64);
         crate::copy_pool::copy(at, from as *const u8, to - from);
         to - from
     }
