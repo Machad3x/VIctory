@@ -304,9 +304,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         if p.graphics.is_none() && compute_waits() {
-            // `start` queued it (or made it when there are no workers). Wait
-            // for the worker: building it here stalls the title's thread.
-            wait_for(p);
+            // A dropped dispatch leaves the scene wrong for the rest of it.
+            // Building here can stall the title's thread once on a cold cache;
+            // the pipeline library has it on the next run. A cap plus inline
+            // fallback still blocks on a worker's OnceLock, and a per-pipeline
+            // cap trips the 30 s watchdog across several cold dispatches.
+            p.make();
         } else {
             wait(p, crate::frame::current());
         }
@@ -369,32 +372,6 @@ fn shared_budget() -> bool {
 /// The frame a budget belongs to, and what was waited of it (of passes over
 /// the screen too); the two slots are distinct.
 static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-
-/// Waits for a worker to make `p`, capped below the title's 30 s watchdog.
-/// `start` queued it, or made it itself when there are no workers.
-fn wait_for(p: &Pending) {
-    let started = Instant::now();
-    let cap = screen_budget();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
-        let rest = cap.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    drop(held);
-    if p.made.get().is_none() {
-        // A long queue: make it here rather than drop the dispatch.
-        p.make();
-    }
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(
-        crate::copystat::C::PipelineWaitUs,
-        started.elapsed().as_micros() as u64,
-    );
-}
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
