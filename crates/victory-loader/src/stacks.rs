@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, GetThreadId, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
@@ -97,8 +97,9 @@ pub(crate) fn dump_stacks_on_crash() -> Option<String> {
     }
 }
 
-/// The thread the dump has suspended (its handle), if any, for the crash
-/// filter to resume when it stops waiting; and whether it did.
+/// The thread the dump has suspended (its id: the dump may close its
+/// handle while the filter resumes it), if any, for the crash filter to
+/// resume when it stops waiting; and whether it did.
 static SUSPENDED: AtomicUsize = AtomicUsize::new(0);
 static GIVE_UP: AtomicBool = AtomicBool::new(false);
 
@@ -108,8 +109,13 @@ fn suspend(thread: HANDLE) -> bool {
     if GIVE_UP.load(Ordering::SeqCst) {
         return false;
     }
+    // SAFETY: a plain query.
+    let id = unsafe { GetThreadId(thread) } as usize;
+    if id == 0 {
+        return false;
+    }
     // One suspended at a time, whichever dump (a scheduled one, a crash).
-    while SUSPENDED.compare_exchange(0, thread as usize, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    while SUSPENDED.compare_exchange(0, id, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         if GIVE_UP.load(Ordering::SeqCst) {
             return false;
         }
@@ -120,7 +126,7 @@ fn suspend(thread: HANDLE) -> bool {
         SUSPENDED.store(0, Ordering::SeqCst);
         return false;
     }
-    if SUSPENDED.load(Ordering::SeqCst) != thread as usize {
+    if SUSPENDED.load(Ordering::SeqCst) != id {
         // The filter resumed it, maybe before the suspend: once more.
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
@@ -131,18 +137,29 @@ fn suspend(thread: HANDLE) -> bool {
 
 /// Resumes `thread` unless the filter already did.
 fn resume(thread: HANDLE) {
-    if SUSPENDED.compare_exchange(thread as usize, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+    // SAFETY: a plain query.
+    let id = unsafe { GetThreadId(thread) } as usize;
+    if SUSPENDED.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
         // SAFETY: suspended by `suspend`.
         unsafe { ResumeThread(thread) };
     }
 }
 
-/// The filter's side: resumes the thread the dump holds suspended.
+/// The filter's side: resumes the thread the dump holds suspended, through
+/// a handle of its own (a suspended thread cannot exit, so its id is not
+/// reused meanwhile).
 fn resume_suspended() {
-    let thread = SUSPENDED.swap(0, Ordering::SeqCst);
-    if thread != 0 {
-        // SAFETY: a thread handle the dump holds open while it is published.
-        unsafe { ResumeThread(thread as HANDLE) };
+    let id = SUSPENDED.swap(0, Ordering::SeqCst);
+    if id == 0 {
+        return;
+    }
+    // SAFETY: opens, resumes and closes a thread of this process.
+    unsafe {
+        let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, id as u32);
+        if !thread.is_null() {
+            ResumeThread(thread);
+            CloseHandle(thread);
+        }
     }
 }
 
@@ -484,8 +501,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(stopped.handles(&open).contains(&(at as u64)), "{:x?} has {at:#x}", stopped.handles(&open));
-        // The filter giving up resumes the thread the dump holds.
+        // The filter giving up resumes the thread the dump holds, even with
+        // the dump's handle closed by then.
         assert!(suspend(thread));
+        // SAFETY: a thread of this process; closed right after.
+        let dumps = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, 0, id) };
+        assert!(suspend_count_is(dumps, 1));
+        // SAFETY: ours.
+        unsafe { CloseHandle(dumps) };
         resume_suspended();
         // SAFETY: as above; the previous count is 0 once resumed.
         assert_eq!(unsafe { SuspendThread(thread) }, 0, "resumed");
@@ -499,6 +522,17 @@ mod tests {
             waiter.join().unwrap();
             CloseHandle(thread);
             CloseHandle(event);
+        }
+    }
+
+    /// Whether `thread` is suspended `n` times (it is suspended and resumed
+    /// once to tell).
+    fn suspend_count_is(thread: HANDLE, n: u32) -> bool {
+        // SAFETY: a thread of this process, left as it was.
+        unsafe {
+            let before = SuspendThread(thread);
+            ResumeThread(thread);
+            before == n
         }
     }
 
