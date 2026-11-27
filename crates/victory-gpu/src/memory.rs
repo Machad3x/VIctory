@@ -432,7 +432,24 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
 /// regions in `wanted` get one too while there is room, after the copies'.
 /// Copies `weak` marks (none past its end) give a page to any other copy
 /// holding it, or part of it.
+/// A page table of copies named at their own addresses only.
+#[cfg(test)]
 fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32, wanted: &[usize], weak: &[bool]) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
+    table_at(copies, &copies.iter().map(|c| c.0 as u32).collect::<Vec<_>>(), pairs, null, wanted, weak)
+}
+
+/// [`table`] with each range's entry start given apart (`starts`): the
+/// address the copy would start at for the range's addresses to be
+/// offsets in it. A range's own start, but for the addresses of a buffer
+/// that shares another's copy ([`Shadow::shared_at`]).
+fn table_at(
+    copies: &[(u64, u64)],
+    starts: &[u32],
+    pairs: &[u32],
+    null: u32,
+    wanted: &[usize],
+    weak: &[bool],
+) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
     let mut order: Vec<usize> = (0..copies.len()).collect();
     order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
     order.retain(|&k| copies[k].1 != 0 && copies[k].0 + copies[k].1 <= 1 << 40);
@@ -489,7 +506,7 @@ fn table(copies: &[(u64, u64)], pairs: &[u32], null: u32, wanted: &[usize], weak
     let mut dwords = level1;
     for o in &owner {
         let entry = match *o {
-            Some((k, _)) => [pairs[k], copies[k].0 as u32],
+            Some((k, _)) => [pairs[k], starts[k]],
             None => [null, 0],
         };
         dwords.extend(entry);
@@ -555,15 +572,29 @@ impl Shared {
             named.push(c);
             slots.push(slot);
         }
-        let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
+        let mut ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
         let wanted: Vec<usize> = if counting() { wanted().iter().copied().collect() } else { Vec::new() };
         self.wanted = wanted.len();
-        let weak: Vec<bool> = named.iter().map(|c| c.demanded()).collect();
-        let (dwords, blocks, owner) = table(&ranges, &slots, self.null, &wanted, &weak);
+        let mut weak: Vec<bool> = named.iter().map(|c| c.demanded()).collect();
+        let mut starts: Vec<u32> = ranges.iter().map(|r| r.0 as u32).collect();
+        // The addresses of buffers that share a copy name it too: the
+        // same pair, read from where the copy would start for them.
+        let mut of: Vec<usize> = (0..named.len()).collect();
+        for (k, c) in named.iter().enumerate() {
+            for (at, len, home) in c.shared_at() {
+                ranges.push((at, len));
+                starts.push(at.wrapping_sub(home - c.range().0) as u32);
+                slots.push(slots[k]);
+                weak.push(weak[k]);
+                of.push(k);
+            }
+        }
+        let (dwords, blocks, owner) = table_at(&ranges, &starts, &slots, self.null, &wanted, &weak);
+        let owner: Vec<Option<usize>> = owner.into_iter().map(|o| o.map(|k| of[k])).collect();
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
-        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        tracing::debug!(copies = named.len(), ranges = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
         let layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
@@ -980,6 +1011,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
+                // In its copy's own addresses, as the ranges kept are.
+                let at = owner.get(entry).copied().flatten().map_or(at, |k| copies[k].canon(at));
                 match owner.get(entry) {
                     // A page no copy holds is a miss, byte for byte or not.
                     Some(Some(_)) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
@@ -1156,6 +1189,29 @@ mod tests {
         m.record(&due, ask(&due, 1 << 30, |_, n, _| (n, Ok(n << 16))));
         assert_eq!(m.healed + m.left_committed, due.len() as u64);
     }
+    /// The addresses of a buffer that shares a copy name the copy's pair,
+    /// from where the copy would start for them: a shader's offset there
+    /// is the offset of the same byte at the copy's own addresses.
+    #[test]
+    fn a_shared_copy_is_named_at_the_addresses_of_each_buffer() {
+        // Two pages at 0x10_0000; another buffer shows the second of them
+        // at 0x90_0000.
+        let ranges = [(0x10_0000u64, 2u64 << 16), (0x90_0000, 1 << 16)];
+        let starts = [0x10_0000u32, 0x90_0000 - (1 << 16)];
+        let (dwords, blocks, owner) = table_at(&ranges, &starts, &[102, 102], 100, &[], &[false, false]);
+        assert_eq!(blocks.len(), 2, "the null block and one for the first 256 MiB");
+        let block = dwords[0] as usize;
+        let entry = |page: usize| {
+            let at = LEVEL1 + 2 * (block * BLOCK + page);
+            (dwords[at], dwords[at + 1])
+        };
+        assert_eq!(entry(0x10), (102, 0x10_0000));
+        assert_eq!(entry(0x11), (102, 0x10_0000));
+        assert_eq!(entry(0x90), (102, 0x8f_0000), "0x90_0010 - 0x8f_0000 is the second page's byte 16");
+        assert_eq!(entry(0x91), (100, 0), "past the shared buffer: no copy");
+        assert_eq!((owner[block * BLOCK + 0x11], owner[block * BLOCK + 0x90]), (Some(0), Some(1)));
+    }
+
 
     /// A demand copy gives a whole page to any other copy, even a larger one.
     #[test]

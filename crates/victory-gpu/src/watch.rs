@@ -1160,6 +1160,9 @@ pub(crate) fn writing_ours(at: usize, len: usize) -> Writing {
 /// view only we write through ([`Tracked::write_unseen`]), until it maps or
 /// unmaps `at` ([`title_memory_remapped`]).
 pub fn title_memory_own(at: usize, len: usize, own: usize) {
+    if crate::memsys::alias::on() {
+        crate::memsys::alias::shown(at as u64, len as u64, own as u64);
+    }
     let mut g = guards();
     for k in 0..len / PAGE {
         g.own.insert(at / PAGE + k, own + k * PAGE);
@@ -1243,6 +1246,10 @@ fn own_views() -> bool {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Before the guards' lock: buffers sharing a copy over these pages
+    // part (`crate::shadow::remapped` takes the buffers' lock).
+    #[cfg(windows)]
+    crate::shadow::remapped(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     // What it showed is gone already: nothing to keep. The other mappings

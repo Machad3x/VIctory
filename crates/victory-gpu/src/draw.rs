@@ -2203,7 +2203,7 @@ impl State {
         let window = (crate::indirect::windows_on() && kind != DISPATCH)
             .then(|| {
                 let (start, _) = args.range();
-                crate::indirect::windowed(list, args.gpu(start), arguments - start, (kind, stride, max))
+                crate::indirect::windowed(list, args.gpu(start), args.canon(arguments) - start, (kind, stride, max))
             })
             .flatten();
         let joined = window.is_some();

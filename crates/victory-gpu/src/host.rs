@@ -3239,6 +3239,8 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // Kept in the copy's own addresses (a buffer sharing it has others).
+        let address = shadow.canon(address as u64) as usize;
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
@@ -3274,6 +3276,7 @@ impl HostList {
         len: usize,
         marked: bool,
     ) {
+        let address = shadow.canon(address as u64) as usize;
         let memory = self.memory_writer.load(Ordering::Relaxed);
         self.deferred()
             .copies
@@ -3818,6 +3821,7 @@ impl Batch {
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let address = shadow.canon(address as u64) as usize;
         #[cfg(feature = "diagnostics")]
         let same = self.flight_prev_copies.binary_search(&(std::sync::Arc::as_ptr(shadow) as usize)).is_ok();
         #[cfg(feature = "diagnostics")]
@@ -6766,6 +6770,151 @@ mod copy_order {
         for &p in &pools {
             crate::watch::tests::free(p);
         }
+    }
+
+    /// With `VICTORY_MEMSYS_ALIAS`, a buffer showing physical pages that
+    /// another buffer's copy holds takes that copy, at its pages: one
+    /// refresh serves both addresses, a title write through either is
+    /// seen, and a remap gives the buffer a copy of its own again.
+    #[test]
+    fn buffers_showing_the_same_pages_share_one_copy() {
+        use crate::memsys::alias::ON_HERE;
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let len = 4 * PAGE;
+        // SAFETY: a pagefile section mapped read-write three times (two
+        // title addresses and a view of our own); the test keeps them.
+        let (a, b, own) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            (map(), map(), map())
+        };
+        assert!(a != 0 && b != 0 && own != 0);
+        struct Here;
+        impl Drop for Here {
+            fn drop(&mut self) {
+                ON_HERE.set(false);
+            }
+        }
+        ON_HERE.set(true);
+        let _here = Here;
+        // As the runtime reports a mapping: what it shows, then where.
+        crate::watch::title_memory_remapped(a, len);
+        crate::watch::title_memory_own(a, len, own);
+        crate::watch::title_memory_remapped(b, len);
+        crate::watch::title_memory_own(b, len, own);
+        for k in 0..4 {
+            crate::watch::title_memory_aliased(b + k * PAGE, &[a + k * PAGE]);
+        }
+        let (au, bu) = (a as u64, b as u64);
+        let page = PAGE as u64;
+        // One buffer over all four pages at `a`, one over the middle two
+        // at `b`.
+        crate::shadow::register(a, au, 4 * page);
+        crate::shadow::register(b, bu + page, 2 * page);
+        let whole = crate::shadow::find(au, 4 * page).unwrap();
+        let shared = crate::memsys::count(crate::memsys::N::AliasShared);
+        let middle = crate::shadow::find(bu + page + 16, 64).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&whole, &middle), "one copy of the pages");
+        assert!(crate::memsys::count(crate::memsys::N::AliasShared) > shared);
+        assert_eq!(middle.gpu(bu + page + 16), whole.gpu(au + page + 16));
+        assert_eq!(middle.offset(bu + 2 * page), whole.offset(au + 2 * page));
+        assert_eq!(middle.left(bu + page + 16), 2 * page - 16, "to its own buffer's end");
+        assert_eq!(middle.page_range(bu + page + 16, 64), (au + page, page), "in the copy's own addresses");
+        assert_eq!(whole.shared_at(), [(bu + page, 2 * page, au + page)]);
+        assert_eq!(crate::shadow::all().iter().filter(|c| std::sync::Arc::ptr_eq(c, &whole)).count(), 1);
+        // The title writes through one address; a list reading through
+        // the other sees it.
+        let read = |address: u64| whole.read_host(address, 1)[0] & 0xff;
+        let run = |through: &std::sync::Arc<crate::shadow::Shadow>, address: u64| {
+            let list = host.new_list().unwrap();
+            through.refresh(&list, address, page);
+            list.close();
+            host.execute(&[&list]);
+        };
+        // SAFETY: bytes of our views.
+        unsafe { ((b + PAGE + 16) as *mut u8).write_volatile(0x5a) };
+        run(&whole, au + page);
+        assert_eq!(read(au + page + 16), 0x5a, "written at b, refreshed at a");
+        // SAFETY: as above.
+        unsafe { ((a + PAGE + 16) as *mut u8).write_volatile(0x77) };
+        run(&middle, bu + page);
+        assert_eq!(read(au + page + 16), 0x77, "written at a, refreshed at b");
+        // The second page at `b` shows something else: the buffers part.
+        crate::watch::title_memory_remapped(b + PAGE, PAGE);
+        assert!(whole.shared_at().is_empty());
+        let apart = crate::shadow::find(bu + page + 16, 64).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&whole, &apart), "a copy of its own again");
+        assert_eq!(apart.range(), (bu + page, 2 * page));
+        // A list recorded before the remap still finds its bytes.
+        assert_eq!(whole.gpu(bu + page + 16), whole.gpu(au + page + 16));
+        crate::shadow::unregister(b, bu + page);
+        crate::shadow::unregister(a, au);
+        crate::watch::title_memory_remapped(a, len);
+        crate::watch::title_memory_remapped(b, len);
+        drop((whole, middle, apart));
+    }
+
+    /// A buffer released while it shares another's copy leaves that copy
+    /// to its own buffer, and one freed takes no copy of other memory
+    /// with it.
+    #[test]
+    fn a_sharing_buffer_released_or_freed_leaves_the_copy() {
+        use crate::memsys::alias::ON_HERE;
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        if super::host().is_none() {
+            return; // no host GPU here
+        }
+        let len = 2 * PAGE;
+        // SAFETY: a pagefile section mapped read-write three times; kept.
+        let (a, b, own) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            (map(), map(), map())
+        };
+        assert!(a != 0 && b != 0 && own != 0);
+        struct Here;
+        impl Drop for Here {
+            fn drop(&mut self) {
+                ON_HERE.set(false);
+            }
+        }
+        ON_HERE.set(true);
+        let _here = Here;
+        crate::watch::title_memory_own(a, len, own);
+        crate::watch::title_memory_own(b, len, own);
+        let (au, bu, n) = (a as u64, b as u64, len as u64);
+        crate::shadow::register(a, au, n);
+        crate::shadow::register(b, bu, n);
+        let copy = crate::shadow::find(au, n).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&copy, &crate::shadow::find(bu, n).unwrap()));
+        // The memory at `b` is freed: the copy, which is `a`'s, lives on.
+        drop(crate::shadow::freed(bu, n));
+        assert!(copy.shared_at().is_empty(), "parted");
+        assert!(std::sync::Arc::ptr_eq(&copy, &crate::shadow::find(au, n).unwrap()));
+        let list = super::host().unwrap().new_list().unwrap();
+        // SAFETY: a byte of our view.
+        unsafe { (a as *mut u8).write_volatile(0x42) };
+        copy.refresh(&list, au, n);
+        list.close();
+        super::host().unwrap().execute(&[&list]);
+        assert_eq!(copy.read_host(au, 1)[0] & 0xff, 0x42, "still refreshed: not gone with b's memory");
+        // Shared again, then released: the copy stays its own buffer's.
+        crate::shadow::unregister(b, bu);
+        crate::shadow::register(b, bu, n);
+        assert!(std::sync::Arc::ptr_eq(&copy, &crate::shadow::find(bu, n).unwrap()));
+        crate::shadow::unregister(b, bu);
+        assert!(copy.shared_at().is_empty());
+        assert!(std::sync::Arc::ptr_eq(&copy, &crate::shadow::find(au, n).unwrap()));
+        crate::shadow::unregister(a, au);
+        crate::watch::title_memory_remapped(a, len);
+        crate::watch::title_memory_remapped(b, len);
     }
 
     /// With the gate on, a submission's write marks are taken on the GPU

@@ -9,8 +9,8 @@
 //!
 //! `VICTORY_MEMSYS=1` turns the new paths on ([`on`]); the counters are
 //! kept either way, so that a run without it gives the numbers to compare
-//! with ([`frame`]). Three more behaviours have a switch each that stands
-//! alone, off unless set: [`gating`], `alias::on` and `budget::on`.
+//! with ([`frame`]). Two more behaviours have a switch each that stands
+//! alone, off unless set: [`gating`] and `alias::on`.
 // The copy queue and the dirty set are wired with the gather; until then
 // only their tests use them, and parts of the ring and the gate.
 #![allow(dead_code)]
@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(windows)]
 pub(crate) mod diff;
+pub(crate) mod alias;
 pub(crate) mod dirty;
 pub(crate) mod gate;
 #[cfg(windows)]
@@ -327,9 +328,20 @@ pub(crate) enum N {
     MarksSnaps,
     MarksBytes,
     MarksNoRoom,
+    /// Buffers that took the copy of another showing the same physical
+    /// pages, and their bytes (a copy not made); buffers whose pages lie
+    /// in one physical run that got a copy of their own all the same;
+    /// buffers given a copy of their own again (a remap, a free).
+    AliasShared,
+    AliasSharedBytes,
+    AliasApart,
+    AliasParted,
+    /// Bytes of copies made for a buffer inside another buffer that has
+    /// a copy at the same addresses (counted with the switch on only).
+    AliasNestedBytes,
 }
 
-const NS: usize = N::MarksNoRoom as usize + 1;
+const NS: usize = N::AliasNestedBytes as usize + 1;
 /// Per class a count and bytes, then the [`N`]s.
 const TOTAL: usize = 2 * Class::COUNT + NS;
 
@@ -385,7 +397,9 @@ pub(crate) fn frame(frame: u64) {
          read-backs {:.2} {:.2}; pooled {:.2} {:.2}, no room in a pool {:.2}; marked pages {:.1}, compared with a twin {:.1}, \
          equal to it {:.1}, of them written to title memory all the same {:.2}, blocks of 256 bytes that differed \
          {:.1}, in the compare {:.2} ms; gate: labels {:.1}, not kept {:.2}, waits answered ahead {:.1}, left to a \
-         retire {:.1}, fence values held {:.2}; write marks taken for {:.1} submissions, {:.2} MiB, no room {:.2}",
+         retire {:.1}, fence values held {:.2}; write marks taken for {:.1} submissions, {:.2} MiB, no room {:.2}; buffers sharing \
+         the copy of the same physical pages {:.2}, {:.2} MiB not copied twice, with a copy of their own all the \
+         same {:.2}, parted again {:.2}, copies inside another at the same addresses {:.2} MiB",
         class(Class::Vram),
         class(Class::Bar),
         class(Class::Upload),
@@ -412,6 +426,11 @@ pub(crate) fn frame(frame: u64) {
         n(N::MarksSnaps),
         n(N::MarksBytes) / MIB,
         n(N::MarksNoRoom),
+        n(N::AliasShared),
+        n(N::AliasSharedBytes) / MIB,
+        n(N::AliasApart),
+        n(N::AliasParted),
+        n(N::AliasNestedBytes) / MIB,
     );
 }
 
@@ -467,7 +486,7 @@ mod tests {
         assert_eq!(after[2 * Class::InPlace as usize + 1] - before[2 * Class::InPlace as usize + 1], 7);
         let full = 2 * Class::COUNT + N::PoolFull as usize;
         assert!(after[full] - before[full] >= 5);
-        assert_eq!(N::MarksNoRoom as usize, NS - 1, "NS counts every N");
+        assert_eq!(N::AliasNestedBytes as usize, NS - 1, "NS counts every N");
     }
 
     /// What shows the title that work is done runs once the work's ticket

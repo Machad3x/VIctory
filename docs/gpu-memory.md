@@ -223,6 +223,27 @@ come back. The snapshot path pays for bringing every declared range back
 before its compare (several GB per frame here): it needs marks to
 benefit.
 
+## One copy per physical page
+
+The console maps one physical page at several title addresses (a pool
+view and a tiled heap, say). A copy per address range then holds the same
+bytes more than once, each refreshed from the same title memory.
+
+With `VICTORY_MEMSYS_ALIAS=1` (off unless set; not yet measured in a
+title) a buffer whose pages another buffer's copy already holds takes
+that copy, at the offset of its pages, and gets none of its own. The
+runtime reports where each run of title addresses lies in its own views
+of the physical sections (`title_memory_own`), which names the pages
+whatever addresses show them. The shader page table names the shared
+copy at both address ranges. A remap, a free or a release of the sharing
+buffer parts it from the copy again.
+
+A buffer shares only when all its pages lie in one physical run that the
+other copy holds whole, and never a copy in upload memory when shaders
+may write the buffer; textures and memory outside buffer objects keep
+copies of their own. The per-frame memory system line counts buffers
+sharing, the bytes not copied twice, and those parted again.
+
 ## Measuring a title
 
 The tests show the mechanism. Whether it pays off in a title depends on

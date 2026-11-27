@@ -66,6 +66,11 @@ pub(crate) struct Shadow {
     /// A window made for a persistent miss ([`demand`]): the frame it was
     /// made in, plus 1 (0: any other copy).
     demand: AtomicU64,
+    /// Other title addresses that show the copy's physical pages, of
+    /// buffers that share it (`crate::memsys::alias`): (first address,
+    /// bytes, the address in the copy's own range, still so). One that
+    /// ended stays: lists recorded with its addresses still run.
+    windows: std::sync::RwLock<Vec<(u64, u64, u64, bool)>>,
 }
 
 /// The video memory side of a mirrored copy.
@@ -352,14 +357,46 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// A title address of the copy's bytes as the address in the copy's
+    /// own range, and where the bytes it may be used with end there: its
+    /// own range's end, or the end of the window of another buffer that
+    /// shares the copy ([`Shadow::windows`]). An address in neither is
+    /// left as it is.
+    fn spans(&self, address: u64) -> (u64, u64) {
+        let end = self.start + self.len;
+        if address.wrapping_sub(self.start) <= self.len {
+            return (address, end);
+        }
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        // The newest first: a window made again at the same addresses.
+        match windows.iter().rev().find(|&&(at, len, ..)| address.wrapping_sub(at) <= len) {
+            Some(&(at, len, home, _)) => (home + (address - at), home + len),
+            None => (address, end),
+        }
+    }
+
+    /// [`Shadow::spans`]'s address: every range a list keeps for its
+    /// submission is in the copy's own addresses.
+    pub(crate) fn canon(&self, address: u64) -> u64 {
+        self.spans(address).0
+    }
+
+    /// The addresses of buffers that share the copy now: (first address,
+    /// bytes, the address in the copy's own range).
+    pub(crate) fn shared_at(&self) -> Vec<(u64, u64, u64)> {
+        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
+        windows.iter().filter(|w| w.3).map(|&(at, len, home, _)| (at, len, home)).collect()
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
-        self.gpu + (address - self.start)
+        self.gpu + (self.canon(address) - self.start)
     }
 
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
-        (self.start + self.len).saturating_sub(address)
+        let (address, end) = self.spans(address);
+        end.saturating_sub(address)
     }
 
     /// `n` dwords of the copy at title address `address` (tests).
@@ -425,7 +462,7 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.base
+        self.canon(address) - self.start + self.base
     }
 
     /// Where the title memory it copies starts, and its length.
@@ -444,6 +481,7 @@ impl Shadow {
     // shortcut: a page the copy holds only in part (at its ends) has no
     // "copied" mark and is compared without the title-write check.
     pub(crate) fn copy_back_page(&self, page: usize) -> usize {
+        let page = self.canon(page as u64) as usize;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
@@ -567,6 +605,7 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        let address = self.canon(address);
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -605,6 +644,7 @@ impl Shadow {
             vram,
             gone: std::sync::atomic::AtomicBool::new(false),
             demand: AtomicU64::new(0),
+            windows: std::sync::RwLock::default(),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -619,8 +659,15 @@ impl Shadow {
     /// left): such views declare what they write ([`Shadow::gpu_writes`]).
     pub(crate) fn mark_entry(&self, start: u64) -> Option<(u32, u32)> {
         let base = self.marks?;
+        let start = self.canon(start);
         let page = (start >> 16).checked_sub(self.start >> 16)?;
         Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
+    }
+
+    /// Whether title address `address` is in the copy's own range (not
+    /// one of a buffer that shares it).
+    fn owns(&self, address: u64) -> bool {
+        address.wrapping_sub(self.start) < self.len.max(1)
     }
 
     /// Whether it was made for a persistent miss ([`demand`]).
@@ -765,6 +812,8 @@ impl Shadow {
     /// so [`crate::watch::Tracked::take`] guards them for
     /// [`Shadow::copy_back_run`].
     pub(crate) fn page_range(&self, address: u64, len: u64) -> (u64, u64) {
+        // In the copy's own addresses (pages are the same pages there).
+        let address = self.canon(address);
         let end = self.start.saturating_add(self.len);
         let from = address.clamp(self.start, end);
         let to = address.saturating_add(len).clamp(from, end);
@@ -2166,6 +2215,135 @@ pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
     register_as(resource, start, len, true);
 }
 
+/// Copies of title buffers by where their pages lie in the runtime's own
+/// views (`crate::memsys::alias`: first byte there, bytes, the copy), and
+/// the buffers that share another buffer's copy: (key in [`BUFFERS`],
+/// bytes, the copy). Locked after [`BUFFERS`], and only while it is held.
+#[derive(Default)]
+struct Homes {
+    copies: BTreeMap<u64, (u64, std::sync::Weak<Shadow>)>,
+    sharing: Vec<((u64, usize), u64, std::sync::Weak<Shadow>)>,
+    /// The size of `copies` it is next pruned of dead entries at.
+    prune_at: usize,
+}
+
+static HOMES: Mutex<Homes> = Mutex::new(Homes { copies: BTreeMap::new(), sharing: Vec::new(), prune_at: 1024 });
+
+/// Buffers sharing another's copy now ([`Homes::sharing`]'s length).
+static SHARING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn homes() -> std::sync::MutexGuard<'static, Homes> {
+    HOMES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The copy of another buffer that holds the physical pages the buffer
+/// `key` of `len` bytes shows, at other addresses: the buffer shares it
+/// from now on (a window of the copy), and gets none of its own. None
+/// when its pages are not in one run, no copy holds them all, or the
+/// copy cannot serve it (in memory shaders must not write, for a buffer
+/// they may write).
+fn share(homes: &mut Homes, key: (u64, usize), len: u64, read_only: bool) -> Option<Arc<Shadow>> {
+    let own = crate::memsys::alias::home(key.0, len)?;
+    let (at, n, copy) = homes.copies.range(..=own).next_back().map(|(&at, (n, copy))| (at, *n, copy.upgrade()))?;
+    let Some(copy) = copy else {
+        homes.copies.remove(&at);
+        return None;
+    };
+    // The copy still stands for those pages at its own addresses.
+    if copy.gone.load(Ordering::Relaxed) || crate::memsys::alias::home(copy.start, copy.len) != Some(at) {
+        homes.copies.remove(&at);
+        return None;
+    }
+    let home = copy.start + (own.checked_sub(at)?);
+    if own + len <= at + n && home == key.0 {
+        // The same addresses: a buffer inside another's, not another
+        // view of its pages. It keeps a copy of its own; counted.
+        crate::memsys::add(crate::memsys::N::AliasNestedBytes, len);
+        return None;
+    }
+    if own + len > at + n || copy.upload.load(Ordering::Relaxed) && !read_only {
+        crate::memsys::add(crate::memsys::N::AliasApart, 1);
+        return None;
+    }
+    let mut windows = copy.windows.write().unwrap_or_else(|e| e.into_inner());
+    windows.retain(|w| w.0 != key.0 || w.1 != len);
+    windows.push((key.0, len, home, true));
+    drop(windows);
+    homes.sharing.push((key, len, Arc::downgrade(&copy)));
+    SHARING.store(homes.sharing.len(), Ordering::Relaxed);
+    crate::memsys::add(crate::memsys::N::AliasShared, 1);
+    crate::memsys::add(crate::memsys::N::AliasSharedBytes, len);
+    tracing::debug!(
+        at = format_args!("{:#x}", key.0),
+        len,
+        copy = format_args!("{:#x}", copy.start),
+        "a buffer shares the copy of its physical pages"
+    );
+    Some(copy)
+}
+
+/// A copy was made for the buffer at `start`: buffers showing the same
+/// physical pages elsewhere find it from now on ([`share`]).
+fn at_home(homes: &mut Homes, copy: &Arc<Shadow>) {
+    let Some(own) = crate::memsys::alias::home(copy.start, copy.len) else {
+        return;
+    };
+    if homes.copies.len() >= homes.prune_at {
+        homes.copies.retain(|_, (_, copy)| copy.strong_count() > 0);
+        homes.prune_at = (2 * homes.copies.len()).max(1024);
+    }
+    // The longer of two copies starting at the same page serves more.
+    if homes.copies.get(&own).is_none_or(|(n, old)| *n < copy.len || old.strong_count() == 0) {
+        homes.copies.insert(own, (copy.len, Arc::downgrade(copy)));
+    }
+}
+
+/// Buffers that share a copy part from it where `[at, at + len)` is the
+/// buffer's addresses or the copy's own: the buffer gets a copy of its
+/// own at its next use, and the window ends ([`Shadow::windows`]).
+fn part(map: &mut BTreeMap<(u64, usize), Entry>, at: u64, len: u64) {
+    if SHARING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let mut homes = homes();
+    let before = homes.sharing.len();
+    homes.sharing.retain(|&(key, n, ref copy)| {
+        let copy = copy.upgrade();
+        let hit = key.0 < end && at < key.0 + n || copy.as_ref().is_none_or(|c| c.start < end && at < c.start + c.len);
+        if hit {
+            if let Some(copy) = &copy {
+                if let Some(entry) = map.get_mut(&key)
+                    && entry.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, copy))
+                {
+                    entry.shadow = None;
+                }
+                let mut windows = copy.windows.write().unwrap_or_else(|e| e.into_inner());
+                windows.iter_mut().filter(|w| w.0 == key.0 && w.1 == n).for_each(|w| w.3 = false);
+            }
+            crate::memsys::add(crate::memsys::N::AliasParted, 1);
+        }
+        !hit
+    });
+    SHARING.store(homes.sharing.len(), Ordering::Relaxed);
+    if homes.sharing.len() != before {
+        drop(homes);
+        changed();
+    }
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: it shows
+/// other pages now (`crate::watch::title_memory_remapped`).
+pub(crate) fn remapped(at: u64, len: u64) {
+    if !crate::memsys::alias::on() {
+        return;
+    }
+    crate::memsys::alias::remapped(at, len);
+    if SHARING.load(Ordering::Relaxed) != 0 {
+        part(&mut buffers(), at, len);
+    }
+}
+
 fn register_as(resource: usize, start: u64, len: u64, read_only: bool) {
     let mut map = buffers();
     MAX_SPAN.fetch_max(len, Ordering::Relaxed);
@@ -2193,10 +2371,19 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     let removed = map.remove(&(start, resource));
     // Counted once the map has changed.
     OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
+    // A buffer sharing another's copy: that copy is not its to retire.
+    let end = removed.as_ref().map_or(start, |e| e.end);
+    let shared = removed.as_ref().and_then(|e| e.shadow.as_ref()).is_some_and(|copy| !copy.owns(start));
+    if shared {
+        // Its entry is gone: only the window ends.
+        part(&mut map, start, end - start);
+    }
     drop(map);
     if let Some(copy) = removed.and_then(|e| e.shadow) {
         changed();
-        retire(&copy);
+        if !shared {
+            retire(&copy);
+        }
     }
 }
 
@@ -2227,10 +2414,15 @@ fn retire(copy: &Arc<Shadow>) {
 pub(crate) fn freed(start: u64, len: u64) -> Freeing {
     let end = start.saturating_add(len);
     let gone = |copy: &Shadow| copy.gone.store(true, Ordering::Relaxed);
-    for (_, entry) in buffers().range((start, 0)..(end, 0)) {
-        if let Some(copy) = &entry.shadow {
-            gone(copy);
+    {
+        let mut map = buffers();
+        for (key, entry) in map.range((start, 0)..(end, 0)) {
+            // Not a copy the buffer shares: that one's memory stays.
+            if let Some(copy) = entry.shadow.as_ref().filter(|copy| copy.owns(key.0)) {
+                gone(copy);
+            }
         }
+        part(&mut map, start, len);
     }
     // Demand windows touching it go: one is made again once the page persists anew.
     // Recorded under the lock windows are made under, so none is missed.
@@ -2400,6 +2592,13 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return loose(address, end);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none() && crate::memsys::alias::on() {
+        // Another buffer's copy of the same physical pages, if any.
+        entry.shadow = share(&mut homes(), key, entry.end - key.0, entry.read_only);
+        if entry.shadow.is_some() {
+            changed();
+        }
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -2455,6 +2654,9 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow
             .upload
             .store(in_upload, std::sync::atomic::Ordering::Relaxed);
+        if crate::memsys::alias::on() {
+            at_home(&mut homes(), &shadow);
+        }
         entry.shadow = Some(shadow);
         changed();
     }
@@ -2852,7 +3054,13 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
+    // A copy other buffers share is named once, by its own buffer (or by
+    // none, once that one is released: then by the first that shares it).
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    if SHARING.load(Ordering::Relaxed) != 0 {
+        let mut seen = crate::fx::Set::default();
+        all.retain(|copy| seen.insert(Arc::as_ptr(copy) as usize));
+    }
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }

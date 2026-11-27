@@ -172,6 +172,8 @@ fn seen(view: &View) -> Option<Seen> {
         return None;
     }
     let len = len.min(shadow.left(address));
+    // In the copy's own addresses: the hull of its ranges is taken there.
+    let address = shadow.canon(address);
     Some(Seen::Buffer(shadow, address, len, uav))
 }
 
