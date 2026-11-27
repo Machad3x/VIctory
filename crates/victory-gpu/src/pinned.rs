@@ -40,14 +40,14 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
 /// unlocks released pages within milliseconds.
 const SETTLE: Duration = Duration::from_millis(100);
 
-// Holders: none yet at title addresses but the tests here (title memory in
-// place opens our own views of sections, which the title never changes:
-// `crate::inplace::title_memory_own_gone` handles their going). A
-// private-memory backstop would register here.
+// Holders: the runs over the title's private memory
+// (`crate::inplace`, `VICTORY_RT_MEMORY`), registered before their heaps are
+// opened and until those are gone. Runs over our own views of sections are
+// not: the title never changes those views
+// (`crate::inplace::title_memory_own_gone` handles their going).
 
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type Release = Box<dyn FnOnce() + Send>;
 
 /// A registered range, given back with [`Pin::forget`] when its holder lets
@@ -55,7 +55,6 @@ pub(crate) type Release = Box<dyn FnOnce() + Send>;
 #[must_use = "a pin forgotten by dropping stays registered until released"]
 pub(crate) struct Pin(u64);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Pin {
     /// The holder let its range go by itself: nothing to release any more.
     pub(crate) fn forget(self) {
@@ -111,7 +110,6 @@ fn pins() -> Guard {
 }
 
 /// Registers that `[at, at + len)` is held in place, and how to let it go.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pin(at: usize, len: usize, release: Release) -> Pin {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let end = at.saturating_add(len);

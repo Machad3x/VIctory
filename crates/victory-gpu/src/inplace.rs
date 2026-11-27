@@ -185,6 +185,9 @@ impl Drop for Run {
             // The heap goes right after: the system unlocks the pages.
             locked_ranges().remove(&(self.at, self.id));
             LOCKED.fetch_sub(1, Ordering::Relaxed);
+            // Registered until now, let go or not: a change of the title's
+            // meanwhile waits for the tables to drop it.
+            unpin(self.id);
         }
     }
 }
@@ -673,6 +676,18 @@ fn open_run(at: usize, len: usize, private: bool) {
         with_runs(|r| finish(r, at, len, None));
         return;
     }
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    if private {
+        // Locked and registered before the heap is opened: a guard is not
+        // set there meanwhile, and a change of the title's there waits for
+        // the open to end ([`release_private`] takes [`PRIVATE_OPENING`]) and lets
+        // the run go, instead of meeting the pages locked with nothing to
+        // release.
+        locked_ranges().insert((start, id), start + bytes);
+        LOCKED.fetch_add(1, Ordering::Relaxed);
+        let pin = crate::pinned::pin(start, bytes, Box::new(move || release_private(start, id)));
+        PINS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, pin);
+    }
     let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
         // SAFETY: our own view of sections whose pages the title's views
         // committed: commits nothing new.
@@ -684,14 +699,14 @@ fn open_run(at: usize, len: usize, private: bool) {
     let run = match opened {
         Ok((heap, buffer)) => {
             crate::host::name(&buffer, || format!("title memory in place {start:#x}+{bytes:#x}"));
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            if private {
-                locked_ranges().insert((start, id), start + bytes);
-                LOCKED.fetch_add(1, Ordering::Relaxed);
-            }
             Arc::new(Run { id, at: start, len: bytes, buffer, private, _heap: heap })
         }
         Err(error) => {
+            if private {
+                locked_ranges().remove(&(start, id));
+                LOCKED.fetch_sub(1, Ordering::Relaxed);
+                unpin(id);
+            }
             with_runs(|r| {
                 finish(r, at, len, None);
                 r.refused.insert((at, len));
@@ -702,22 +717,18 @@ fn open_run(at: usize, len: usize, private: bool) {
             return;
         }
     };
-    let id = run.id;
     STATS[5].fetch_add(1, Ordering::Relaxed);
     STATS[6].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     let Some(old) = with_runs(|r| finish(r, at, len, Some((start, run, over)))) else {
         return;
     };
     if private {
-        // The runs it replaces are let go with it from now on.
-        for run in old.iter().filter(|run| run.private) {
-            PRIVATE_OPEN.fetch_sub(1, Ordering::Relaxed);
-            unpin(run.id);
-        }
+        // The runs it replaces stay registered until their heaps go (their
+        // drop): a change of the title's there drops them from the tables.
+        let replaced = old.iter().filter(|run| run.private).count();
+        PRIVATE_OPEN.fetch_sub(replaced, Ordering::Relaxed);
         PRIVATE_OPEN.fetch_add(1, Ordering::Relaxed);
         RT[0].fetch_add(1, Ordering::Relaxed);
-        let pin = crate::pinned::pin(start, bytes, Box::new(move || release_private(start, id)));
-        PINS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, pin);
     }
     drop(old);
     GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -788,12 +799,19 @@ fn forget_private(start: usize, id: u64) -> Option<Arc<Run>> {
 fn release_private(start: usize, id: u64) {
     // Released by the registry: nothing to forget there.
     PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
-    let Some(run) = forget_private(start, id) else {
-        return;
+    // An open under way ends first (it registered before opening), and its
+    // run is forgotten here. Not held while waiting for the tables below:
+    // their holder may wait for the opening thread.
+    let run = {
+        let _opening = PRIVATE_OPENING.lock().unwrap_or_else(|e| e.into_inner());
+        forget_private(start, id)
     };
-    RT[2].fetch_add(1, Ordering::Relaxed);
-    drop(run);
-    // And the runs it replaced, if tables still name them.
+    if let Some(run) = run {
+        RT[2].fetch_add(1, Ordering::Relaxed);
+        drop(run);
+    }
+    // It, or a run let go for a tracker whose heap a table still holds, and
+    // the runs it replaced.
     crate::memory::drop_runs_wait(&dead());
 }
 
@@ -801,7 +819,9 @@ fn release_private(start: usize, id: u64) {
 /// private memory holding part of it are let go (their pages cannot be
 /// protected). Never waits: the page tables drop them at their next
 /// rewrite, and until the heaps are gone the pages stay [`locked`] and
-/// unguarded. One atomic load while none is open.
+/// unguarded; their registration with `crate::pinned` stays until then, so
+/// that a change of the title's there still waits for the heaps to go. One
+/// atomic load while none is open.
 pub(crate) fn make_way(at: usize, len: usize) {
     if PRIVATE_OPEN.load(Ordering::Relaxed) == 0 || len == 0 {
         return;
@@ -816,7 +836,6 @@ pub(crate) fn make_way(at: usize, len: usize) {
     });
     for (start, id) in hit {
         if forget_private(start, id).is_some() {
-            unpin(id);
             RT[1].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1282,9 +1301,10 @@ mod tests {
     fn a_title_protect_over_an_open_private_run_lets_it_go_first() {
         use windows_sys::Win32::System::Memory as mem;
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
-        if crate::host::host().is_none() {
-            return; // no host GPU here
-        }
+        let Some(host) = crate::host::host() else {
+            eprintln!("SKIPPED a_title_protect_over_an_open_private_run_lets_it_go_first: no host GPU here");
+            return;
+        };
         let len = 4 * PAGE;
         // Private memory as `xmem` makes the title's heaps.
         // SAFETY: plain allocation, freed below.
@@ -1310,8 +1330,13 @@ mod tests {
         assert!(run_for(at, len, true).is_none(), "asked of the worker");
         assert!(wait_private(), "the worker opened it or was refused");
         let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) else {
+            // Not open: only if the host itself refuses such a heap (a
+            // driver or Windows without `ID3D12Device13`), said out loud.
+            let direct = open_at(&host.device, at, len).map(drop);
+            assert!(direct.is_err(), "the host opens private memory in place, the worker did not");
             assert_ne!(free(), 0);
-            return; // the host does not open private memory in place
+            eprintln!("SKIPPED a_title_protect_over_an_open_private_run_lets_it_go_first: the host does not open private memory in place ({direct:?})");
+            return;
         };
         let id = run.id;
         // Lists ran with a layout naming it, and their table was rewritten
@@ -1349,9 +1374,22 @@ mod tests {
         assert_eq!(info.Protect, mem::PAGE_READONLY);
         assert!(!locked(at / PAGE) || with_runs(|r| holding(&r.open, at, len)).is_some(), "locked only by an open run");
         assert_ne!(crate::pinned::title_memory_change(at, PAGE, || protect(mem::PAGE_READWRITE)), 0);
-        // Not opened again while a tracker would guard it: nothing holds it.
-        make_way(at, len);
-        assert_ne!(free(), 0, "and freed");
+        // Open again and let go for a tracker while a layout lists ran with
+        // still holds its heap: the pages stay locked, and the title's free
+        // still lets the heap go first.
+        assert!(run_for(at, len, true).is_none());
+        assert!(wait_private());
+        if let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) {
+            let id = run.id;
+            crate::memory::ran_with(key, run);
+            make_way(at, len);
+            assert!(with_runs(|r| holding(&r.open, at, len)).is_none(), "let go for the tracker");
+            assert!(locked(at / PAGE), "its heap lives in the layout");
+            assert_ne!(free(), 0, "the heap let go first, then freed");
+            assert!(!crate::memory::ran_names(id));
+        } else {
+            assert_ne!(free(), 0, "and freed");
+        }
     }
 
     #[test]
