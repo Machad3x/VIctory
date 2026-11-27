@@ -179,6 +179,49 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+/// What a [`Ticket`] borrows, kept by [`Host::submit`]'s caller until the
+/// ticket is retired.
+#[derive(Default)]
+pub(crate) struct Sending {
+    uploads: Option<crate::bindless::Uploads>,
+    snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+}
+
+/// A submission sent to the host GPU, its last group not yet waited for
+/// and nothing settled ([`Host::submit`], [`Host::retire`]); it holds the
+/// submission lock.
+pub(crate) struct Ticket<'a> {
+    submitted: std::sync::MutexGuard<'a, u64>,
+    started: std::time::Instant,
+    #[cfg(feature = "diagnostics")]
+    flight: Option<crate::copystat::Flight>,
+    #[cfg(feature = "diagnostics")]
+    sync_heaps_ns: u64,
+    #[cfg(feature = "diagnostics")]
+    traced: bool,
+    #[cfg(feature = "diagnostics")]
+    clock: Option<&'a crate::gpumeasure::Clock>,
+    /// Flight study: when the first lists went to the card.
+    #[cfg(feature = "diagnostics")]
+    sent: Option<std::time::Instant>,
+    heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    runs: Vec<&'a HostList>,
+    /// Kept until they have run.
+    lists: Vec<Option<ID3D12CommandList>>,
+    groups: usize,
+    snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    batch: Batch,
+    prepared: std::time::Instant,
+    riding: Option<Option<Riding<'a>>>,
+    /// The pull ran and was waited for with the last group.
+    pulled: bool,
+    removed_in: Option<usize>,
+    /// A wait that failed: query results may not be resolved yet.
+    unwaited: bool,
+    /// The last group sent: its index, when, and its fence wait's setup.
+    last: Option<(usize, std::time::Instant, windows::core::Result<()>)>,
+}
+
 /// How a wait for a submission ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Waited {
@@ -592,6 +635,28 @@ pub(crate) mod tests {
         host.copy_now(&[(&dst, 0, &src, 0, 4)]);
         // SAFETY: as above, the copy waited for.
         assert_eq!(unsafe { std::slice::from_raw_parts(d, 4) }, [0xAB; 4]);
+    }
+
+    /// A sent submission holds the submission lock and leaves its
+    /// bottom-of-pipe write undone until it is retired.
+    #[test]
+    fn a_sent_submission_settles_when_retired() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let word = Box::new(std::cell::Cell::new(0u64));
+        let list = host.new_list().unwrap();
+        list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
+        list.close();
+        let mut sending = super::Sending::default();
+        let ticket = host.submit(&[&list], &mut sending);
+        let value = *ticket.submitted;
+        assert_eq!(word.get(), 0, "written when settled");
+        assert!(host.submitted.try_lock().is_err(), "held until settled");
+        host.retire(ticket);
+        assert_eq!(word.get(), 7);
+        // SAFETY: a plain query.
+        assert!(unsafe { host.fence.GetCompletedValue() } >= value);
     }
 
     /// Keeps submissions off while held: for tests of what one takes from
@@ -1581,9 +1646,18 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        let mut sending = Sending::default();
+        let ticket = self.submit(runs, &mut sending);
+        self.retire(ticket);
+    }
+
+    /// Prepares closed lists and sends them to the host GPU; the last group
+    /// is waited for and settled by [`Host::retire`].
+    pub(crate) fn submit<'a>(&'a self, runs: &[&'a HostList], sending: &'a mut Sending) -> Ticket<'a> {
+        let Sending { uploads: kept_uploads, snapshots: kept_snapshots } = sending;
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1592,7 +1666,7 @@ impl Host {
         // Flight study: whether this is a title submission, and what came
         // between it and the one before.
         #[cfg(feature = "diagnostics")]
-        let mut flight = crate::copystat::flight_begin();
+        let flight = crate::copystat::flight_begin();
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
         crate::resource::evict_unused();
@@ -1640,18 +1714,19 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        let uploads = (!heaps.is_empty() || !textures.is_empty())
+        *kept_uploads = (!heaps.is_empty() || !textures.is_empty())
             .then(|| crate::bindless::uploads(&heaps, &textures))
             .flatten();
+        let uploads: &'a Option<crate::bindless::Uploads> = kept_uploads;
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let runs: Vec<&HostList> = uploads
+        let all: Vec<&'a HostList> = uploads
             .as_ref()
             .map(|u| u.list())
             .into_iter()
             .chain(runs.iter().copied())
             .collect();
-        let runs = &runs[..];
+        let runs = &all[..];
         // A frame `crate::capture` lists: every command of every list, in
         // the order the GPU runs them (with `VICTORY_D3D12_DRED`, which
         // notes them).
@@ -1676,7 +1751,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         // Snapshots of copies in video memory read their mirrors: brought up
         // to date at once, and kept so until the copy-backs.
-        let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
+        *kept_snapshots = runs
             .iter()
             .flat_map(|l| {
                 l.deferred()
@@ -1691,7 +1766,8 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
-        crate::shadow::snapshots_ahead(&snapshots);
+        let snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] = kept_snapshots;
+        crate::shadow::snapshots_ahead(snapshots);
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         {
@@ -1728,17 +1804,17 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let groups: Vec<std::ops::Range<usize>> = if timing() {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                .map(|(&a, &b)| a..b)
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![0..lists.len()]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [0..lists.len()];
         // Clear read marks of slots forgotten before this submission (placed
         // textures written or evicted) so reads in it are not wiped after it.
         crate::shadow::clear_forgotten_reads();
@@ -1750,127 +1826,175 @@ impl Host {
         // fence wait covers both. Recorded now: the stale bits it clears
         // are set again by any refresh after, and video memory written
         // before is seen by the copies.
-        let mut riding = if pull_same_execute() && !snapshots.is_empty() {
-            self.pull_riding(&snapshots)
+        let riding = if pull_same_execute() && !snapshots.is_empty() {
+            self.pull_riding(snapshots)
         } else {
             None
         };
         // The pull ran and was waited for with the last group.
-        let mut pulled = matches!(riding, Some(None));
-        let mut removed_in = None;
-        // A wait that failed: query results may not be resolved yet.
-        let mut unwaited = false;
-        // Flight study: when the first lists went to the card.
-        #[cfg(feature = "diagnostics")]
-        let mut sent: Option<std::time::Instant> = None;
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let mut ended = Waited::Done;
+        let pulled = matches!(riding, Some(None));
+        let mut t = Ticket {
+            groups: groups.len(),
+            submitted,
+            started,
+            #[cfg(feature = "diagnostics")]
+            flight,
+            #[cfg(feature = "diagnostics")]
+            sync_heaps_ns,
+            #[cfg(feature = "diagnostics")]
+            traced,
+            #[cfg(feature = "diagnostics")]
+            clock,
+            #[cfg(feature = "diagnostics")]
+            sent: None,
+            heaps,
+            runs: all,
+            lists,
+            snapshots,
+            batch,
+            prepared,
+            riding,
+            pulled,
+            removed_in: None,
+            unwaited: false,
+            last: None,
+        };
+        for (i, group) in groups.into_iter().enumerate() {
+            *t.submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
+            crate::resource::life::note(0, crate::resource::life::SUBMITTED, *t.submitted, 0);
             #[cfg(feature = "diagnostics")]
-            if sent.is_none() {
-                crate::copystat::flight_sent(&mut flight);
-                sent = Some(std::time::Instant::now());
+            if t.sent.is_none() {
+                crate::copystat::flight_sent(&mut t.flight);
+                t.sent = Some(std::time::Instant::now());
             }
-            let last = i + 1 == groups.len();
+            let last = i + 1 == t.groups;
             // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                if last && let Some(Some(r)) = &mut riding {
+            let waited = unsafe {
+                self.queue.ExecuteCommandLists(&t.lists[group]);
+                if last && let Some(Some(r)) = &mut t.riding {
                     self.queue.ExecuteCommandLists(&[Some(r.list.clone())]);
                     r.guard.busy = true;
-                    r.guard.value = *submitted;
+                    r.guard.value = *t.submitted;
                 }
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        ended = wait_for_submission(
-                            // The event is auto-reset and shared: an earlier wait's
-                            // signal may wake this one (#2899).
-                            || {
-                                WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT
-                                    && self.fence.GetCompletedValue() >= *submitted
-                            },
-                            || self.device.GetDeviceRemovedReason().is_err(),
-                            |secs| {
-                                tracing::warn!(
-                                    secs,
-                                    lists = runs.len(),
-                                    "host submission still on the GPU"
-                                );
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        unwaited = true;
-                        tracing::warn!(error = %e, "host submission not waited for");
-                    }
-                }
+                self.queue
+                    .Signal(&self.fence, *t.submitted)
+                    .and_then(|()| self.fence.SetEventOnCompletion(*t.submitted, self.event))
+            };
+            // The last group is waited for when the ticket is retired.
+            if last {
+                t.last = Some((i, started, waited));
+                break;
             }
-            match ended {
-                Waited::Done => {}
-                // Nothing more runs on a removed device; reported below.
-                Waited::Removed => {
-                    if groups.len() > 1 && removed_in.is_none() {
-                        removed_in = Some(i);
-                    }
-                    break;
-                }
-                Waited::Stalled => fail(format_args!(
-                    "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
-                     no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
-                     names a fault){}",
-                    runs.len(),
-                    last_notes(runs)
-                )),
+            if !self.end_group(&mut t, i, started, waited) {
+                break;
             }
-            // `ended` stays `Done` when the wait could not be set up.
-            if last
-                && !unwaited
-                && matches!(ended, Waited::Done)
-                && let Some(Some(r)) = &mut riding
-            {
-                r.guard.busy = false;
-                pulled = true;
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::PullsRiding, 1);
-            }
-            #[cfg(feature = "diagnostics")]
-            crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
-            #[cfg(feature = "diagnostics")]
-            if let Some(clock) = clock
-                && !unwaited
-            {
-                clock.add(started.elapsed());
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX));
-            }
-            #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
-                }
-            }
-            // SAFETY: a plain query.
-            if groups.len() > 1 && removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
-                removed_in = Some(i);
-            }
-            let _ = (i, started);
         }
-        let _ = &firsts;
+        t
+    }
+
+    /// Waits for group `i` of a ticket, sent at `started`: false when the
+    /// device is gone and no more of it may run.
+    fn end_group(&self, t: &mut Ticket<'_>, i: usize, started: std::time::Instant, waited: windows::core::Result<()>) -> bool {
+        let mut ended = Waited::Done;
+        let last = i + 1 == t.groups;
+        // SAFETY: the fence and event are ours.
+        unsafe {
+            match waited {
+                Ok(()) => {
+                    ended = wait_for_submission(
+                        // The event is auto-reset and shared: an earlier wait's
+                        // signal may wake this one (#2899).
+                        || {
+                            WaitForSingleObject(self.event, WAIT_SLICE_MS) != WAIT_TIMEOUT
+                                && self.fence.GetCompletedValue() >= *t.submitted
+                        },
+                        || self.device.GetDeviceRemovedReason().is_err(),
+                        |secs| {
+                            tracing::warn!(
+                                secs,
+                                lists = t.runs.len(),
+                                "host submission still on the GPU"
+                            );
+                        },
+                    );
+                }
+                Err(e) => {
+                    t.unwaited = true;
+                    tracing::warn!(error = %e, "host submission not waited for");
+                }
+            }
+        }
+        match ended {
+            Waited::Done => {}
+            // Nothing more runs on a removed device; reported below.
+            Waited::Removed => {
+                if t.groups > 1 && t.removed_in.is_none() {
+                    t.removed_in = Some(i);
+                }
+                return false;
+            }
+            Waited::Stalled => fail(format_args!(
+                "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
+                 no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
+                 names a fault){}",
+                t.runs.len(),
+                last_notes(&t.runs)
+            )),
+        }
+        // `ended` stays `Done` when the wait could not be set up.
+        if last
+            && !t.unwaited
+            && matches!(ended, Waited::Done)
+            && let Some(Some(r)) = &mut t.riding
+        {
+            r.guard.busy = false;
+            t.pulled = true;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PullsRiding, 1);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::resource::life::note(0, crate::resource::life::RAN, *t.submitted, 0);
+        #[cfg(feature = "diagnostics")]
+        if let Some(clock) = t.clock
+            && !t.unwaited
+        {
+            clock.add(started.elapsed());
+        }
+        #[cfg(feature = "diagnostics")]
+        if t.groups > 1 {
+            // SAFETY: a plain query.
+            let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+            gpu_times(started.elapsed(), &t.runs[i].slowest(frequency, usize::MAX));
+        }
+        #[cfg(feature = "diagnostics")]
+        if t.groups > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            // SAFETY: a plain query.
+            let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+            let commands = t.runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+            for (ms, op) in t.runs[i].slowest(frequency, 6) {
+                tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            }
+        }
+        // SAFETY: a plain query.
+        if t.groups > 1 && t.removed_in.is_none() && unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            t.removed_in = Some(i);
+        }
+        let _ = (i, started);
+        true
+    }
+
+    /// Waits for a submission [`Host::submit`] sent and settles it: what
+    /// shaders wrote goes back to title memory, then the deferred copies,
+    /// work and bottom-of-pipe writes.
+    pub(crate) fn retire(&self, mut t: Ticket<'_>) {
+        if let Some((i, started, waited)) = t.last.take() {
+            self.end_group(&mut t, i, started, waited);
+        }
+        let Ticket { submitted, started, heaps, runs, snapshots, batch, prepared, mut riding, pulled, removed_in, unwaited, .. } = t;
+        let runs = &runs[..];
         // The riding copies ran, or never will: their pages unlock before
         // anything here reads a mirror. Not waited for, they may run later:
         // their pages stay stale.
@@ -2072,8 +2196,8 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        if let Some(f) = flight {
-            let sent = sent.unwrap_or(waited_at);
+        if let Some(f) = t.flight {
+            let sent = t.sent.unwrap_or(waited_at);
             let ns = |d: std::time::Duration| d.as_nanos() as u64;
             // What the next submission would wait for: the shaders' ranges,
             // late copies' destinations, bottom-of-pipe writes.
@@ -2092,7 +2216,7 @@ impl Host {
                 batch.flight_touched,
                 batch.flight_real,
                 batch.flight_shared,
-                [ns(sent - started), sync_heaps_ns, ns(waited_at - sent), ns(copying.elapsed())],
+                [ns(sent - started), t.sync_heaps_ns, ns(waited_at - sent), ns(copying.elapsed())],
                 writes,
                 copies,
             );
@@ -2105,7 +2229,7 @@ impl Host {
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
-        if traced {
+        if t.traced {
             let sub = *submitted;
             drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
