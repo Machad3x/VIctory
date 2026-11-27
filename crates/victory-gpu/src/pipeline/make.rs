@@ -263,6 +263,27 @@ pub(crate) fn begin(p: &Arc<Pending>) {
     }
 }
 
+/// Queues `p` ahead of the others (as a dispatch waiting for it) and waits
+/// until it is made or refused, or `until`; no frame's budget counts it.
+/// [`state`] then.
+pub(crate) fn wait_made(p: &Arc<Pending>, until: Instant) -> Option<bool> {
+    if p.made.get().is_none() && !p.shaders.is_empty() {
+        start(p, true);
+        WAITERS.fetch_add(1, Ordering::Relaxed);
+        let (lock, done) = &DONE;
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() {
+            let rest = until.saturating_duration_since(Instant::now());
+            if rest.is_zero() {
+                break;
+            }
+            held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        drop(held);
+        WAITERS.fetch_sub(1, Ordering::Relaxed);
+    }
+    state(p)
+}
 /// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
 /// translated (`Some(false)`), or not yet (`None`); never waits.
 pub(crate) fn state(p: &Pending) -> Option<bool> {

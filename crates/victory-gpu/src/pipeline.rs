@@ -333,12 +333,14 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use make::take_compute_waits;
 
-/// Whether a dispatch with the title pipeline is held back: it is the
-/// acceleration-structure builder's, which does not run this frame
-/// ([`builder::runs`]).
+/// Before a dispatch with the title pipeline: if it is the acceleration-
+/// structure builder's, waits for every pipeline of the builder's
+/// ([`builder::wait_for_pipelines`]). Never holds the dispatch back.
 #[cfg(windows)]
-pub(crate) fn held_back(this: This) -> bool {
-    !this.is_null() && pipeline(this).builder && !builder::runs()
+pub(crate) fn wait_for_builder(this: This) {
+    if !this.is_null() && pipeline(this).builder {
+        builder::wait_for_pipelines();
+    }
 }
 
 /// Whether the title pipeline is one of the acceleration-structure
@@ -349,8 +351,7 @@ pub(crate) fn is_builder(this: This) -> bool {
 }
 
 /// A dispatch with the title pipeline was not run on the host (`why`): one
-/// of the acceleration-structure builder's holds the builder back
-/// ([`builder::dropped`]).
+/// of the acceleration-structure builder's is said ([`builder::dropped`]).
 #[cfg(windows)]
 pub(crate) fn not_dispatched(this: This, why: &str) {
     if !this.is_null() && pipeline(this).builder {
@@ -886,10 +887,9 @@ mod tests {
     }
 
     /// A compute pipeline the acceleration-structure builder creates (its
-    /// bytecode in the builder's image) is known as the builder's, and its
-    /// dispatches are held back while its host pipeline is not made: here
-    /// never, as its bytes are no shader container. Pipelines of other
-    /// code are never held back.
+    /// bytecode in the builder's image) is known as the builder's and made
+    /// at once; one refused (its bytes are no shader container) holds no
+    /// builder dispatch back: the wait for the builder's pipelines ends.
     #[cfg(windows)]
     #[test]
     fn builder_dispatches_wait_for_every_builder_pipeline() {
@@ -927,11 +927,10 @@ mod tests {
         });
         assert!(refused, "the builder's pipeline was started");
         assert_eq!(make::state(&pipeline(p).host), Some(false));
-        assert!(
-            held_back(p),
-            "one builder pipeline missing: the builder waits"
-        );
-        assert!(!held_back(other));
+        // Refused: nothing left to wait for, for it or for the others.
+        wait_for_builder(p);
+        wait_for_builder(other);
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
         for q in [p, other] {
             slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
         }
@@ -974,52 +973,38 @@ mod tests {
         )
     }
 
-    /// A dispatch of a made builder pipeline that is dropped all the same
-    /// (as `State::bind` drops one whose root view offset it cannot place)
-    /// holds the builder back at once and in later frames, until the title
-    /// releases that pipeline.
+    /// A dispatch of the builder's waits for every pipeline the builder has
+    /// created, those no dispatch used yet too, instead of being held back
+    /// (gpu307: a held-back builder left its submission's later waits
+    /// unmet, and the title's watchdog ended the run); a dropped one holds
+    /// nothing back after it.
     #[cfg(windows)]
     #[test]
-    fn a_dropped_builder_dispatch_holds_the_builder() {
+    fn a_builder_dispatch_waits_for_every_builder_pipeline() {
         let _one = builder::test_lock();
         let image = [0xB0u8; 64];
         builder::note_title_dll("XboxBvhBuilder.dll", image.as_ptr() as usize, image.len());
-        let mut p: This = std::ptr::null();
-        assert_eq!(
-            hand_out(
-                vec![ending_shader()],
-                None,
-                &[image.as_ptr()],
-                &PIPELINE_IIDS[0],
-                &mut p
-            ),
-            S_OK
-        );
+        let make_one = || {
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                hand_out(vec![ending_shader()], None, &[image.as_ptr()], &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        let (p, q) = (make_one(), make_one());
         builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
-        let release = || slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
-        assert!(pipeline(p).builder);
-        let made = (0..500).find_map(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            make::state(&pipeline(p).host)
-        });
-        if made != Some(true) {
-            release();
-            return; // no host GPU here
-        }
-        assert!(
-            !held_back(p),
-            "every builder pipeline made: the builder runs"
-        );
-        not_dispatched(
-            p,
-            "a root view's offset: no root view, or outside title buffers",
-        );
-        assert!(held_back(p), "held back for the rest of the frame");
-        builder::forget_decision();
-        assert!(held_back(p), "and in later frames");
-        release();
-        builder::forget_decision();
-        assert!(builder::runs(), "the pipeline released: the hold is lifted");
+        let release = |x: This| slot::<extern "system" fn(This) -> u32>(x, 0x10)(x);
+        assert!(pipeline(p).builder && pipeline(q).builder);
+        // The first dispatch of `p`: `q`, never dispatched, is waited for.
+        wait_for_builder(p);
+        let states = [make::state(&pipeline(p).host), make::state(&pipeline(q).host)];
+        assert!(states.iter().all(Option::is_some), "both made or refused: {states:?}");
+        not_dispatched(p, "a root view's offset: no root view, or outside title buffers");
+        // Nothing held back: the next dispatch waits for nothing.
+        wait_for_builder(q);
+        release(p);
+        release(q);
     }
 
     #[test]

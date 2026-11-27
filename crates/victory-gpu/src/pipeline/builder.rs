@@ -1,24 +1,27 @@
-//! The title's acceleration-structure builder runs whole or not at all.
+//! The title's acceleration-structure builder waits for its pipelines.
 //!
 //! `XboxBvhBuilder.dll` builds and refits the ray-tracing structures in
 //! title memory every frame through some fifty compute programs, one
-//! dispatch after another. A dispatch whose host pipeline is missing is
-//! dropped on its own (`State::dispatch`), and some of the builder's are
-//! missing for a long time or for good: refused (64-lane waves on a host of
-//! 32-lane waves), not translated, or still being made. The stages that do
-//! run then work on what the missing ones never wrote, and write the result
-//! into title memory: on fxceless/victory-fork, garbage bounds that crashed
-//! the title. So the builder's dispatches run only in frames where every
-//! pipeline it has created has its host pipeline; otherwise none of them
-//! run (the structures keep what they held). A dispatch of a made pipeline
-//! can still be dropped (`State::bind` fails, say): that holds the builder
-//! back at once, for the rest of the frame and while that pipeline lives.
+//! dispatch after another, and the title's queues wait on what follows
+//! them. A dispatch whose host pipeline is not made within the frame's
+//! budget is dropped (`State::dispatch`), and with a cold pipeline cache
+//! many of the builder's are still being made when it first runs: the
+//! stages that run then work on what the dropped ones never wrote.
+//!
+//! So a builder dispatch first waits for every pipeline the builder has
+//! created, queued ahead of all others, up to [`WAIT`] a frame (below the
+//! title's 30 s watchdog): its frames run whole. Nothing is held back: a
+//! frame that would skip the builder's dispatches leaves what comes after
+//! them in its submission (labels, cross-queue waits) waiting on work that
+//! never ran, and the title's watchdog ends the run (gpu307). A pipeline
+//! refused for good, or one not made within [`WAIT`], still drops its own
+//! dispatches only, said once.
 //!
 //! Its pipelines are known by where they come from: created by its code (a
 //! return address in its image on the stack) or from bytecode in its image.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use super::make::{self, Pending};
 
@@ -79,138 +82,98 @@ fn callers() -> Vec<usize> {
     Vec::new()
 }
 
-/// One of the builder's pipelines (alive while the title holds it), and
-/// whether a dispatch of it was dropped though it is made.
-struct Noted {
-    pipeline: Weak<Pending>,
-    dropped: bool,
-}
+/// The builder's pipelines (alive while the title holds them).
+static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
 
-/// The builder's pipelines.
-static PIPELINES: Mutex<Vec<Noted>> = Mutex::new(Vec::new());
+/// The longest the builder's dispatches of one frame wait for its
+/// pipelines, below the title's 30 s watchdog.
+pub(crate) const WAIT: Duration = Duration::from_secs(20);
 
-/// The builder created pipeline `p`: it counts towards [`runs`], and is
-/// made at once (no frame's wait budget holds it back).
+/// The builder created pipeline `p`: its dispatches wait for it
+/// ([`wait_for_pipelines`]), and it is made at once.
 pub(crate) fn note(p: &Arc<Pending>) {
-    PIPELINES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(Noted {
-            pipeline: Arc::downgrade(p),
-            dropped: false,
-        });
+    PIPELINES.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(p));
     make::begin(p);
 }
 
-/// A dispatch of the builder's pipeline `p` was not run on the host
-/// (`why`): none of the builder's dispatches run for the rest of the frame.
-/// If `p` is made, none run while it lives either; one not made yet holds
-/// the builder back through [`runs`] until it is.
-pub(crate) fn dropped(p: &Arc<Pending>, why: &str) {
-    let frame = crate::frame::current();
-    let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
-    if decided.0 == frame {
-        decided.1 = false;
+/// A dispatch of the builder's pipeline `p` was not run on the host (`why`):
+/// said, the first times. Nothing else of the builder is held back.
+pub(crate) fn dropped(_p: &Arc<Pending>, why: &str) {
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        tracing::warn!(frame = crate::frame::current(), why, "a dispatch of the BVH builder was not run");
     }
-    if make::state(p) != Some(true) {
+}
+
+/// Before a dispatch of the builder's: waits until every pipeline it has
+/// created is made or refused, queued ahead of the others, for what is
+/// left of [`WAIT`] in this frame. One lock and a scan once all are made.
+pub(crate) fn wait_for_pipelines() {
+    let unmade: Vec<Arc<Pending>> = {
+        let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
+        pipelines.retain(|p| p.strong_count() > 0);
+        pipelines.iter().filter_map(Weak::upgrade).filter(|p| make::state(p).is_none()).collect()
+    };
+    if unmade.is_empty() {
         return;
     }
-    let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(n) = pipelines
-        .iter_mut()
-        .find(|n| std::ptr::eq(n.pipeline.as_ptr(), Arc::as_ptr(p)) && !n.dropped)
-    {
-        n.dropped = true;
-        tracing::warn!(
-            frame,
-            why,
-            "BVH builder held back: a dispatch of it was dropped"
-        );
+    let left = left_in_frame(crate::frame::current(), Duration::ZERO);
+    if left.is_zero() {
+        return;
     }
+    let started = Instant::now();
+    let until = started + left;
+    for p in &unmade {
+        make::wait_made(p, until);
+    }
+    let waited = started.elapsed();
+    left_in_frame(crate::frame::current(), waited);
+    let still = unmade.iter().filter(|p| make::state(p).is_none()).count();
+    let refused = unmade.iter().filter(|p| make::state(p) == Some(false)).count();
+    tracing::info!(
+        frame = crate::frame::current(),
+        waited_for = unmade.len(),
+        still_being_made = still,
+        refused,
+        ms = waited.as_millis() as u64,
+        "BVH builder waited for its pipelines"
+    );
 }
 
-/// The frame [`runs`] last decided for, and its decision.
-static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
-
-/// Whether the builder's dispatches run in the current frame: decided once
-/// per frame, so that a frame never runs part of the builder.
-pub(crate) fn runs() -> bool {
-    static SAID: AtomicBool = AtomicBool::new(false);
-    let frame = crate::frame::current();
-    let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
-    if decided.0 == frame {
-        return decided.1;
-    }
-    let (states, dropped): (Vec<Option<bool>>, usize) = {
-        let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
-        pipelines.retain(|n| n.pipeline.strong_count() > 0);
-        let states = pipelines
-            .iter()
-            .filter_map(|n| n.pipeline.upgrade())
-            .map(|p| make::state(&p))
-            .collect();
-        (states, pipelines.iter().filter(|n| n.dropped).count())
-    };
-    let open = all_made(&states) && dropped == 0;
-    if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
-        let (made, refused) = (
-            states.iter().filter(|s| **s == Some(true)).count(),
-            states.iter().filter(|s| **s == Some(false)).count(),
-        );
-        tracing::info!(
-            frame,
-            pipelines = states.len(),
-            made,
-            refused,
-            dropped,
-            "BVH builder {}",
-            if open {
-                "runs"
-            } else if dropped > 0 {
-                "held back: a dispatch of it was dropped"
-            } else {
-                "held back: not all its pipelines are made"
-            }
-        );
-    }
-    *decided = (frame, open);
-    open
+/// What is left of [`WAIT`] in `frame`, after counting `waited` in it.
+fn left_in_frame(frame: u64, waited: Duration) -> Duration {
+    static WAITED: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+    left_of(&mut WAITED.lock().unwrap_or_else(|e| e.into_inner()), frame, waited)
 }
 
-/// Whether every pipeline is made (`Some(true)`); refused ones are
-/// `Some(false)`, those still being made `None`.
-fn all_made(states: &[Option<bool>]) -> bool {
-    states.iter().all(|s| *s == Some(true))
+/// [`left_in_frame`] with `w` (the frame, and what was waited in it).
+fn left_of(w: &mut (u64, Duration), frame: u64, waited: Duration) -> Duration {
+    if w.0 != frame {
+        *w = (frame, Duration::ZERO);
+    }
+    w.1 += waited;
+    WAIT.saturating_sub(w.1)
 }
 
-/// Tests that set the builder's image, one at a time; each starts with
-/// no decision made.
+/// Tests that set the builder's image, one at a time.
 #[cfg(test)]
 pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
-    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    forget_decision();
-    guard
-}
-
-/// As if a new frame began: [`runs`] decides afresh.
-#[cfg(test)]
-pub(crate) fn forget_decision() {
-    *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The builder runs only when every one of its pipelines is made: one
-    /// refused or still being made holds all of them back.
+    /// A frame's waits share [`WAIT`]; a new frame starts it anew.
     #[test]
-    fn the_builder_runs_only_with_every_pipeline_made() {
-        assert!(all_made(&[]), "no builder: nothing to hold back");
-        assert!(all_made(&[Some(true), Some(true)]));
-        assert!(!all_made(&[Some(true), Some(false)]), "one refused");
-        assert!(!all_made(&[Some(true), None]), "one still being made");
+    fn a_frame_s_waits_share_the_allowance() {
+        let mut w = (u64::MAX, Duration::ZERO);
+        assert_eq!(left_of(&mut w, 7, Duration::ZERO), WAIT);
+        assert_eq!(left_of(&mut w, 7, Duration::from_secs(15)), Duration::from_secs(5));
+        assert_eq!(left_of(&mut w, 7, Duration::from_secs(15)), Duration::ZERO);
+        assert_eq!(left_of(&mut w, 8, Duration::ZERO), WAIT, "another frame");
     }
 
     /// Pipelines are the builder's by their bytecode in its image, or by

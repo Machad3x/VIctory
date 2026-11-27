@@ -1468,15 +1468,9 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
-        // The acceleration-structure builder runs whole or not at all
-        // (`pipeline::builder`).
-        if crate::pipeline::held_back(self.pipeline as This) {
-            once!("a dispatch of the BVH builder held back: not all its pipelines are made");
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            dropped(list, self.pipeline, "dispatch");
-            return;
-        }
+        // The acceleration-structure builder's frames run whole: its
+        // dispatches wait for all its pipelines (`pipeline::builder`).
+        crate::pipeline::wait_for_builder(self.pipeline as This);
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -2166,7 +2160,7 @@ impl State {
         };
         #[cfg(not(feature = "diagnostics"))]
         let note = |_: &str| {};
-        // Not run: one of the BVH builder's holds the builder back
+        // Not run: said, if it is one of the BVH builder's
         // (`pipeline::builder`).
         let why = |what: &str| {
             crate::pipeline::not_dispatched(pipeline, what);
@@ -2179,10 +2173,7 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
-        if crate::pipeline::held_back(self.pipeline as This) {
-            note("the BVH builder held back");
-            return false;
-        }
+        crate::pipeline::wait_for_builder(self.pipeline as This);
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
