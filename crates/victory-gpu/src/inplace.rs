@@ -74,6 +74,7 @@
 //!   again. Until the heap is gone the pages stay locked ([`locked`]), and
 //!   `crate::watch` sets no guard on them: they count as changed and are
 //!   copied at each use, as memory that cannot be guarded.
+//!
 //! shortcut: such heaps are system memory, as loose copies are; move the
 //! hot ones to video memory if the builder's lists run long.
 
@@ -786,7 +787,7 @@ fn forget_private(start: usize, id: u64) -> Option<Arc<Run>> {
 /// its change again while that settles.
 fn release_private(start: usize, id: u64) {
     // Released by the registry: nothing to forget there.
-    drop(PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id));
+    PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     let Some(run) = forget_private(start, id) else {
         return;
     };
