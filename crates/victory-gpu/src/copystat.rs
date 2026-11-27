@@ -243,6 +243,7 @@ static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 static OURS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
 /// A copy-back wrote title memory `[at, at + len)`.
+// shortcut: the write-backs at list.rs:1181 and watch.rs:1142 are not recorded (count as the title's), record them there when R1 must be exact.
 pub(crate) fn ours_wrote(at: usize, len: usize) {
     use crate::watch::PAGE;
     let frame = crate::queue::presented();

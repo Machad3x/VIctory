@@ -221,9 +221,9 @@ fn write_runs(at: usize, merged: &[u8], runs: &[(usize, usize)]) -> bool {
         return false;
     }
     let _writing = crate::watch::writing_ours(at, merged.len());
+    write_spans(at, merged, runs);
     #[cfg(feature = "diagnostics")]
     crate::copystat::ours_wrote(at, merged.len());
-    write_spans(at, merged, runs);
     true
 }
 
@@ -897,13 +897,16 @@ impl Shadow {
             // title's stay guarded, with nothing to take again.
             let own = t.write_unseen(from, to);
             let opened = own.is_none().then(|| crate::watch::writing_ours(from, to - from));
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::ours_wrote(from, to - from);
             for c in stretch {
                 if let Some((host, runs, _)) = &c.back {
                     let _spans = write_spans(own.as_ref().map_or(c.from, |own| own.at(c.from)), host, runs);
                     #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::MarkedSpans, _spans as u64);
+                    {
+                        crate::copystat::add(crate::copystat::C::MarkedSpans, _spans as u64);
+                        if _spans != 0 {
+                            crate::copystat::ours_wrote(c.from, c.to - c.from);
+                        }
+                    }
                     written += c.to - c.from;
                     if own.is_some() {
                         unseen.push(c.page);
@@ -1044,7 +1047,8 @@ impl Shadow {
         if !before.0.iter().any(|(at, bytes)| *at < b && a < *at + bytes.len()) {
             return self.copy_queued(from, to);
         }
-        let copied = self.copy(from, to);
+        // Serial: a pooled write landing later could carry newer title bytes than the snapshot.
+        let copied = self.copy(from, to, true);
         for (at, bytes) in before.0.iter_mut() {
             let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
             if s < e {
@@ -1152,13 +1156,7 @@ impl Shadow {
             return 0;
         }
         if self.vram.is_some() || self.tracked.as_ref().is_some_and(|t| t.has_saved(from, to)) {
-            #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
-            #[cfg(feature = "diagnostics")]
-            if self.vram.is_none() || refresh_serial() {
-                crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
-            }
-            return self.copy(from, to);
+            return self.copy(from, to, false);
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
@@ -1171,8 +1169,9 @@ impl Shadow {
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy:
     /// into video memory alone for a mirrored copy, whose mirror catches up
     /// when the CPU reads it ([`Shadow::freshen`]; writing it too cost a
-    /// second copy of everything refreshed).
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// second copy of everything refreshed). `serial`: video memory written
+    /// at once, never queued.
+    fn copy(&self, from: usize, to: usize, serial: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if from >= to {
@@ -1194,14 +1193,14 @@ impl Shadow {
                     break;
                 }
                 if at < s {
-                    self.copy_video(v, at, s);
+                    self.copy_video(v, at, s, serial);
                 }
                 let e = e.min(b);
                 self.copy_both(at.max(s), e);
                 at = e;
             }
             if at < b {
-                self.copy_video(v, at, b);
+                self.copy_video(v, at, b, serial);
             }
             return to - from;
         }
@@ -1211,13 +1210,17 @@ impl Shadow {
 
     /// Title memory at offsets `[from, to)` into the copy in video memory
     /// only: the mirror is behind there until [`Shadow::freshen`].
-    fn copy_video(&self, v: &Vram, from: usize, to: usize) {
+    fn copy_video(&self, v: &Vram, from: usize, to: usize, serial: bool) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::VideoBytes, (to - from) as u64);
         // SAFETY: inside the video memory mapping (offsets within the copy).
         let at = unsafe { v.data.add(from) };
         let src = (self.start as usize + from) as *const u8;
-        if refresh_serial() {
+        if serial || refresh_serial() {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
             crate::host::copy_mapped(at, src, to - from, false);
         } else {
             // Pooled: nothing reads video memory before the pool's run returns, ahead of the submission.
@@ -1225,12 +1228,17 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::RefreshPoolBytes, (to - from) as u64);
             crate::copy_pool::copy(at, src, to - from);
         }
+        // Set before a pooled write lands: every reader of the stale bits runs on the flushing thread after `copy_pool::run`.
         self.stale(from, to);
     }
 
     /// Title memory at offsets `[from, to)` into the copy (the mirror, and
     /// video memory after it).
     fn copy_both(&self, from: usize, to: usize) {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
         // SAFETY: inside the mapping (offsets within the copy).
         let at = unsafe { self.data.add(from) };
         crate::host::copy_mapped(
@@ -2847,6 +2855,49 @@ pub(crate) mod tests {
         unsafe { ((p + PAGE + 100) as *mut u8).write_volatile(0xA5) };
         copy.update(p, len);
         assert_eq!(gpu_bytes(&copy, p + PAGE + 100, 1), [0xA5]);
+        unregister(p, p as u64);
+    }
+
+    /// A mirrored copy's refresh inside [`crate::copy_pool::queued`] queues
+    /// its video-memory writes: made by [`crate::copy_pool::run`] (on the
+    /// workers, and on the calling thread alone), not before, with the
+    /// mirror left behind.
+    #[test]
+    fn queued_video_refresh_lands_when_the_pool_runs() {
+        if !rerun_with_gpu_upload(
+            "shadow::tests::queued_video_refresh_lands_when_the_pool_runs",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return; // no GPU upload heaps here
+        }
+        // 80 pages: over the pool's 4 MiB, so its workers copy.
+        let pages = 80;
+        let (p, len, copy) = mirrored_buffer(pages);
+        copy.freshen(0, len);
+        for (serial, stamp) in [(false, 0xA5u8), (true, 0x5A)] {
+            crate::copy_pool::SERIAL.store(serial, std::sync::atomic::Ordering::Relaxed);
+            for page in 0..pages {
+                // SAFETY: our pool's bytes.
+                unsafe { ((p + page * PAGE + 100) as *mut u8).write_volatile(stamp) };
+            }
+            let (_, pieces) = crate::copy_pool::queued(|| copy.update(p, len));
+            assert!(!pieces.is_empty(), "serial {serial}: video writes queued");
+            assert_ne!(gpu_bytes(&copy, p + PAGE + 100, 1), [stamp], "serial {serial}: not before the run");
+            crate::copy_pool::run(pieces);
+            for page in 0..pages {
+                assert_eq!(gpu_bytes(&copy, p + page * PAGE + 100, 1), [stamp], "serial {serial}: page {page}");
+            }
+            assert_eq!(copy.stale_pages(), (0..pages).collect::<Vec<_>>(), "serial {serial}: mirror behind");
+            // SAFETY: the mirror's bytes.
+            assert_ne!(unsafe { *copy.data.add(PAGE + 100) }, stamp, "serial {serial}: mirror not written");
+        }
+        crate::copy_pool::SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
         unregister(p, p as u64);
     }
 
