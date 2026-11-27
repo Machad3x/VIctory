@@ -313,12 +313,40 @@ pub(crate) fn after_retire_in_flight(then: Box<dyn FnOnce() + Send>) -> Result<(
 /// it: until the GPU passes it, its lists may still read what they name.
 static UNWAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whether a submission retired without waiting may still run on the GPU:
-/// what its lists read (descriptors among them) may not be made anew in
-/// place, only replaced.
+/// Whether a submission retired without waiting may still run on the GPU.
 pub(crate) fn unwaited_running() -> bool {
     let upto = UNWAITED.load(std::sync::atomic::Ordering::Relaxed);
     upto != 0 && completed() < upto
+}
+
+/// Before page tables, their view pairs or what they name in place change
+/// (`crate::memory`: a rewrite, a load-only flip, a drop of runs): a
+/// submission retired without waiting for its fence (its wait could not be
+/// set) may still read them, so the GPU is waited for to pass it, polled.
+/// A GPU that never does is said after 10 s and passed by (it faulted or
+/// hung: nothing it still reads is used again).
+pub(crate) fn wait_unwaited() {
+    if !unwaited_running() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while unwaited_running() {
+        if started.elapsed() > std::time::Duration::from_secs(10) {
+            tracing::error!("a submission retired without waiting is still on the GPU after 10 s: page tables change all the same");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+thread_local! {
+    static RELEASE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this is the thread [`release_later`] drops on: nothing there may
+/// wait for a submission (the drops it does are ones submissions hand it).
+pub(crate) fn on_release_thread() -> bool {
+    RELEASE_THREAD.get()
 }
 
 /// Whether this is the retire thread: work it waits for runs after it.
@@ -5981,7 +6009,10 @@ pub(crate) fn release_later(what: Box<dyn std::any::Any + Send>) {
         // Without the thread the receiver is gone: sends fail and drop here.
         let _ = std::thread::Builder::new()
             .name("victory-release".into())
-            .spawn(move || rx.into_iter().for_each(drop));
+            .spawn(move || {
+                RELEASE_THREAD.set(true);
+                rx.into_iter().for_each(drop)
+            });
         tx
     });
     let _ = release.send(what);

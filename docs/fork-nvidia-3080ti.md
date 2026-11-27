@@ -1406,6 +1406,20 @@ load-only); after a retire that could not wait, a flip takes fresh pairs.
 `gpu318` (af14e819) stayed alive 251 s with no assertion at the same window
 scene, about 5,000 draws at 875 to 1,096 ms a frame (`gpu317`: 850 to
 1,344): no regression.
+
+Review of eefaa9ec: a title change waits for the tables at most 20 s
+(one submission is up to its 10 s pipeline allowance and 25 s of GPU wait,
+past the 30 s watchdog), then is refused and said loudly, the memory kept
+as it is; a holder that cannot let go (a submitting, retiring or releasing
+thread) refuses at once. After a retire that could not wait for its fence,
+page tables, their pairs and drops of runs wait for the GPU to pass it
+before they change. Physical unmaps go straight to the host, with nothing
+held in place there.
+
+`gpu319` (eefaa9ec) stayed alive 251 s at the same scene, 1,000 to 1,460
+ms a frame; the page tables still waited the whole 500 ms for the opening
+thread every frame (3,668 times, 62.6 s in all) with no run opened and no
+open pending: the next priority.
 Still open: a list's first miss of memory no table knew of stores in place;
 a retire whose fence wait could not be set leaves the next table writable.
 

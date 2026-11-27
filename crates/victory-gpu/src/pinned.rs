@@ -54,6 +54,22 @@ const SETTLE: Duration = Duration::from_millis(100);
 // not: the title never changes those views
 // (`crate::inplace::title_memory_own_gone` handles their going).
 
+thread_local! {
+    /// Releases that could not let go since the last change began.
+    static FAILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a holder holds part of `[at, at + len)` in place now.
+pub fn title_memory_held_over(at: usize, len: usize) -> bool {
+    if PINS.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let pins = pins();
+    let from = at.saturating_sub(pins.longest);
+    pins.ranges.range((from, 0)..(end, 0)).any(|(_, (e, _))| *e > at)
+}
+
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory. False if the holder
 /// could not let go in time (a page table still names it): the change then
@@ -151,7 +167,17 @@ pub fn title_memory_held() -> bool {
 /// the runtime's unmapping of physical pages): whatever holds part of the
 /// range in place lets it go first. `change`'s answer, with its last error.
 pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
+    FAILED.set(0);
     let released = release(at, len);
+    if FAILED.take() > 0 {
+        // A holder could not let go (`crate::memory::drop_runs_wait`: a
+        // thread that would wait for itself, or the tables past 20 s): the
+        // memory is locked; refused at once, not tried for the settle.
+        tracing::warn!(at = format_args!("{at:#x}"), len, "a change of title memory refused: held in place still");
+        // SAFETY: a plain write of this thread's last error.
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        return 0;
+    }
     // The settle runs from when the release returned (a release waits for
     // a submission's retire, a frame or more: counted in, the settle could
     // end before the system unlocked the pages, and a valid change got
@@ -312,6 +338,7 @@ fn release(at: usize, len: usize) -> usize {
     let n = released.len();
     let ids: Vec<u64> = released.iter().map(|(id, _)| *id).collect();
     let failed = released.into_iter().map(|(_, release)| !release()).filter(|&f| f).count();
+    FAILED.set(FAILED.get() + failed);
     if failed > 0 {
         static SAID: AtomicU64 = AtomicU64::new(0);
         if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -432,6 +459,25 @@ mod tests {
         assert_eq!(title_memory_change(base, 0x1000, denied), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 2);
+    }
+
+    /// A holder that cannot let go refuses the change at once: not tried,
+    /// nor tried again for the settle.
+    #[test]
+    fn a_holder_that_cannot_let_go_refuses_at_once() {
+        let base = 0x7b00_0000_0000;
+        let _p = pin(base, 0x1_0000, Box::new(|| false));
+        let calls = AtomicUsize::new(0);
+        let started = Instant::now();
+        let change = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            1
+        };
+        assert_eq!(title_memory_change(base, 0x1000, change), 0);
+        // SAFETY: a plain read of this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "not tried");
+        assert!(started.elapsed() < SETTLE, "no settle");
     }
 
     /// A release that takes longer than the settle (it waits for a

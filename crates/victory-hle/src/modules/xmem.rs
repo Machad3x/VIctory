@@ -1037,12 +1037,14 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
-        // What the GPU side holds in place at the title's address would make
-        // the unmap fail: it lets go first. (Title memory in place opens our
-        // own view of the section, which this unmap leaves alone, so today
-        // nothing is held here: one atomic load.)
+        // Nothing of the GPU side's is held in place here: title memory in
+        // place opens our own view of the section (left alone by this
+        // unmap), and private runs never cover mapped views. So the unmap
+        // goes straight to the host: a release could wait for a submission,
+        // and `PHYSICAL` is held here, which other title threads wait for.
+        debug_assert!(!victory_gpu::title_memory_held_over(at, size), "a physical view held in place");
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        victory_gpu::title_memory_change(at, size, || unsafe {
+        unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1050,7 +1052,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        });
+        };
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

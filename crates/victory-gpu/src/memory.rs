@@ -179,9 +179,6 @@ struct Shared {
     /// load-only ([`crate::inplace::table_load_only`]; one pair a run, its
     /// unordered access view made anew when that changes).
     run_pairs: fx::Map<u64, u32>,
-    /// Pairs replaced while a submission retired without waiting may still
-    /// read them: freed once none may ([`crate::host::unwaited_running`]).
-    retired_pairs: Vec<u32>,
     in_place: u64,
     load_only: bool,
     /// The number of [`WANTED`] regions it was written with.
@@ -651,7 +648,6 @@ impl Shared {
             run_pairs: fx::Map::default(),
             in_place: u64::MAX,
             load_only: false,
-            retired_pairs: Vec::new(),
             wanted: 0,
             layout: Arc::default(),
         })
@@ -868,14 +864,6 @@ impl Shared {
     /// stores dropped) or writable again, in place: the table and its
     /// layout stay as they are. Only while no submission runs.
     fn set_load_only(&mut self, heap: &HostHeap, load_only: bool) {
-        // A submission retired without waiting may still read the pairs:
-        // fresh ones then, the old freed once the GPU passed it.
-        if crate::host::unwaited_running() {
-            self.retired_pairs.extend(self.run_pairs.drain().map(|(_, pair)| pair));
-            self.load_only = load_only;
-            crate::inplace::flipped();
-            return;
-        }
         for (id, &pair) in &self.run_pairs {
             if let Some(run) = self.layout.runs.iter().find(|r| r.id == *id) {
                 heap.raw_pair_of(pair, Some(&run.buffer), run.len as u64, !load_only);
@@ -930,17 +918,19 @@ impl Shared {
 /// and the title can change the memory under them
 /// (`crate::inplace::release_private`): at once when no submission runs,
 /// else asked of the submission under way, and waited for, blocked, not
-/// spinning, with no time limit. The wait is bounded all the same: every
-/// submission serves what is asked at its end (`Host::execute` after its
-/// retire, the retire job under `VICTORY_PIPELINE`, the next submission's
-/// start), and a submission never waits for a title thread (its waits are
-/// pipelines, within the frame's allowance, the GPU, and title memory being
-/// opened, within it too), nor for a lock this thread holds here (none of
-/// ours). So the title's change waits one submission at most, and is never
-/// refused or told it worked when it did not. False only on a thread that
-/// is itself submitting or retiring (it would wait for itself; the title's
-/// own calls never run there): the tables drop the runs at their next
-/// rewrite.
+/// spinning. Every submission serves what is asked at its end
+/// (`Host::execute` after its retire, the retire job under
+/// `VICTORY_PIPELINE`, the next submission's start), and a submission never
+/// waits for a title thread, nor for a lock this thread holds here (none of
+/// ours): so the wait is one submission, at most its pipeline allowance
+/// (10 s) and its GPU wait (up to the 25 s a submission is waited for before
+/// it is taken for hung), 35 s, past the title's 30 s watchdog. So it stops
+/// at [`DROP_MOST`], well under it, said loudly, and the change is refused
+/// (false): the memory stays as it is, which a GPU still reading it needs,
+/// rather than freed under it. False also on a thread that submits, retires
+/// or drops what submissions hand back (`victory-release`): it would wait
+/// for itself, and the title's own calls never run there; the tables drop
+/// the runs at their next rewrite.
 pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     // The tables, and the layouts their lists last ran with ([`RAN`]): a
     // table rewritten since no longer names a run its lists ran with, and
@@ -958,7 +948,8 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     }
     // A submission, or the retire thread (its later work runs after it, the
     // drop served behind itself): it would wait for itself.
-    if crate::host::submitting_here() || crate::host::on_retire_thread() {
+    if crate::host::submitting_here() || crate::host::on_retire_thread() || crate::host::on_release_thread() {
+        tracing::warn!(?dead, "runs over title memory to drop on a submitting, retiring or releasing thread: not waited for");
         return false;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -983,12 +974,20 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
             said = true;
             tracing::warn!(?dead, "a title change waits for the page tables to drop runs over its memory for more than 2 s");
         }
+        if started.elapsed() > DROP_MOST {
+            tracing::error!(?dead, "page tables did not drop runs over title memory in 20 s: the title's change is refused");
+            return false;
+        }
     }
 }
 
 /// A drop waited for longer than this is said (a submission is a frame or
 /// so; one waiting out the pipeline allowance, up to 10 s).
 const SLOW_DROP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The longest a title change waits for the tables, under the title's 30 s
+/// watchdog with room for the rest of its frame.
+const DROP_MOST: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// What lists last ran with, as taken from [`RAN`].
 type Ran = fx::Map<usize, Arc<Layout>>;
@@ -1067,6 +1066,9 @@ fn drop_runs_taking(dead: &[u64]) -> Ran {
     if dead.is_empty() {
         return Ran::default();
     }
+    // A retire not waited for may still read what the runs hold: the
+    // memory is not given back under it.
+    crate::host::wait_unwaited();
     for (_, s) in shared().iter_mut() {
         s.drop_runs(dead);
     }
@@ -1419,22 +1421,18 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let stale = s.generation != now;
         let stale = stale || counting() && s.wanted != wanted().len();
         let stale = stale || crate::inplace::backstop() && s.in_place != crate::inplace::generation();
-        if !s.retired_pairs.is_empty() && !crate::host::unwaited_running() {
-            for pair in s.retired_pairs.drain(..) {
-                heap.raw_pair_at(pair, None, 0);
-                heap.free_pair(pair);
-            }
-        }
         // Load-only while memory is opened or a miss withholds, and
-        // writable again once neither holds: the runs' pairs alone, unless
-        // they were given up (a retire not waited for) and the table names
-        // fresh ones.
+        // writable again once neither holds: the runs' pairs alone.
         let flip = crate::inplace::backstop() && s.load_only != crate::inplace::table_load_only();
-        if flip && !stale {
-            s.set_load_only(heap, !s.load_only);
+        if stale || flip {
+            // What the GPU still reads of a retire not waited for is not
+            // changed under it.
+            crate::host::wait_unwaited();
         }
-        if stale || s.run_pairs.is_empty() && !s.layout.runs.is_empty() {
+        if stale {
             s.rewrite(heap, now);
+        } else if flip {
+            s.set_load_only(heap, !s.load_only);
         }
         Some(s.layout.clone())
     })
