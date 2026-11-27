@@ -1226,9 +1226,15 @@ unmapping, and a commit with another protection fail with
   the title names run first and let go only if refused as locked.
 - Letting go drops the run from the page tables and from the layouts lists
   last ran with, once no submission runs (waited for up to 2 s).
+- The backstop opens only views of ours. Private runs are the one exception:
+  asked as such, wholly in private memory the runtime reported, committed
+  read-write throughout. Anything else is refused.
 - A run is locked and registered before its heap is opened. A change of the
   title's that comes during the open waits for it to end, then lets the run
-  go.
+  go (a test stops an open there and frees the memory every time). A change
+  refused as locked with nothing released looks again: a run registered
+  after the first look, or one let go within 100 ms, is let go or waited
+  out, and the change is tried again.
 - A tracker made over such memory lets the runs there go without waiting. A
   page a live run still locks gets no guard and stays changed. The run stays
   registered until its heap is gone, so the title's `VirtualFree` there
@@ -1236,7 +1242,7 @@ unmapping, and a commit with another protection fail with
 - Runs are opened on a worker thread when the runtime reports the memory
   (`XMemVirtualAlloc`, or a miss in committed private memory not reported
   yet). A page table that still finds one pending waits, at most 100 ms a
-  frame for all tables.
+  frame for all tables, woken when the worker is done (no polling).
 - A miss in memory reported already costs one lookup. It rewrites the page
   tables at most once a frame. What the host refused stays refused until the
   title commits there again (`XMemVirtualAlloc` or its own `VirtualAlloc`).
