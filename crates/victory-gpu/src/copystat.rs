@@ -239,32 +239,71 @@ pub(crate) enum C {
 const COUNTERS: usize = C::RefreshPoolBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
-/// Title pages (64 KiB index) our copy-backs wrote, and the frame.
-static OURS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+/// Whether the refresh's own statistics are kept (who wrote the pages
+/// refreshed, time in the copies made at once): `VICTORY_REFRESH_STATS=1`.
+/// Off, their hot paths do nothing: [`ours_wrote`] runs for every span a
+/// copy-back writes, on its threads, and [`refresh_cause`] for every run
+/// of pages a refresh takes. Asked once.
+pub(crate) fn refresh_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_REFRESH_STATS");
+        tracing::info!(on, "refresh statistics by cause and path (VICTORY_REFRESH_STATS)");
+        on
+    })
+}
+
+/// The title pages our copy-backs wrote last, and when: a table with no
+/// lock and no allocation, a slot per page by its hash, each holding the
+/// page (64 KiB index) above [`FRAME_BITS`] bits of the frame. Two pages
+/// that share a slot leave the later one: the statistics then take a page
+/// we wrote for one the title wrote, never the reverse.
+static OURS: [AtomicU64; OURS_SLOTS] = [const { AtomicU64::new(u64::MAX) }; OURS_SLOTS];
+const OURS_SLOTS: usize = 1 << 16;
+const FRAME_BITS: u32 = 20;
+const FRAME_MASK: u64 = (1 << FRAME_BITS) - 1;
+
+/// A page's slot in [`OURS`] (FxHash's multiply, the high bits).
+fn ours_slot(page: usize) -> usize {
+    ((page as u64).wrapping_mul(0x517c_c1b7_2722_0a95) >> 48) as usize % OURS_SLOTS
+}
+
+/// What [`OURS`] holds for `page` written in `frame`.
+fn ours_entry(page: usize, frame: u64) -> u64 {
+    ((page as u64) << FRAME_BITS) | (frame & FRAME_MASK)
+}
+
+/// Whether `entry` says that `page` was written in the frame `now` or the
+/// one before.
+fn ours_recent(entry: u64, page: usize, now: u64) -> bool {
+    (entry >> FRAME_BITS) == page as u64 && (now.wrapping_sub(entry) & FRAME_MASK) <= 1
+}
 
 /// A copy-back wrote title memory `[at, at + len)` (our copies into title
 /// memory too: [`crate::host::copy_mapped`] to a title destination, and a
 /// texture's copy back in `list.rs`).
 pub(crate) fn ours_wrote(at: usize, len: usize) {
     use crate::watch::PAGE;
+    if !refresh_stats() {
+        return;
+    }
     let frame = crate::queue::presented();
-    let mut map = OURS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
     for p in at / PAGE..(at + len).div_ceil(PAGE) {
-        map.insert(p, frame);
+        OURS[ours_slot(p)].store(ours_entry(p, frame), Relaxed);
     }
 }
 
 /// A refresh of taken title memory `[a, b)`, into video memory or not.
 pub(crate) fn refresh_cause(a: usize, b: usize, video: bool) {
     use crate::watch::PAGE;
+    if !refresh_stats() {
+        return;
+    }
     let now = crate::queue::presented();
     let mut ours = 0;
-    if let Some(map) = OURS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        for p in a / PAGE..b.div_ceil(PAGE) {
-            if map.get(&p).is_some_and(|&f| f + 1 >= now) {
-                ours += (b.min((p + 1) * PAGE) - a.max(p * PAGE)) as u64;
-            }
+    for p in a / PAGE..b.div_ceil(PAGE) {
+        if ours_recent(OURS[ours_slot(p)].load(Relaxed), p, now) {
+            ours += (b.min((p + 1) * PAGE) - a.max(p * PAGE)) as u64;
         }
     }
     let (o, t) = if video {
@@ -643,12 +682,6 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::RefreshSerialUs as usize]),
         mb(c[C::RefreshPoolBytes as usize]),
     );
-    {
-        let now = crate::queue::presented();
-        if let Some(map) = OURS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            map.retain(|_, f| *f + 1 >= now);
-        }
-    }
     if crate::indirect::windows_on() {
         tracing::info!(
             "  clamp windows per frame: {:.0} holding {:.0} indirect draws; {:.0} indirect draws alone as they may store",
@@ -836,5 +869,33 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
             }
         }
         q
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A page our copy-back wrote counts as ours in that frame and the
+    /// next, not after, and not for a page that shares its slot.
+    #[test]
+    fn a_page_we_wrote_is_ours_for_two_frames() {
+        let page = 0x1_2345;
+        let entry = ours_entry(page, 100);
+        assert!(ours_recent(entry, page, 100) && ours_recent(entry, page, 101));
+        assert!(!ours_recent(entry, page, 102) && !ours_recent(entry, page, 99));
+        assert!(!ours_recent(entry, page + 1, 100), "another page");
+        assert!(!ours_recent(u64::MAX, page, 100), "a slot never written");
+        // The frame count wraps in its bits.
+        let last = FRAME_MASK;
+        let entry = ours_entry(page, last);
+        assert!(ours_recent(entry, page, last + 1) && !ours_recent(entry, page, last + 2));
+        // Slots are inside the table, and pages next to each other apart.
+        let slots: Vec<usize> = (0..1000).map(|p| ours_slot(0x10_0000 + p)).collect();
+        assert!(slots.iter().all(|&s| s < OURS_SLOTS));
+        let mut apart = slots.clone();
+        apart.sort_unstable();
+        apart.dedup();
+        assert!(apart.len() > 990, "{} of 1000 slots", apart.len());
     }
 }

@@ -1258,7 +1258,8 @@ impl Shadow {
         let src = (self.start as usize + from) as *const u8;
         if serial || !refresh_pooled() {
             #[cfg(feature = "diagnostics")]
-            let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
+            let _timed = crate::copystat::refresh_stats()
+                .then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs));
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
             crate::host::copy_mapped(at, src, to - from, false);
@@ -1277,7 +1278,8 @@ impl Shadow {
     /// video memory after it).
     fn copy_both(&self, from: usize, to: usize) {
         #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
+        let _timed = crate::copystat::refresh_stats()
+            .then(|| crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs));
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
         // SAFETY: inside the mapping (offsets within the copy).
