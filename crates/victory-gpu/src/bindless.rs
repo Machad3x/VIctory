@@ -40,6 +40,17 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 #[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    /// The textures [`uploads`] last found worth bringing up.
+    walked: Mutex<Walked>,
+}
+
+/// A heap's textures worth bringing up as its last full walk found them
+/// (made, read lately): the frame and the count of textures added to the
+/// heap it was made at, and each texture with the host copy it had then.
+#[derive(Default)]
+struct Walked {
+    at: Option<(u64, u64)>,
+    textures: Vec<(usize, std::sync::Weak<crate::resource::HostTexture>)>,
 }
 
 type Range = (usize, u64, u64, bool);
@@ -64,6 +75,8 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+    /// Textures that came into `textures` (a new walk is due).
+    textures_added: u64,
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -115,6 +128,9 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
+                if add && !self.textures.contains_key(r) {
+                    self.textures_added += 1;
+                }
                 let n = self.textures.entry(*r).or_insert(0);
                 step(n);
                 if *n == 0 {
@@ -236,27 +252,55 @@ pub(crate) fn uploads(
     let mut done = crate::fx::Set::default();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::UploadsCalls, 1);
+    // A heap's textures are walked once a frame, or when textures came into
+    // it, not at each of the frame's ~30 submissions (17.9 ms a frame for 6
+    // textures uploaded, run gpu280); `VICTORY_UPLOADS_FULL=1` walks at each.
+    static FULL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on("VICTORY_UPLOADS_FULL"));
+    let frame = crate::queue::presented();
     for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::UploadsWalked, inner.textures.len() as u64);
-        for &r in inner.textures.keys() {
+        let mut walked = viewed.walked.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let at = Some((frame, inner.textures_added));
+            if *FULL || walked.at != at {
+                walked.at = at;
+                walked.textures.clear();
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::UploadsWalked, inner.textures.len() as u64);
+                for &r in inner.textures.keys() {
+                    // Not made (given up, or never read): nothing to bring up.
+                    let Some(texture) = crate::resource::made_copy(r as This) else {
+                        continue;
+                    };
+                    // Only what shaders read lately (the eviction pass's
+                    // stamps): the heaps view thousands of textures a frame
+                    // never reads, and bringing each up whenever its pages
+                    // change re-uploaded about 4 GB in 30-46 world frames
+                    // (runs evict2, noevict1).
+                    // shortcut: a texture read again after a gap is brought up
+                    // after the submission that read it, which can see bytes
+                    // one refresh old (a slot the title rewrites is made fresh
+                    // anyway); upload on the mark itself if that shows. With
+                    // the walk once a frame, one read again later in the frame
+                    // waits for the next frame's walk (`VICTORY_UPLOADS_FULL=1`
+                    // walks at each submission if that shows).
+                    if texture.used_recently() {
+                        walked.textures.push((r, Arc::downgrade(&texture)));
+                    }
+                }
+            }
+        }
+        for (r, was) in &walked.textures {
+            let r = *r;
             if !done.insert(r) {
                 continue;
             }
-            // Not made (given up, or never read): nothing to bring up.
+            // Given up since the walk: nothing to bring up; made again: the
+            // new copy, if read lately.
             let Some(texture) = crate::resource::made_copy(r as This) else {
                 continue;
             };
-            // Only what shaders read lately (the eviction pass's stamps):
-            // the heaps view thousands of textures a frame never reads, and
-            // bringing each up whenever its pages change re-uploaded about
-            // 4 GB in 30-46 world frames (runs evict2, noevict1).
-            // shortcut: a texture read again after a gap is brought up after
-            // the submission that read it, which can see bytes one refresh
-            // old (a slot the title rewrites is made fresh anyway); upload on
-            // the mark itself if that shows.
-            if !texture.used_recently() {
+            if Arc::as_ptr(&texture) != was.as_ptr() && !texture.used_recently() {
                 continue;
             }
             // Its contents are the host's since a host copy wrote it.
@@ -444,6 +488,21 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::core::s;
+
+    /// A texture coming into a heap's textures counts once, while any slot
+    /// views it; again after it left (a new walk is due either time).
+    #[test]
+    fn textures_added_counts_new_textures() {
+        let mut inner = Inner::default();
+        inner.count(&Seen::Texture(5), true);
+        inner.count(&Seen::Texture(5), true);
+        assert_eq!(inner.textures_added, 1);
+        inner.count(&Seen::Texture(5), false);
+        inner.count(&Seen::Texture(5), false);
+        assert!(inner.textures.is_empty());
+        inner.count(&Seen::Texture(5), true);
+        assert_eq!(inner.textures_added, 2);
+    }
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
