@@ -8,7 +8,8 @@
 //! lives; on the console the GPU reads title memory in place and these
 //! always work. Everything else in these DLLs is the host's directly.
 //!
-//! Cost while the GPU side holds nothing in place: one atomic load a call.
+//! Cost while the GPU side holds nothing in place: one atomic load a call,
+//! and a lookup more when the host refuses a change as locked.
 
 // Named as the imports; the title passes the pointers to the host as is.
 #![allow(non_snake_case)]
@@ -67,16 +68,15 @@ fn this_process(process: HANDLE) -> bool {
 /// view's unmapping).
 pub(crate) fn change(at: *const c_void, len: usize, change: impl FnMut() -> BOOL) -> BOOL {
     let mut change = change;
-    if !victory_gpu::title_memory_held() || at.is_null() {
+    if at.is_null() {
         return change();
     }
     let at = at as usize;
-    let len = if len == 0 {
-        rest_of_allocation(at)
-    } else {
-        len
-    };
-    victory_gpu::title_memory_change(at, len, change)
+    // The range is worked out only when something may hold it: with nothing
+    // held, a change refused as locked (a holder registered since the look,
+    // or let go just before) is tried again there too.
+    let range = || if len == 0 { rest_of_allocation(at) } else { len };
+    victory_gpu::title_memory_change_from(at, range, change)
 }
 
 /// The bytes `VirtualFree` changes: a release is of the whole allocation,
@@ -290,6 +290,31 @@ mod tests {
         assert!(VirtualAlloc(0x1000 as *const c_void, PAGE, mem::MEM_COMMIT, 0).is_null(), "the host's refusal");
         assert_ne!(VirtualFree(at as *mut c_void, 0, MEM_RELEASE), 0);
         assert_eq!(rest_of_allocation(at), 0, "freed");
+    }
+
+    /// The entry goes through the GPU side's change even with nothing held
+    /// (`victory_gpu::title_memory_change_from`): a change refused as locked
+    /// with nothing held or let go there is the host's answer with its last
+    /// error, tried at most twice; one that works is done once.
+    #[test]
+    fn the_entry_keeps_the_host_s_answer_with_nothing_held() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        let calls = std::cell::Cell::new(0);
+        let refused = || {
+            calls.set(calls.get() + 1);
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            0
+        };
+        // An address nothing in this process holds in place.
+        let at = 0x7f00_0000_0000usize as *const c_void;
+        assert_eq!(change(at, 0x1000, refused), 0);
+        // SAFETY: a plain read of this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
+        assert!((1..=2).contains(&calls.get()), "tried {} times", calls.get());
+        calls.set(0);
+        assert_eq!(change(at, 0, || { calls.set(calls.get() + 1); 1 }), 1);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

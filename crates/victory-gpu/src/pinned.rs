@@ -178,6 +178,9 @@ pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i3
     // SAFETY: plain reads of this thread's last error.
     while unsafe { GetLastError() } == ERROR_INVALID_PARAMETER && start.elapsed() < SETTLE {
         std::thread::yield_now();
+        // A holder registered since the last look (its heap opened before
+        // the last try) goes too.
+        release(at, len);
         worked = change();
         tries += 1;
         if worked != 0 {
@@ -209,6 +212,31 @@ pub fn title_memory_retry(at: usize, len: usize, mut change: impl FnMut() -> i32
     // Nothing held now: a holder may still have let go just before.
     if !title_memory_held() && !let_go_lately(at, len) {
         // SAFETY: as above; the lookup may have changed it.
+        unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+        return worked;
+    }
+    title_memory_change(at, len, change)
+}
+
+/// The runtime's entries (`VirtualFree`, `VirtualProtect`, unmapping):
+/// [`title_memory_change`] when anything is held in place; with nothing
+/// held, `change` at once, and only if the host refuses it as locked is
+/// `len` worked out (`[at, at + len)`, the range changed) and the change
+/// tried again as [`title_memory_change`] does: a holder may have
+/// registered and opened its heap since the look, or let go just before,
+/// its heap still going. One atomic load a call while nothing is held.
+pub fn title_memory_change_from(at: usize, len: impl FnOnce() -> usize, mut change: impl FnMut() -> i32) -> i32 {
+    if title_memory_held() {
+        return title_memory_change(at, len(), change);
+    }
+    let worked = change();
+    // SAFETY: plain reads and writes of this thread's last error.
+    if worked != 0 || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+        return worked;
+    }
+    let len = len();
+    if !title_memory_held() && !let_go_lately(at, len) {
+        // SAFETY: as above; the lookups may have changed it.
         unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
         return worked;
     }
@@ -430,6 +458,65 @@ mod tests {
         assert_eq!(title_memory_change(base + 0x1_0000, 0x1000, late(1)), 0, "not over it");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 0, "forgotten pins are not released");
+    }
+
+    /// The runtime's entry with nothing held: a change refused as locked
+    /// right after a holder let go is tried again, the range worked out only
+    /// then; one with nothing let go there is the answer, tried once.
+    #[test]
+    fn the_entry_with_nothing_held_tries_again_after_a_let_go() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7700_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        let calls = AtomicUsize::new(0);
+        let late = |at_least: usize| {
+            let calls = &calls;
+            move || {
+                let k = calls.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: plain write of this thread's last error.
+                unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+                i32::from(k >= at_least)
+            }
+        };
+        let asked = AtomicUsize::new(0);
+        let len = || {
+            asked.fetch_add(1, Ordering::Relaxed);
+            0x1000
+        };
+        // Other tests may hold pins meanwhile (the registry is shared): the
+        // range is asked then too.
+        assert_eq!(title_memory_change_from(base + 0x2_0000, len, late(0)), 1);
+        calls.store(0, Ordering::Relaxed);
+        pin(base, 0x1_0000, counting(&n)).forget();
+        assert_eq!(title_memory_change_from(base, len, late(1)), 1, "let go just before: tried again");
+        assert!(calls.swap(0, Ordering::Relaxed) >= 2);
+        assert_eq!(title_memory_change_from(base + 0x2_0000, len, late(5)), 0, "nothing there: the answer");
+        assert!(calls.load(Ordering::Relaxed) <= 3, "not tried for long");
+    }
+
+    /// A holder registers after both looks of a change and opens its heap
+    /// before the second try: the settle loop looks again, lets it go, and
+    /// the change works.
+    #[test]
+    fn a_pin_registered_before_the_second_try_is_let_go_in_the_settle_loop() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7800_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        // Let go just before: the second try happens.
+        pin(base, 0x1_0000, counting(&n)).forget();
+        let calls = AtomicUsize::new(0);
+        let mut pinned = None;
+        let racing = || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 1 {
+                pinned = Some(pin(base, 0x1_0000, counting(&n)));
+            }
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            i32::from(n.load(Ordering::Relaxed) == 1)
+        };
+        assert_eq!(title_memory_change(base, 0x1000, racing), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 1, "let go in the loop");
+        assert!(pinned.is_some());
     }
 
     /// A change that works on memory held in place leaves the holder; one
