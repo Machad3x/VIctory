@@ -1230,6 +1230,22 @@ process's handle list and keeps its deadline; the long-copy reach shrinks when
 the longest copy goes. Run gpu311: medians prep/sync/GPU/settle
 174/33/75/53 ms, no hang, no regression.
 
+## Descriptor slot map and heap census
+
+Merged from the `descmap` work, off by default: `VICTORY_DESC_CACHE=1` copies a
+view slot's descriptor from a slot of the same record, and
+`VICTORY_DESC_MAP=check|on` lets the view slots of one record share one
+descriptor through a slot map read from the heap (its rewrites wait on the
+host fence). Map-on translations use their own shader cache key, so the first
+runs with it rebuild the pipeline set. On by default: heap texture uploads
+walk each heap once a frame, and diagnostics counters for shared records.
+
+A read-write lock on the shader-visible heaps' table (also from this work)
+made the per-submission heap sync three times slower (90 to 168 ms against
+35 to 55 ms) because title threads mirrored view writes during the sync; the
+sync takes the table alone again. Run gpu314 (map off): medians
+prep/sync/GPU/settle 136/54/89/55 ms, no regression.
+
 ## Open problems
 
 - About 1 frame per second.
