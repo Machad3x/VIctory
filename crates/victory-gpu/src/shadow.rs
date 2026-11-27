@@ -1812,6 +1812,14 @@ impl Stale {
         self.bits().1 = false;
         self.unpinned.notify_all();
     }
+
+    /// Pages (index ranges) marked stale again, by their pin's holder.
+    fn restale(&self, pages: &[(usize, usize)]) {
+        let mut bits = self.bits();
+        for k in pages.iter().flat_map(|&(a, b)| a..b) {
+            bits.0[k / 64] |= 1 << (k % 64);
+        }
+    }
 }
 
 /// [`lock_stale`]'s bits, unpinned.
@@ -1878,10 +1886,8 @@ impl Held {
     /// The copies may not have run: their pages are stale again.
     pub(crate) fn restale(&mut self) {
         for (copy, pages) in &self.0 {
-            let Some(v) = &copy.vram else { continue };
-            let mut bits = v.stale.bits();
-            for k in pages.iter().flat_map(|&(a, b)| a..b) {
-                bits.0[k / 64] |= 1 << (k % 64);
+            if let Some(v) = &copy.vram {
+                v.stale.restale(pages);
             }
         }
     }
@@ -2764,11 +2770,11 @@ pub(crate) mod tests {
     /// and unlocked on `release`.
     #[test]
     fn held_stale_pages_come_back_on_restale() {
-        let stale = Mutex::new(vec![0u64; 2]);
-        let mut held = Held(vec![(stale.lock().unwrap(), vec![(1, 3), (64, 65)])]);
-        held.restale();
-        held.release();
-        assert_eq!(*stale.lock().unwrap(), [0b110, 1]);
+        let stale = Stale::new(2);
+        lock_stale(&stale).pin();
+        stale.restale(&[(1, 3), (64, 65)]);
+        stale.unpin();
+        assert_eq!(*lock_stale(&stale), [0b110, 1]);
     }
     use windows::Win32::Graphics::Direct3D12::*;
 
