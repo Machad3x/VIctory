@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -180,11 +181,24 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            // A failed translation must complete this queue entry and wake its waiters.
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -289,9 +303,30 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() && compute_waits() {
+            // Made here, or waited for while a worker makes it.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's [`wait_budget`]; a draw still waits within the
+/// budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again next frame. A dispatch runs once when a
+/// scene changes (a buffer reset or cleared) and what it leaves is read for
+/// as long as the scene lasts: a cold compute program dropped after half a
+/// second left the picture wrong until the scene ended. A wait of seconds
+/// once (the pipeline library has it on the next run) against that.
+/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
+/// before.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -330,6 +365,10 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// The frame a budget belongs to, and what was waited of it (of passes over
+/// the screen too); the two slots are distinct.
+static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -339,7 +378,6 @@ fn wait(p: &Pending, frame: u64) {
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
@@ -618,6 +656,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+    }
+
+    #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
         assert_eq!(worker_count(None, 24), 16);
@@ -628,6 +684,54 @@ mod tests {
         assert_eq!(worker_count_for(None, 16, true), 8);
         assert_eq!(worker_count_for(None, 24, true), 8);
         assert_eq!(worker_count_for(Some(12), 8, true), 12);
+    }
+
+    /// A cold compute dispatch is run once: it must wait for its pipeline
+    /// past the frame's budget, rather than be dropped for this frame only.
+    #[test]
+    fn cold_compute_dispatch_waits_for_the_pipeline() {
+        // Spend the screen slot's budget so a budgeted wait returns at once;
+        // no other test here asks for a screen pipeline.
+        let mut spent = SPENT[1].lock().unwrap_or_else(|e| e.into_inner());
+        let before = *spent;
+        loop {
+            let frame = crate::frame::current();
+            *spent = (frame, screen_budget());
+            if crate::frame::current() == frame {
+                break;
+            }
+        }
+        drop(spent);
+
+        let mut pending = Pending::new(Vec::new(), None);
+        pending.screen = true;
+        pending.queue_state.store(MAKING, Ordering::Relaxed); // no worker claims it
+        let p = Arc::new(pending);
+        let began = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let p = p.clone();
+            let began = began.clone();
+            std::thread::spawn(move || {
+                p.made.get_or_init(|| {
+                    began.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    None
+                });
+            })
+        };
+        while !began.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        let _ = ready(&p);
+        let elapsed = started.elapsed();
+        worker.join().expect("the worker should finish");
+        assert!(matches!(p.made.get(), Some(None)));
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "cold compute dispatch was dropped after {elapsed:?}"
+        );
+        *SPENT[1].lock().unwrap_or_else(|e| e.into_inner()) = before;
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
@@ -668,7 +772,9 @@ mod tests {
 
     #[test]
     fn pending_pipeline_is_recorded_for_the_next_launch() {
-        let mut p = Pending::new(Vec::new(), None);
+        // A draw can still be pending past its budget; a compute pipeline is
+        // now made on this thread, so use a graphics state here.
+        let mut p = Pending::new(Vec::new(), Some(Box::<GraphicsState>::default()));
         p.key = "pending-pipeline-test".to_owned();
         // Simulate a worker that has taken the job but cannot finish it yet.
         p.queue_state.store(MAKING, Ordering::Relaxed);

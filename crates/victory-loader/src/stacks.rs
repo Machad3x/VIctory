@@ -1,8 +1,12 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
-//! [`dump_stacks_on_schedule`], to find what a title waits on.
+//! [`dump_stacks_on_schedule`], to find what a title waits on. An entry
+//! `crash` prints them once more at the first unhandled exception: a title
+//! watchdog that ends a hung run with a write to address 0 then shows who
+//! waited on what.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
@@ -28,6 +32,7 @@ pub fn dump_stacks_on_schedule() {
         return;
     };
     let times = schedule(&list);
+    ON_CRASH.store(wants_crash(&list), Ordering::Relaxed);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
         for at in times {
@@ -49,6 +54,21 @@ fn schedule(list: &str) -> Vec<std::time::Duration> {
         .collect();
     times.sort();
     times
+}
+
+/// Whether the list asks for a dump at the first unhandled exception.
+fn wants_crash(list: &str) -> bool {
+    list.split(',').any(|t| t.trim() == "crash")
+}
+
+/// `VICTORY_STACKS` named `crash` and no crash has printed them yet.
+static ON_CRASH: AtomicBool = AtomicBool::new(false);
+
+/// At an unhandled exception: every other thread's stack, once, if asked.
+pub(crate) fn dump_stacks_on_crash() {
+    if ON_CRASH.swap(false, Ordering::Relaxed) {
+        dump_stacks();
+    }
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -211,6 +231,15 @@ pub(crate) fn name_of(thread: HANDLE) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_entry_is_recognised() {
+        assert!(wants_crash("crash"));
+        assert!(wants_crash("30, crash"));
+        assert!(!wants_crash("30,5"));
+        assert!(!wants_crash("crasher"));
+        assert!(!wants_crash(""));
+    }
 
     #[test]
     fn another_threads_stack_unwinds_to_its_start() {
