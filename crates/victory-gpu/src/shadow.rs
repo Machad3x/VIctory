@@ -2234,18 +2234,77 @@ pub(crate) fn register_read_only(resource: usize, start: u64, len: u64) {
 }
 
 /// Copies of title buffers by where their pages lie in the runtime's own
-/// views (`crate::memsys::alias`: first byte there, bytes, the copy), and
+/// views (`crate::memsys::alias`, [`Copies`]), and
 /// the buffers that share another buffer's copy: (key in [`BUFFERS`],
 /// bytes, the copy). Locked after [`BUFFERS`], and only while it is held.
-#[derive(Default)]
 struct Homes {
-    copies: BTreeMap<u64, (u64, std::sync::Weak<Shadow>)>,
+    copies: Copies<std::sync::Weak<Shadow>>,
     sharing: Vec<((u64, usize), u64, std::sync::Weak<Shadow>)>,
     /// The size of `copies` it is next pruned of dead entries at.
     prune_at: usize,
 }
 
-static HOMES: Mutex<Homes> = Mutex::new(Homes { copies: BTreeMap::new(), sharing: Vec::new(), prune_at: 1024 });
+static HOMES: Mutex<Homes> = Mutex::new(Homes { copies: Copies::new(), sharing: Vec::new(), prune_at: 1024 });
+
+/// Copies by where their pages lie in the runtime's own views: (first byte
+/// there, an id telling copies apart) to (bytes, the copy). Copies may
+/// overlap and start alike; every one is kept. Those of [`BIG_LEN`] or more
+/// are kept apart, so that a lookup scans below an address only as far as
+/// the longest short copy reaches, then the few long ones.
+struct Copies<T> {
+    small: BTreeMap<(u64, usize), (u64, T)>,
+    big: BTreeMap<(u64, usize), (u64, T)>,
+    /// The longest copy ever kept in each (they stay after it goes).
+    small_longest: u64,
+    big_longest: u64,
+}
+
+impl<T> Copies<T> {
+    const fn new() -> Self {
+        Copies { small: BTreeMap::new(), big: BTreeMap::new(), small_longest: 0, big_longest: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.small.len() + self.big.len()
+    }
+
+    fn insert(&mut self, at: u64, id: usize, n: u64, copy: T) {
+        let (map, longest) =
+            if n >= BIG_LEN { (&mut self.big, &mut self.big_longest) } else { (&mut self.small, &mut self.small_longest) };
+        *longest = (*longest).max(n);
+        map.insert((at, id), (n, copy));
+    }
+
+    fn get(&self, at: u64, id: usize) -> Option<&(u64, T)> {
+        self.small.get(&(at, id)).or_else(|| self.big.get(&(at, id)))
+    }
+
+    fn remove(&mut self, at: u64, id: usize) {
+        self.small.remove(&(at, id));
+        self.big.remove(&(at, id));
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        self.small.retain(|_, (_, c)| keep(c));
+        self.big.retain(|_, (_, c)| keep(c));
+    }
+
+    /// The copies holding the byte at `own`, as (first byte, id, bytes):
+    /// nearest start first, then the longer. O(log n) plus the copies
+    /// starting within reach below it.
+    fn holding(&self, own: u64) -> Vec<(u64, usize, u64)> {
+        let scan = |map: &BTreeMap<(u64, usize), (u64, T)>, longest: u64| {
+            map.range((own.saturating_sub(longest), 0)..=(own, usize::MAX))
+                .filter(move |&(&(at, _), &(n, _))| at.saturating_add(n) > own)
+                .map(|(&(at, id), &(n, _))| (at, id, n))
+                .collect::<Vec<_>>()
+        };
+        let mut found = scan(&self.small, self.small_longest);
+        found.extend(scan(&self.big, self.big_longest));
+        found.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.2.cmp(&a.2)));
+        found
+    }
+}
 
 /// Buffers sharing another's copy now ([`Homes::sharing`]'s length).
 static SHARING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2268,34 +2327,51 @@ fn share(
     read_only: bool,
 ) -> Option<Arc<Shadow>> {
     let own = crate::memsys::alias::home(key.0, len)?;
-    let (at, n, copy) = homes.copies.range(..=own).next_back().map(|(&at, (n, copy))| (at, *n, copy.upgrade()))?;
-    let Some(copy) = copy else {
-        homes.copies.remove(&at);
+    // Every copy holding the first byte, nearest start first: one starting
+    // further below, or overlapping another, may be the one holding all.
+    let mut apart = false;
+    let mut chosen = None;
+    for (at, id, n) in homes.copies.holding(own) {
+        let Some(copy) = homes.copies.get(at, id).and_then(|(_, copy)| copy.upgrade()) else {
+            homes.copies.remove(at, id);
+            continue;
+        };
+        // Its own buffer still holds it: a released buffer's copy, alive in
+        // lists only, is not taken (its next buffer would make a second copy
+        // of the same pages beside it).
+        let owned = || {
+            map.range((copy.start, 0)..=(copy.start, usize::MAX))
+                .any(|(_, e)| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, &copy)))
+        };
+        // The copy still stands for those pages at its own addresses.
+        if copy.gone.load(Ordering::Relaxed) || crate::memsys::alias::home(copy.start, copy.len) != Some(at) || !owned() {
+            homes.copies.remove(at, id);
+            continue;
+        }
+        if own + len > at + n {
+            apart = true;
+            continue;
+        }
+        let home = copy.start + (own - at);
+        if home == key.0 {
+            // The same addresses: a buffer inside another's, not another
+            // view of its pages. It keeps a copy of its own; counted.
+            crate::memsys::add(crate::memsys::N::AliasNestedBytes, len);
+            return None;
+        }
+        if copy.upload.load(Ordering::Relaxed) && !read_only {
+            apart = true;
+            continue;
+        }
+        chosen = Some((copy, home));
+        break;
+    }
+    let Some((copy, home)) = chosen else {
+        if apart {
+            crate::memsys::add(crate::memsys::N::AliasApart, 1);
+        }
         return None;
     };
-    // Its own buffer still holds it: a released buffer's copy, alive in
-    // lists only, is not taken (its next buffer would make a second copy
-    // of the same pages beside it).
-    let owned = || {
-        map.range((copy.start, 0)..=(copy.start, usize::MAX))
-            .any(|(_, e)| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, &copy)))
-    };
-    // The copy still stands for those pages at its own addresses.
-    if copy.gone.load(Ordering::Relaxed) || crate::memsys::alias::home(copy.start, copy.len) != Some(at) || !owned() {
-        homes.copies.remove(&at);
-        return None;
-    }
-    let home = copy.start + (own.checked_sub(at)?);
-    if own + len <= at + n && home == key.0 {
-        // The same addresses: a buffer inside another's, not another
-        // view of its pages. It keeps a copy of its own; counted.
-        crate::memsys::add(crate::memsys::N::AliasNestedBytes, len);
-        return None;
-    }
-    if own + len > at + n || copy.upload.load(Ordering::Relaxed) && !read_only {
-        crate::memsys::add(crate::memsys::N::AliasApart, 1);
-        return None;
-    }
     let mut windows = copy.windows.write().unwrap_or_else(|e| e.into_inner());
     windows.retain(|w| w.0 != key.0 || w.1 != len);
     windows.push((key.0, len, home, true));
@@ -2320,13 +2396,11 @@ fn at_home(homes: &mut Homes, copy: &Arc<Shadow>) {
         return;
     };
     if homes.copies.len() >= homes.prune_at {
-        homes.copies.retain(|_, (_, copy)| copy.strong_count() > 0);
+        homes.copies.retain(|copy| copy.strong_count() > 0);
         homes.prune_at = (2 * homes.copies.len()).max(1024);
     }
-    // The longer of two copies starting at the same page serves more.
-    if homes.copies.get(&own).is_none_or(|(n, old)| *n < copy.len || old.strong_count() == 0) {
-        homes.copies.insert(own, (copy.len, Arc::downgrade(copy)));
-    }
+    // Told apart by the copy's allocation, which its weak reference keeps.
+    homes.copies.insert(own, Arc::as_ptr(copy) as usize, copy.len, Arc::downgrade(copy));
 }
 
 /// Buffers that share a copy part from it where `[at, at + len)` is the
@@ -3164,6 +3238,40 @@ pub(crate) mod tests {
         assert_eq!(at(0x15_0000), (0x12_0000, 0x12_0000), "its end");
         assert_eq!(at(0x40_0000), (0x40_0000, 0x12_0000), "neither: as it is");
         assert_eq!(spans_in(0x10_0000, 2 * P, &[], 0x12_0000), (0x12_0000, 0x12_0000));
+    }
+
+    /// Every copy holding a byte is found, nearest start first, then the
+    /// longer: one starting far below (long, kept apart as big), copies
+    /// overlapping each other, and copies starting at the same page; none
+    /// ending at or before the byte, none starting past it.
+    #[test]
+    fn copies_holding_a_byte_are_all_found() {
+        const P: u64 = 64 << 10;
+        let o = 0x7000_0000u64;
+        let mut c: Copies<()> = Copies::new();
+        // A long copy from far below, reaching past the byte.
+        c.insert(o, 1, 64 * BIG_LEN, ());
+        // A short one just below, ending before the byte.
+        c.insert(o + 40 * P, 2, 2 * P, ());
+        // Two overlapping ones holding it, and one at the same start as
+        // the second, shorter.
+        c.insert(o + 41 * P, 3, 8 * P, ());
+        c.insert(o + 43 * P, 4, 4 * P, ());
+        c.insert(o + 43 * P, 5, 2 * P, ());
+        // One starting right after the byte.
+        c.insert(o + 44 * P + 1, 6, P, ());
+        let at = o + 44 * P;
+        let ids: Vec<usize> = c.holding(at).iter().map(|&(_, id, _)| id).collect();
+        assert_eq!(ids, [4, 5, 3, 1]);
+        assert_eq!(c.holding(o + 41 * P).iter().map(|&(_, id, _)| id).collect::<Vec<_>>(), [3, 2, 1], "the first byte of one");
+        assert_eq!(c.holding(o + 42 * P).iter().map(|&(_, id, _)| id).collect::<Vec<_>>(), [3, 1], "one's end is not in it");
+        assert_eq!(c.holding(o + 64 * BIG_LEN).len(), 0, "past the long one's end");
+        assert_eq!(c.holding(o - 1).len(), 0);
+        c.remove(o + 43 * P, 4);
+        c.retain(|_| true);
+        assert_eq!(c.holding(at).iter().map(|&(_, id, _)| id).collect::<Vec<_>>(), [5, 3, 1]);
+        assert_eq!(c.len(), 5);
+        assert!(c.get(o, 1).is_some() && c.get(o + 43 * P, 4).is_none());
     }
 
     /// Stale bits pinned on one thread are released by another: a lock
