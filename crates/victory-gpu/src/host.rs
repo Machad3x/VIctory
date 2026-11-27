@@ -309,6 +309,11 @@ pub(crate) fn after_retire_in_flight(then: Box<dyn FnOnce() + Send>) -> Result<(
     }
 }
 
+/// Whether this is the retire thread: work it waits for runs after it.
+pub(crate) fn on_retire_thread() -> bool {
+    RETIRE_THREAD.get()
+}
+
 /// The retire thread's queue.
 fn retirer() -> &'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>> {
     static TX: OnceLock<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> = OnceLock::new();

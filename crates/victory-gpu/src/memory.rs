@@ -902,7 +902,9 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     if !named() || host.between_submissions(|| drop(drop_runs_taking(dead))).is_some() {
         return true;
     }
-    if crate::host::submitting_here() {
+    // A submission, or the retire thread (its later work runs after it, the
+    // drop served behind itself): it would wait for itself.
+    if crate::host::submitting_here() || crate::host::on_retire_thread() {
         return false;
     }
     let (tx, rx) = std::sync::mpsc::channel();
@@ -931,8 +933,10 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
 }
 
 /// The longest a change of the title's waits for the tables to drop runs:
-/// a submission's retire, never seconds unless the GPU hangs.
-const DROP_MOST: std::time::Duration = std::time::Duration::from_secs(10);
+/// a submission's retire, a frame or so. Its thread is the title's, inside
+/// its own `VirtualFree`, and the title's watchdog counts it with the
+/// pipeline allowance.
+const DROP_MOST: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What lists last ran with, as taken from [`RAN`].
 type Ran = fx::Map<usize, Arc<Layout>>;
