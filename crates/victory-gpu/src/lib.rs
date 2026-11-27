@@ -89,7 +89,7 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{title_memory_committed, title_memory_own_gone, title_memory_private};
 #[cfg(windows)]
-pub use pinned::{title_memory_change, title_memory_change_from, title_memory_deferred, title_memory_held, title_memory_retry};
+pub use pinned::{title_memory_change, title_memory_change_from, title_memory_held, title_memory_retry};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_own, title_memory_remapped,

@@ -309,6 +309,18 @@ pub(crate) fn after_retire_in_flight(then: Box<dyn FnOnce() + Send>) -> Result<(
     }
 }
 
+/// The fence value of the last submission whose retire could not wait for
+/// it: until the GPU passes it, its lists may still read what they name.
+static UNWAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a submission retired without waiting may still run on the GPU:
+/// what its lists read (descriptors among them) may not be made anew in
+/// place, only replaced.
+pub(crate) fn unwaited_running() -> bool {
+    let upto = UNWAITED.load(std::sync::atomic::Ordering::Relaxed);
+    upto != 0 && completed() < upto
+}
+
 /// Whether this is the retire thread: work it waits for runs after it.
 pub(crate) fn on_retire_thread() -> bool {
     RETIRE_THREAD.get()
@@ -1735,10 +1747,14 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
-    /// Its last run named title memory in place load-only
-    /// (`crate::memory::prepare`): its stores there were dropped, so its
-    /// copies are withheld as a miss's are, not counted as a miss.
-    ran_load_only: bool,
+    /// The view heaps whose page tables its last run used
+    /// (`crate::memory::prepare`): one of them named title memory in place
+    /// load-only as the submission ran, so its stores there were dropped, and
+    /// its copies are withheld as a miss's are, not counted as a miss.
+    /// Asked at the settle, not at its prepare: a table is shared by the
+    /// lists using its heap, and a later list's prepare may turn it
+    /// load-only after this one's.
+    memory_heaps: Vec<usize>,
     /// Tests: as if its table named title memory in place load-only.
     #[cfg(test)]
     load_only_test: bool,
@@ -2359,6 +2375,7 @@ impl Host {
                 }
                 Err(e) => {
                     t.unwaited = true;
+                    UNWAITED.fetch_max(t.value, Ordering::Relaxed);
                     tracing::warn!(error = %e, "host submission not waited for");
                 }
             }
@@ -2505,7 +2522,18 @@ impl Host {
         // A list that ran on a load-only table had its stores in place
         // dropped (atomics read 0): what it computed is partial, so its
         // copies stay out of title memory as a miss's do.
-        let missed: Vec<bool> = runs.iter().zip(missed).map(|(list, m)| m || list.deferred().ran_load_only).collect();
+        let missed: Vec<bool> = runs
+            .iter()
+            .zip(missed)
+            .map(|(list, m)| {
+                let d = list.deferred();
+                #[cfg(test)]
+                let forced = d.load_only_test;
+                #[cfg(not(test))]
+                let forced = false;
+                m || forced || crate::memory::ran_load_only(&d.memory_heaps)
+            })
+            .collect();
         let withholding = crate::memory::withholding();
         #[cfg(feature = "diagnostics")]
         {
@@ -3717,7 +3745,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         let mut deferred = self.deferred();
-        let mut ran_load_only = false;
+        let mut heaps = Vec::new();
         let mut steps = deferred.copies.iter().peekable();
         while let Some(step) = steps.next() {
             let mut started = std::time::Instant::now();
@@ -3833,8 +3861,8 @@ impl HostList {
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    let load_only = crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
-                    ran_load_only |= load_only;
+                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    heaps.push(heap);
                     continue;
                 }
             };
@@ -3842,9 +3870,7 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
         drop(steps);
-        #[cfg(test)]
-        let ran_load_only = ran_load_only || deferred.load_only_test;
-        deferred.ran_load_only = ran_load_only;
+        deferred.memory_heaps = heaps;
     }
 }
 

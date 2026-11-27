@@ -56,8 +56,8 @@ const SETTLE: Duration = Duration::from_millis(100);
 
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory. False if the holder
-/// could not let go in time (a page table still names it): the change is
-/// then queued ([`title_memory_change`]).
+/// could not let go in time (a page table still names it): the change then
+/// meets the memory locked, and the title its error, said here.
 pub(crate) type Release = Box<dyn FnOnce() -> bool + Send>;
 
 /// A registered range, given back with [`Pin::forget`] when its holder lets
@@ -150,149 +150,7 @@ pub fn title_memory_held() -> bool {
 /// nonzero when it worked (the title's own `VirtualFree` and the like, or
 /// the runtime's unmapping of physical pages): whatever holds part of the
 /// range in place lets it go first. `change`'s answer, with its last error.
-///
-/// A change over memory a page table still names when its release runs out
-/// of time is not refused (the console never refuses a change of its own
-/// memory): it is queued and done once the tables let the memory go, off
-/// the title's thread ([`run_queued`]), and reported done now
-/// ([`title_memory_deferred`] tells the caller). The memory stays as it was
-/// (reserved, committed) until then; a change or allocation there meanwhile
-/// waits for the queued one first.
-pub fn title_memory_change<F>(at: usize, len: usize, mut change: F) -> i32
-where
-    F: FnMut() -> i32 + Send + 'static,
-{
-    DEFERRED.set(false);
-    finish_queued(at, len);
-    FAILED.set(0);
-    let worked = settle(at, len, &mut change);
-    // SAFETY: plain reads and writes of this thread's last error.
-    if worked == 0 && FAILED.take() > 0 && unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
-        queue(at, len, Box::new(change));
-        DEFERRED.set(true);
-        // SAFETY: as above.
-        unsafe { SetLastError(0) };
-        return 1;
-    }
-    worked
-}
-
-/// Whether this thread's last [`title_memory_change`] was queued (reported
-/// done, done later): a caller that hands back something the change gives
-/// (`VirtualProtect`'s old protection) works it out itself.
-pub fn title_memory_deferred() -> bool {
-    DEFERRED.get()
-}
-
-thread_local! {
-    /// Releases that could not let go, since the last change began.
-    static FAILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// A change queued for when the tables let its memory go: start, end, the
-/// change.
-type Queued = (usize, usize, Box<dyn FnMut() -> i32 + Send>);
-static QUEUED: Mutex<Vec<Queued>> = Mutex::new(Vec::new());
-static QUEUED_N: AtomicUsize = AtomicUsize::new(0);
-/// Signalled when queued changes are done.
-static QUEUED_DONE: Condvar = Condvar::new();
-
-fn queue(at: usize, len: usize, change: Box<dyn FnMut() -> i32 + Send>) {
-    tracing::warn!(
-        at = format_args!("{at:#x}"),
-        len,
-        "a title change over memory a page table still names: done once the tables let it go"
-    );
-    QUEUED.lock().unwrap_or_else(|e| e.into_inner()).push((at, at.saturating_add(len.max(1)), change));
-    QUEUED_N.fetch_add(1, Ordering::Relaxed);
-    run_queued_later();
-}
-
-/// Whether changes are queued.
-pub(crate) fn queued() -> bool {
-    QUEUED_N.load(Ordering::Relaxed) > 0
-}
-
-/// Tries the queued changes overlapping `[at, end)` (all: `(0, MAX)`): those
-/// done leave the queue. Whether none overlapping is left.
-fn try_queued(at: usize, end: usize) -> bool {
-    let mut q = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
-    let before = q.len();
-    // In the order queued: a protect after a free of the same range keeps it.
-    let mut blocked: Vec<(usize, usize)> = Vec::new();
-    q.retain_mut(|(s, e, change)| {
-        let overlaps = *s < end && at < *e;
-        if !overlaps || blocked.iter().any(|&(bs, be)| bs < *e && *s < be) {
-            return true;
-        }
-        let done = change() != 0;
-        if !done {
-            blocked.push((*s, *e));
-        }
-        !done
-    });
-    let left = q.iter().any(|(s, e, _)| *s < end && at < *e);
-    QUEUED_N.fetch_sub(before - q.len(), Ordering::Relaxed);
-    drop(q);
-    QUEUED_DONE.notify_all();
-    !left
-}
-
-/// Off the title's threads: the queued changes, tried until done (the
-/// tables drop the runs at their next rewrite or frame end, and the heaps
-/// go with the last layout naming them).
-pub(crate) fn run_queued() {
-    let started = Instant::now();
-    while queued() && !try_queued(0, usize::MAX) && started.elapsed() < Duration::from_secs(30) {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if queued() {
-        tracing::warn!("title changes still queued after 30 s: tried again when the tables next let memory go");
-    }
-}
-
-/// [`run_queued`] on a thread of its own, one at a time.
-pub(crate) fn run_queued_later() {
-    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !queued() || RUNNING.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let spawned = std::thread::Builder::new().name("victory queued changes".into()).spawn(|| {
-        run_queued();
-        RUNNING.store(false, Ordering::Relaxed);
-    });
-    if spawned.is_err() {
-        RUNNING.store(false, Ordering::Relaxed);
-    }
-}
-
-/// Before a change or an allocation at `[at, at + len)`: the queued changes
-/// there are done first, or waited for (2 s at most, as a change waits for
-/// the tables), so that a free queued there is not passed by.
-fn finish_queued(at: usize, len: usize) {
-    if !queued() {
-        return;
-    }
-    let end = at.saturating_add(len.max(1));
-    let started = Instant::now();
-    while !try_queued(at, end) && started.elapsed() < Duration::from_secs(2) {
-        let q = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
-        drop(QUEUED_DONE.wait_timeout(q, Duration::from_millis(20)).unwrap_or_else(|e| e.into_inner()));
-    }
-}
-
-/// [`title_memory_change`] with a change that borrows: never queued (a
-/// release that runs out of time leaves the change refused), after what
-/// is queued there. Tests: their changes borrow what they count.
-#[cfg(test)]
-pub(crate) fn title_memory_change_scoped(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
-    finish_queued(at, len);
-    settle(at, len, &mut change)
-}
-
-/// [`title_memory_change`] without the queue: let go, change, settle.
-fn settle(at: usize, len: usize, change: &mut dyn FnMut() -> i32) -> i32 {
+pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
     let released = release(at, len);
     // The settle runs from when the release returned (a release waits for
     // a submission's retire, a frame or more: counted in, the settle could
@@ -356,9 +214,6 @@ fn settle(at: usize, len: usize, change: &mut dyn FnMut() -> i32) -> i32 {
 /// tried again. For `XMemVirtualAlloc` at an address the title names: a
 /// commit with another protection over an open heap is refused.
 pub fn title_memory_retry(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
-    // A free queued there comes first (the title may allocate the address
-    // it freed).
-    finish_queued(at, len);
     let worked = change();
     // SAFETY: a plain read of this thread's last error.
     if worked != 0 || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
@@ -370,7 +225,7 @@ pub fn title_memory_retry(at: usize, len: usize, mut change: impl FnMut() -> i32
         unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
         return worked;
     }
-    settle(at, len, &mut change)
+    title_memory_change(at, len, change)
 }
 
 /// The runtime's entries (`VirtualFree`, `VirtualProtect`, unmapping):
@@ -380,12 +235,8 @@ pub fn title_memory_retry(at: usize, len: usize, mut change: impl FnMut() -> i32
 /// tried again as [`title_memory_change`] does: a holder may have
 /// registered and opened its heap since the look, or let go just before,
 /// its heap still going. One atomic load a call while nothing is held.
-pub fn title_memory_change_from<F>(at: usize, len: impl FnOnce() -> usize, mut change: F) -> i32
-where
-    F: FnMut() -> i32 + Send + 'static,
-{
-    DEFERRED.set(false);
-    if title_memory_held() || queued() {
+pub fn title_memory_change_from(at: usize, len: impl FnOnce() -> usize, mut change: impl FnMut() -> i32) -> i32 {
+    if title_memory_held() {
         return title_memory_change(at, len(), change);
     }
     let worked = change();
@@ -461,7 +312,6 @@ fn release(at: usize, len: usize) -> usize {
     let n = released.len();
     let ids: Vec<u64> = released.iter().map(|(id, _)| *id).collect();
     let failed = released.into_iter().map(|(_, release)| !release()).filter(|&f| f).count();
-    FAILED.set(FAILED.get() + failed);
     if failed > 0 {
         static SAID: AtomicU64 = AtomicU64::new(0);
         if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -469,7 +319,7 @@ fn release(at: usize, len: usize) -> usize {
                 at = format_args!("{at:#x}"),
                 len,
                 failed,
-                "title memory still held in place when the runtime changes it: the change is queued until the tables let it go"
+                "title memory still held in place when the runtime changes it: the change meets it locked"
             );
         }
     }
@@ -562,14 +412,14 @@ mod tests {
             i32::from(k >= 2)
         };
         assert_eq!(
-            title_memory_change_scoped(base, 0x1000, late),
+            title_memory_change(base, 0x1000, late),
             0,
             "nothing released"
         );
         assert_eq!(calls.swap(0, Ordering::Relaxed), 1);
         let n = Arc::new(AtomicUsize::new(0));
         let _p = pin(base, 0x1000, counting(&n));
-        assert_eq!(title_memory_change_scoped(base, 0x1000, late), 1);
+        assert_eq!(title_memory_change(base, 0x1000, late), 1);
         assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
         // Another refusal is the answer at once.
         let _p = pin(base, 0x1000, counting(&n));
@@ -579,47 +429,9 @@ mod tests {
             unsafe { SetLastError(ERROR_ACCESS_DENIED) };
             0
         };
-        assert_eq!(title_memory_change_scoped(base, 0x1000, denied), 0);
+        assert_eq!(title_memory_change(base, 0x1000, denied), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 2);
-    }
-
-    /// A change over memory a page table still names (its release ran out
-    /// of time) is reported done and queued; it is done once the memory
-    /// unlocks, off the caller's thread, and an allocation at the address
-    /// meanwhile comes after it.
-    #[test]
-    fn a_change_the_tables_hold_up_is_queued_and_done_first() {
-        use std::sync::atomic::AtomicBool;
-        use windows_sys::Win32::Foundation::SetLastError;
-        let base = 0x7a00_0000_0000;
-        static LOCKED: AtomicBool = AtomicBool::new(true);
-        static ORDER: Mutex<Vec<&str>> = Mutex::new(Vec::new());
-        let _p = pin(base, 0x1_0000, Box::new(|| false));
-        let free = move || {
-            if LOCKED.load(Ordering::SeqCst) {
-                // SAFETY: plain write of this thread's last error.
-                unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
-                return 0;
-            }
-            ORDER.lock().unwrap().push("free");
-            1
-        };
-        assert_eq!(title_memory_change(base, 0x1000, free), 1, "reported done");
-        assert!(title_memory_deferred() && queued());
-        assert!(ORDER.lock().unwrap().is_empty(), "not done yet");
-        let unlock = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(50));
-            LOCKED.store(false, Ordering::SeqCst);
-        });
-        let allocate = || {
-            ORDER.lock().unwrap().push("allocate");
-            1
-        };
-        assert_eq!(title_memory_retry(base, 0x1000, allocate), 1);
-        unlock.join().unwrap();
-        assert_eq!(*ORDER.lock().unwrap(), ["free", "allocate"], "the queued free first");
-        assert!(try_queued(base, base + 0x1000), "none left there");
     }
 
     /// A release that takes longer than the settle (it waits for a
@@ -641,7 +453,7 @@ mod tests {
             unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
             i32::from(k >= 1)
         };
-        assert_eq!(title_memory_change_scoped(base, 0x1000, late), 1);
+        assert_eq!(title_memory_change(base, 0x1000, late), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -664,7 +476,7 @@ mod tests {
             unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
             i32::from(n.load(Ordering::Relaxed) == 1)
         };
-        assert_eq!(title_memory_change_scoped(base, 0x1000, racing), 1);
+        assert_eq!(title_memory_change(base, 0x1000, racing), 1);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         assert_eq!(n.load(Ordering::Relaxed), 1, "let go once");
         assert!(pinned.is_some());
@@ -688,12 +500,12 @@ mod tests {
                 i32::from(k >= at_least)
             }
         };
-        assert_eq!(title_memory_change_scoped(base + 0x8000, 0x1000, late(1)), 1);
+        assert_eq!(title_memory_change(base + 0x8000, 0x1000, late(1)), 1);
         assert_eq!(calls.swap(0, Ordering::Relaxed), 2);
         pin(base, 0x1_0000, counting(&n)).forget();
         assert_eq!(title_memory_retry(base, 0x1000, late(2)), 1, "the retry path too");
         assert_eq!(calls.swap(0, Ordering::Relaxed), 3);
-        assert_eq!(title_memory_change_scoped(base + 0x1_0000, 0x1000, late(1)), 0, "not over it");
+        assert_eq!(title_memory_change(base + 0x1_0000, 0x1000, late(1)), 0, "not over it");
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 0, "forgotten pins are not released");
     }
@@ -706,10 +518,9 @@ mod tests {
         use windows_sys::Win32::Foundation::SetLastError;
         let base = 0x7700_0000_0000;
         let n = Arc::new(AtomicUsize::new(0));
-        // Held by the changes, which may be queued: 'static.
-        static CALLS: AtomicUsize = AtomicUsize::new(0);
-        let calls = &CALLS;
+        let calls = AtomicUsize::new(0);
         let late = |at_least: usize| {
+            let calls = &calls;
             move || {
                 let k = calls.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: plain write of this thread's last error.
@@ -753,7 +564,7 @@ mod tests {
             unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
             i32::from(n.load(Ordering::Relaxed) == 1)
         };
-        assert_eq!(title_memory_change_scoped(base, 0x1000, racing), 1);
+        assert_eq!(title_memory_change(base, 0x1000, racing), 1);
         assert_eq!(n.load(Ordering::Relaxed), 1, "let go in the loop");
         assert!(pinned.is_some());
     }
@@ -899,7 +710,7 @@ mod tests {
         let page = unsafe { at.cast::<u8>().add(BYTES / 2) } as usize;
         // SAFETY: our memory.
         let protect = || unsafe { mem::VirtualProtect(at, 0x1_0000, mem::PAGE_READONLY, &mut old) };
-        assert_ne!(title_memory_change_scoped(page, 0x1000, protect), 0);
+        assert_ne!(title_memory_change(page, 0x1000, protect), 0);
         assert!(held.lock().unwrap().is_none(), "the holder let go");
         // SAFETY: our memory, no heap on it any more.
         assert_ne!(unsafe { mem::VirtualFree(at, 0, mem::MEM_RELEASE) }, 0);

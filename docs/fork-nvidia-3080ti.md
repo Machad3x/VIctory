@@ -1393,8 +1393,19 @@ opening the miss window. Load-only and writable flips remake the runs'
 pairs in place (one pair a run, counted on the frame line) instead of
 rewriting the table. Texture read-backs go back again (a copy the title
 commanded, of a texture any list may have rendered). A title change over
-memory a table still names after its 2 s wait is reported done and queued
-until the tables let the memory go (an allocation there waits for it).
+memory a table still names waits, with no time limit, until the tables
+drop the runs there: the submission under way does it at its end (a
+submission never waits for a title thread), so the wait is one submission
+at most, and the title is never refused or told a change worked when it did
+not. (A queue that reported such changes done and did them later was
+dropped: the title could see memory in another state than it was told.)
+The settle asks each heap's table whether it was load-only as the lists
+ran, not each list's prepare (a later list may turn the shared table
+load-only); after a retire that could not wait, a flip takes fresh pairs.
+
+`gpu318` (af14e819) stayed alive 251 s with no assertion at the same window
+scene, about 5,000 draws at 875 to 1,096 ms a frame (`gpu317`: 850 to
+1,344): no regression.
 Still open: a list's first miss of memory no table knew of stores in place;
 a retire whose fence wait could not be set leaves the next table writable.
 

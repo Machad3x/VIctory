@@ -179,6 +179,9 @@ struct Shared {
     /// load-only ([`crate::inplace::table_load_only`]; one pair a run, its
     /// unordered access view made anew when that changes).
     run_pairs: fx::Map<u64, u32>,
+    /// Pairs replaced while a submission retired without waiting may still
+    /// read them: freed once none may ([`crate::host::unwaited_running`]).
+    retired_pairs: Vec<u32>,
     in_place: u64,
     load_only: bool,
     /// The number of [`WANTED`] regions it was written with.
@@ -648,6 +651,7 @@ impl Shared {
             run_pairs: fx::Map::default(),
             in_place: u64::MAX,
             load_only: false,
+            retired_pairs: Vec::new(),
             wanted: 0,
             layout: Arc::default(),
         })
@@ -864,6 +868,14 @@ impl Shared {
     /// stores dropped) or writable again, in place: the table and its
     /// layout stay as they are. Only while no submission runs.
     fn set_load_only(&mut self, heap: &HostHeap, load_only: bool) {
+        // A submission retired without waiting may still read the pairs:
+        // fresh ones then, the old freed once the GPU passed it.
+        if crate::host::unwaited_running() {
+            self.retired_pairs.extend(self.run_pairs.drain().map(|(_, pair)| pair));
+            self.load_only = load_only;
+            crate::inplace::flipped();
+            return;
+        }
         for (id, &pair) in &self.run_pairs {
             if let Some(run) = self.layout.runs.iter().find(|r| r.id == *id) {
                 heap.raw_pair_of(pair, Some(&run.buffer), run.len as u64, !load_only);
@@ -917,11 +929,18 @@ impl Shared {
 /// The page tables drop the runs `dead` names now, so that their heaps go
 /// and the title can change the memory under them
 /// (`crate::inplace::release_private`): at once when no submission runs,
-/// else asked of the submission under way, which drops them once idle (at
-/// its retire, or the next submission's start), and waited for, blocked,
-/// not spinning. False only on a thread that is itself submitting (it
-/// would wait for itself: the tables drop them at their next rewrite), or
-/// past [`DROP_MOST`].
+/// else asked of the submission under way, and waited for, blocked, not
+/// spinning, with no time limit. The wait is bounded all the same: every
+/// submission serves what is asked at its end (`Host::execute` after its
+/// retire, the retire job under `VICTORY_PIPELINE`, the next submission's
+/// start), and a submission never waits for a title thread (its waits are
+/// pipelines, within the frame's allowance, the GPU, and title memory being
+/// opened, within it too), nor for a lock this thread holds here (none of
+/// ours). So the title's change waits one submission at most, and is never
+/// refused or told it worked when it did not. False only on a thread that
+/// is itself submitting or retiring (it would wait for itself; the title's
+/// own calls never run there): the tables drop the runs at their next
+/// rewrite.
 pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     // The tables, and the layouts their lists last ran with ([`RAN`]): a
     // table rewritten since no longer names a run its lists ran with, and
@@ -931,8 +950,6 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     let Some(host) = crate::host::host() else {
         return true;
     };
-    // From the first look: `named` waits for the tables' lock, which a
-    // submission holds while it prepares.
     let started = std::time::Instant::now();
     // What lists ran with is dropped on this thread, the title's: the runs'
     // heaps go before its change is tried.
@@ -948,6 +965,7 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     DROPS.lock().unwrap_or_else(|e| e.into_inner()).push((dead.to_vec(), tx));
     // A retire in flight serves it before the next submission prepares.
     let _ = crate::host::after_retire_in_flight(Box::new(serve_drops));
+    let mut said = false;
     loop {
         // What the server took from the lists' layouts: dropped here.
         if let Ok(ran) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
@@ -961,18 +979,16 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
             drop(ran);
             return true;
         }
-        if started.elapsed() > DROP_MOST {
-            tracing::warn!(?dead, "page tables did not drop runs over title memory in time");
-            return false;
+        if !said && started.elapsed() > SLOW_DROP {
+            said = true;
+            tracing::warn!(?dead, "a title change waits for the page tables to drop runs over its memory for more than 2 s");
         }
     }
 }
 
-/// The longest a change of the title's waits for the tables to drop runs:
-/// a submission's retire, a frame or so. Its thread is the title's, inside
-/// its own `VirtualFree`, and the title's watchdog counts it with the
-/// pipeline allowance.
-const DROP_MOST: std::time::Duration = std::time::Duration::from_secs(2);
+/// A drop waited for longer than this is said (a submission is a frame or
+/// so; one waiting out the pipeline allowance, up to 10 s).
+const SLOW_DROP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// What lists last ran with, as taken from [`RAN`].
 type Ran = fx::Map<usize, Arc<Layout>>;
@@ -998,7 +1014,6 @@ pub(crate) fn serve_drops() {
             crate::host::release_later(Box::new(left.0));
         }
     }
-    crate::pinned::run_queued_later();
 }
 
 /// At a frame's end, with the backstop on: the page tables drop the runs
@@ -1045,8 +1060,6 @@ fn drop_runs_now(dead: &[u64]) {
     if !ran.is_empty() {
         crate::host::release_later(Box::new(ran));
     }
-    // Title changes queued over runs the tables named may be done now.
-    crate::pinned::run_queued_later();
 }
 
 /// [`drop_runs_now`], what lists ran with given back to be dropped.
@@ -1396,11 +1409,8 @@ fn layout(key: usize) -> Arc<Layout> {
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory). Whether the table names title memory
-/// in place load-only: what the list stores there is dropped, so what it
-/// computed is partial and its copies are withheld as a miss's are
-/// (`crate::host`'s settle).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) -> bool {
+/// until a step writes title memory).
+pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
@@ -1409,23 +1419,26 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let stale = s.generation != now;
         let stale = stale || counting() && s.wanted != wanted().len();
         let stale = stale || crate::inplace::backstop() && s.in_place != crate::inplace::generation();
-        if stale {
-            s.rewrite(heap, now);
-        } else if crate::inplace::backstop() {
-            // Load-only while memory is opened or a miss withholds, and
-            // writable again once neither holds: the runs' pairs alone.
-            let load_only = crate::inplace::table_load_only();
-            if s.load_only != load_only {
-                s.set_load_only(heap, load_only);
+        if !s.retired_pairs.is_empty() && !crate::host::unwaited_running() {
+            for pair in s.retired_pairs.drain(..) {
+                heap.raw_pair_at(pair, None, 0);
+                heap.free_pair(pair);
             }
         }
-        Some((s.layout.clone(), s.load_only && !s.layout.runs.is_empty()))
+        // Load-only while memory is opened or a miss withholds, and
+        // writable again once neither holds: the runs' pairs alone, unless
+        // they were given up (a retire not waited for) and the table names
+        // fresh ones.
+        let flip = crate::inplace::backstop() && s.load_only != crate::inplace::table_load_only();
+        if flip && !stale {
+            s.set_load_only(heap, !s.load_only);
+        }
+        if stale || s.run_pairs.is_empty() && !s.layout.runs.is_empty() {
+            s.rewrite(heap, now);
+        }
+        Some(s.layout.clone())
     })
     .flatten();
-    let (layout, load_only) = match layout {
-        Some((l, load_only)) => (Some(l), load_only),
-        None => (None, false),
-    };
     // The layout replaced may hold copies' last references: released off
     // the submitting thread, as in `rewrite`.
     if let Some(l) = &layout
@@ -1444,7 +1457,24 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
             }
         }
     }
-    load_only
+}
+
+/// At a submission's settle, for a list whose lists used the page tables of
+/// view heaps `heaps`: whether one of them named title memory in place
+/// load-only as the submission ran (its state now: no submission prepares
+/// between a submission's last prepare and its settle). Its stores there were
+/// dropped (atomics read 0), so what it computed is partial.
+pub(crate) fn ran_load_only(heaps: &[usize]) -> bool {
+    if heaps.is_empty() {
+        return false;
+    }
+    let tables: Vec<(usize, bool)> = shared().iter().map(|(k, s)| (*k, s.load_only && !s.layout.runs.is_empty())).collect();
+    load_only_of(heaps, &tables)
+}
+
+/// [`ran_load_only`] over `tables` (heap, names runs load-only).
+fn load_only_of(heaps: &[usize], tables: &[(usize, bool)]) -> bool {
+    tables.iter().any(|&(k, load_only)| load_only && heaps.contains(&k))
 }
 
 /// `list` uses title memory with view heap `key` bound: the heap's page
@@ -1728,6 +1758,18 @@ pub(crate) fn without_a_miss() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The settle asks the tables of every heap a list used as they are
+    /// then (a later list's prepare may have turned one load-only after its
+    /// own): one load-only table withholds it.
+    #[test]
+    fn a_list_is_withheld_for_any_heap_left_load_only() {
+        let tables = [(1, false), (2, true), (3, false)];
+        assert!(load_only_of(&[1, 2], &tables), "turned load-only by a later list");
+        assert!(!load_only_of(&[1, 3], &tables));
+        assert!(!load_only_of(&[], &tables));
+        assert!(!load_only_of(&[9], &tables), "a heap with no table");
+    }
 
     /// A submission's miss is known before the next submission writes its
     /// tables: submissions are serialised from preparation to retire

@@ -243,8 +243,9 @@ pub(crate) const ALLOWANCE: Duration = Duration::from_secs(10);
 /// Of it, the most for pipelines that are not urgent.
 const BUDGET: Duration = Duration::from_millis(500);
 
-/// Of it, the most for title memory being opened in place, well under the
-/// 2 s a title change waits for the page tables (`crate::memory`).
+/// Of it, the most for title memory being opened in place a frame: the
+/// title's submission waits for it before it takes any lock
+/// (`crate::inplace::wait_private`).
 const MEMORY_MOST: Duration = Duration::from_millis(500);
 
 /// Of it, what is kept for passes over the screen and the builder: other
@@ -876,7 +877,6 @@ mod tests {
         s.spend(9, Class::Memory, MEMORY_MOST);
         assert_eq!(s.take(9, Class::Memory, ALLOWANCE), Duration::ZERO, "spent this frame");
         assert_eq!(s.left(9, Class::Screen), ALLOWANCE - MEMORY_MOST, "on the one clock");
-        assert!(MEMORY_MOST * 4 <= Duration::from_secs(2), "well under a title change's wait");
         let mut s = Spent::new();
         s.left(9, Class::Screen);
         s.spend(9, Class::Urgent, ALLOWANCE - SCREEN_RESERVE);
