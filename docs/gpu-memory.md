@@ -236,7 +236,10 @@ runtime reports where each run of title addresses lies in its own views
 of the physical sections (`title_memory_own`), which names the pages
 whatever addresses show them. The shader page table names the shared
 copy at both address ranges. A remap, a free or a release of the sharing
-buffer parts it from the copy again.
+buffer parts it from the copy again, and so does a release of the buffer
+that owns the copy: a released buffer's copy, alive in lists only, is
+never shared, so a buffer made again at its addresses does not leave the
+pages in two copies.
 
 A buffer shares only when all its pages lie in one physical run that the
 other copy holds whole, and never a copy in upload memory when shaders

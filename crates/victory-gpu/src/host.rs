@@ -6917,6 +6917,56 @@ mod copy_order {
         crate::watch::title_memory_remapped(b, len);
     }
 
+    /// The buffer whose copy others share is released and made again at
+    /// its addresses: those sharing part, and the pages end up in one
+    /// copy again, not in the released one and a new one beside it.
+    #[test]
+    fn a_shared_copy_released_by_its_buffer_is_not_kept_beside_a_new_one() {
+        use crate::memsys::alias::ON_HERE;
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        if super::host().is_none() {
+            return; // no host GPU here
+        }
+        let len = 2 * PAGE;
+        // SAFETY: a pagefile section mapped read-write three times; kept.
+        let (a, b, own) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize;
+            (map(), map(), map())
+        };
+        assert!(a != 0 && b != 0 && own != 0);
+        struct Here;
+        impl Drop for Here {
+            fn drop(&mut self) {
+                ON_HERE.set(false);
+            }
+        }
+        ON_HERE.set(true);
+        let _here = Here;
+        crate::watch::title_memory_own(a, len, own);
+        crate::watch::title_memory_own(b, len, own);
+        let (au, bu, n) = (a as u64, b as u64, len as u64);
+        crate::shadow::register(a, au, n);
+        crate::shadow::register(b, bu, n);
+        let old = crate::shadow::find(au, n).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&old, &crate::shadow::find(bu, n).unwrap()));
+        // A list still holds the copy of `a`'s released buffer.
+        crate::shadow::unregister(a, au);
+        assert!(old.shared_at().is_empty(), "the buffer sharing it parted");
+        crate::shadow::register(a, au, n);
+        let at_b = crate::shadow::find(bu, n).unwrap();
+        let at_a = crate::shadow::find(au, n).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&old, &at_b), "the released copy is not taken again");
+        assert!(std::sync::Arc::ptr_eq(&at_a, &at_b), "one copy of the pages");
+        crate::shadow::unregister(a, au);
+        crate::shadow::unregister(b, bu);
+        crate::watch::title_memory_remapped(a, len);
+        crate::watch::title_memory_remapped(b, len);
+        drop((old, at_a, at_b));
+    }
+
     /// With the gate on, a submission's write marks are taken on the GPU
     /// as it ends, its marked page goes back from them, and the bitmap is
     /// clear for the next submission.

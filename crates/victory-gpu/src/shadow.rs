@@ -2248,15 +2248,28 @@ fn homes() -> std::sync::MutexGuard<'static, Homes> {
 /// when its pages are not in one run, no copy holds them all, or the
 /// copy cannot serve it (in memory shaders must not write, for a buffer
 /// they may write).
-fn share(homes: &mut Homes, key: (u64, usize), len: u64, read_only: bool) -> Option<Arc<Shadow>> {
+fn share(
+    homes: &mut Homes,
+    map: &BTreeMap<(u64, usize), Entry>,
+    key: (u64, usize),
+    len: u64,
+    read_only: bool,
+) -> Option<Arc<Shadow>> {
     let own = crate::memsys::alias::home(key.0, len)?;
     let (at, n, copy) = homes.copies.range(..=own).next_back().map(|(&at, (n, copy))| (at, *n, copy.upgrade()))?;
     let Some(copy) = copy else {
         homes.copies.remove(&at);
         return None;
     };
+    // Its own buffer still holds it: a released buffer's copy, alive in
+    // lists only, is not taken (its next buffer would make a second copy
+    // of the same pages beside it).
+    let owned = || {
+        map.range((copy.start, 0)..=(copy.start, usize::MAX))
+            .any(|(_, e)| e.shadow.as_ref().is_some_and(|s| Arc::ptr_eq(s, &copy)))
+    };
     // The copy still stands for those pages at its own addresses.
-    if copy.gone.load(Ordering::Relaxed) || crate::memsys::alias::home(copy.start, copy.len) != Some(at) {
+    if copy.gone.load(Ordering::Relaxed) || crate::memsys::alias::home(copy.start, copy.len) != Some(at) || !owned() {
         homes.copies.remove(&at);
         return None;
     }
@@ -2308,15 +2321,23 @@ fn at_home(homes: &mut Homes, copy: &Arc<Shadow>) {
 /// buffer's addresses or the copy's own: the buffer gets a copy of its
 /// own at its next use, and the window ends ([`Shadow::windows`]).
 fn part(map: &mut BTreeMap<(u64, usize), Entry>, at: u64, len: u64) {
+    let end = at.saturating_add(len);
+    part_if(map, |key, n, copy| {
+        key.0 < end && at < key.0 + n || copy.is_none_or(|c| c.start < end && at < c.start + c.len)
+    });
+}
+
+/// Buffers that share a copy part from it where `hit` says so, given the
+/// buffer's key, its bytes and the copy (none: gone).
+fn part_if(map: &mut BTreeMap<(u64, usize), Entry>, hit: impl Fn((u64, usize), u64, Option<&Arc<Shadow>>) -> bool) {
     if SHARING.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let end = at.saturating_add(len);
     let mut homes = homes();
     let before = homes.sharing.len();
     homes.sharing.retain(|&(key, n, ref copy)| {
         let copy = copy.upgrade();
-        let hit = key.0 < end && at < key.0 + n || copy.as_ref().is_none_or(|c| c.start < end && at < c.start + c.len);
+        let hit = hit(key, n, copy.as_ref());
         if hit {
             if let Some(copy) = &copy {
                 if let Some(entry) = map.get_mut(&key)
@@ -2378,11 +2399,16 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     // Counted once the map has changed.
     OWNERS.fetch_add(1, std::sync::atomic::Ordering::Release);
     // A buffer sharing another's copy: that copy is not its to retire.
-    let end = removed.as_ref().map_or(start, |e| e.end);
-    let shared = removed.as_ref().and_then(|e| e.shadow.as_ref()).is_some_and(|copy| !copy.owns(start));
+    let copy = removed.as_ref().and_then(|e| e.shadow.as_ref());
+    let shared = copy.is_some_and(|copy| !copy.owns(start));
     if shared {
         // Its entry is gone: only the window ends.
-        part(&mut map, start, end - start);
+        part_if(&mut map, |key, _, copy| key == (start, resource) || copy.is_none());
+    } else if let Some(copy) = copy {
+        // Its own buffer's copy: those sharing it part too, and none takes
+        // it again ([`share`]). Kept, the next buffer at these addresses
+        // would make a second copy of the pages beside it.
+        part_if(&mut map, |_, _, c| c.is_none_or(|c| Arc::ptr_eq(c, copy)));
     }
     drop(map);
     if let Some(copy) = removed.and_then(|e| e.shadow) {
@@ -2597,14 +2623,16 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = map.get(&key)?;
     if entry.shadow.is_none() && crate::memsys::alias::on() {
         // Another buffer's copy of the same physical pages, if any.
-        entry.shadow = share(&mut homes(), key, entry.end - key.0, entry.read_only);
-        if entry.shadow.is_some() {
+        let shared = share(&mut homes(), &map, key, entry.end - key.0, entry.read_only);
+        if shared.is_some() {
+            map.get_mut(&key)?.shadow = shared;
             changed();
         }
     }
+    let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -3060,8 +3088,8 @@ impl Arena {
 
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    // A copy other buffers share is named once, by its own buffer (or by
-    // none, once that one is released: then by the first that shares it).
+    // A copy other buffers share is named once, by its own buffer (they
+    // part from it when that one is released).
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
     if SHARING.load(Ordering::Relaxed) != 0 {
         let mut seen = crate::fx::Set::default();
