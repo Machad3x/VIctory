@@ -138,6 +138,23 @@ fn page_buffer() -> Box<[u8]> {
     pooled.unwrap_or_else(|| vec![0u8; PAGE].into_boxed_slice())
 }
 
+/// Room for `n` buffers in `pool` unless it has some, allocated without
+/// its lock: the guard handler takes it, perhaps holding the heap's lock.
+fn reserve(pool: &Mutex<Vec<Box<[u8]>>>, n: usize) {
+    if pool.lock().unwrap_or_else(|e| e.into_inner()).capacity() > 0 {
+        return;
+    }
+    let mut room = Vec::with_capacity(n);
+    {
+        let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.capacity() == 0 {
+            std::mem::swap(&mut *pool, &mut room);
+        }
+    }
+    // Another thread's room, or the empty one, freed unlocked.
+    drop(room);
+}
+
 /// Gives a saved page's buffer back to [`SAVE_POOL`] (freed when full).
 fn recycle(bytes: Box<[u8]>) {
     debug_assert_eq!(bytes.len(), PAGE);
@@ -500,13 +517,8 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
         return None;
     }
     install();
-    {
-        let mut pool = SAVE_POOL.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.capacity() == 0 {
-            // Once, outside the guard handler, so its pushes never allocate.
-            pool.reserve_exact(SAVE_POOL_MAX);
-        }
-    }
+    // Once, outside the guard handler, so its pushes never allocate.
+    reserve(&SAVE_POOL, SAVE_POOL_MAX);
     // The rest of the range, as byte runs.
     let mut untracked: Vec<(usize, usize)> = Vec::new();
     let mut at = start;
@@ -1791,6 +1803,18 @@ pub(crate) mod tests {
         assert_eq!(saved(2), None, "disarmed");
         drop(t);
         free(p);
+    }
+
+    #[test]
+    fn the_save_pool_is_reserved_once_keeping_its_buffers() {
+        let pool = Mutex::new(Vec::new());
+        super::reserve(&pool, 4);
+        assert!(pool.lock().unwrap().capacity() >= 4);
+        pool.lock().unwrap().push(vec![1u8].into_boxed_slice());
+        super::reserve(&pool, 64);
+        let pool = pool.into_inner().unwrap();
+        assert!(pool.capacity() < 64, "reserved once");
+        assert_eq!(pool.len(), 1, "its buffers kept");
     }
 
     /// A save into a pooled buffer holding another page's bytes keeps the
