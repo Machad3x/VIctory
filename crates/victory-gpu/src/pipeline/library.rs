@@ -379,8 +379,8 @@ pub(crate) fn save_every() -> Option<std::time::Duration> {
 }
 
 /// Whether a save is due: `SAVE_AFTER` pipelines made since the last, or
-/// the workers ran out and `DRAINED_EVERY` passed; with `save_every`, its
-/// time passed.
+/// `DRAINED_EVERY` passed and the workers ran out or made one (an abrupt
+/// end loses at most that much); with `save_every`, its time passed.
 fn due(
     why: Save,
     unsaved: u64,
@@ -392,7 +392,7 @@ fn due(
         (Save::Now, _) => true,
         (_, Some(every)) => passed(every),
         (Save::Drained, None) => unsaved >= SAVE_AFTER || passed(DRAINED_EVERY),
-        (Save::Made, None) => unsaved >= SAVE_AFTER,
+        (Save::Made, None) => unsaved >= SAVE_AFTER || (unsaved > 0 && passed(DRAINED_EVERY)),
     }
 }
 
@@ -622,7 +622,9 @@ mod tests {
     fn saves_are_due_by_count_drain_or_the_timer() {
         use std::time::Duration;
         let (hour, zero) = (Some(Duration::from_secs(3600)), Some(Duration::ZERO));
-        assert!(!due(Save::Made, SAVE_AFTER - 1, None, hour));
+        assert!(due(Save::Made, SAVE_AFTER - 1, None, hour), "made ones wait at most DRAINED_EVERY");
+        assert!(!due(Save::Made, SAVE_AFTER - 1, None, zero));
+        assert!(!due(Save::Made, 0, None, hour));
         assert!(due(Save::Made, SAVE_AFTER, None, zero));
         assert!(due(Save::Drained, 1, None, Some(DRAINED_EVERY)));
         assert!(due(Save::Drained, 0, None, None));
