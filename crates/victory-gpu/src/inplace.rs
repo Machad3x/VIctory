@@ -595,11 +595,7 @@ pub(crate) fn wait_private() -> bool {
     }
     let started = std::time::Instant::now();
     let left = PRIVATE_WAIT_US.saturating_sub(WAITED_US.load(Ordering::Relaxed));
-    let mut done = false;
-    while !done && (started.elapsed().as_micros() as u64) < left {
-        std::thread::sleep(std::time::Duration::from_micros(200));
-        done = PRIVATE_PENDING.load(Ordering::Relaxed) == 0;
-    }
+    let done = wait_pending(Some(std::time::Duration::from_micros(left)));
     let waited = started.elapsed().as_micros() as u64;
     WAITED_US.fetch_add(waited, Ordering::Relaxed);
     RT[5].fetch_add(1, Ordering::Relaxed);
@@ -608,6 +604,33 @@ pub(crate) fn wait_private() -> bool {
         RT[3].fetch_add(1, Ordering::Relaxed);
     }
     done
+}
+
+/// Signalled (under [`SETTLED_LOCK`]) when no private run is left asked of
+/// the worker.
+static SETTLED: std::sync::Condvar = std::sync::Condvar::new();
+static SETTLED_LOCK: Mutex<()> = Mutex::new(());
+
+/// A private run asked of the worker is no longer waited for.
+fn asked_done() {
+    if PRIVATE_PENDING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        // Taken so that a waiter between its test and its wait is not missed.
+        let _settled = SETTLED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SETTLED.notify_all();
+    }
+}
+
+/// Waits until no private run is left asked of the worker, for `limit` at
+/// most (None: as long as that takes); woken by [`asked_done`], no polling.
+/// True if none is left.
+fn wait_pending(limit: Option<std::time::Duration>) -> bool {
+    let pending = |_: &mut ()| PRIVATE_PENDING.load(Ordering::Relaxed) != 0;
+    let settled = SETTLED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut settled = match limit {
+        Some(limit) => SETTLED.wait_timeout_while(settled, limit, pending).unwrap_or_else(|e| e.into_inner()).0,
+        None => SETTLED.wait_while(settled, pending).unwrap_or_else(|e| e.into_inner()),
+    };
+    !pending(&mut settled)
 }
 
 /// Sends `[at, at + len)` to the opening thread.
@@ -627,7 +650,7 @@ fn worker(at: usize, len: usize, private: bool) {
     if work.lock().unwrap_or_else(|e| e.into_inner()).send((at, len, private)).is_err() {
         with_runs(|r| r.pending.remove(&(at, len)));
         if private {
-            PRIVATE_PENDING.fetch_sub(1, Ordering::Relaxed);
+            asked_done();
         }
     }
 }
@@ -639,7 +662,7 @@ struct Asked(bool);
 impl Drop for Asked {
     fn drop(&mut self) {
         if self.0 {
-            PRIVATE_PENDING.fetch_sub(1, Ordering::Relaxed);
+            asked_done();
         }
     }
 }
@@ -687,6 +710,8 @@ fn open_run(at: usize, len: usize, private: bool) {
         LOCKED.fetch_add(1, Ordering::Relaxed);
         let pin = crate::pinned::pin(start, bytes, Box::new(move || release_private(start, id)));
         PINS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, pin);
+        #[cfg(test)]
+        stall::opening(start);
     }
     let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
         // SAFETY: our own view of sections whose pages the title's views
@@ -765,6 +790,55 @@ fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, 
     Some(old)
 }
 
+/// Tests: an open over the armed address stops once its run is registered
+/// (locked, pinned, [`PRIVATE_OPENING`] held, heap not open) until a release of it
+/// has begun ([`release_private`]), which then waits for the open: the
+/// title's free lands in the middle of the open, every time.
+#[cfg(test)]
+mod stall {
+    use std::sync::{Condvar, Mutex};
+
+    /// The armed address (0: none), whether its open is stopped, whether
+    /// its release has begun.
+    static STATE: Mutex<(usize, bool, bool)> = Mutex::new((0, false, false));
+    static MOVED: Condvar = Condvar::new();
+    /// Far past any step's time: a test that never releases fails, not hangs.
+    const MOST: std::time::Duration = std::time::Duration::from_secs(30);
+
+    fn state() -> std::sync::MutexGuard<'static, (usize, bool, bool)> {
+        STATE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn arm(at: usize) {
+        *state() = (at, false, false);
+    }
+
+    /// On the opening thread, the run registered and not opened.
+    pub(super) fn opening(start: usize) {
+        let mut s = state();
+        if s.0 == 0 || s.0 != start {
+            return;
+        }
+        s.1 = true;
+        MOVED.notify_all();
+        drop(MOVED.wait_timeout_while(s, MOST, |s| !s.2).unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// A release of the run at `start` begins.
+    pub(super) fn releasing(start: usize) {
+        let mut s = state();
+        if s.0 != 0 && s.0 == start {
+            s.2 = true;
+            MOVED.notify_all();
+        }
+    }
+
+    /// Waits for the armed open to stop; true if it did.
+    pub(super) fn stopped() -> bool {
+        MOVED.wait_timeout_while(state(), MOST, |s| !s.1).unwrap_or_else(|e| e.into_inner()).0.1
+    }
+}
+
 /// The private run `id` is no longer registered with `crate::pinned`.
 fn unpin(id: u64) {
     let pin = PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -802,6 +876,8 @@ fn release_private(start: usize, id: u64) {
     // An open under way ends first (it registered before opening), and its
     // run is forgotten here. Not held while waiting for the tables below:
     // their holder may wait for the opening thread.
+    #[cfg(test)]
+    stall::releasing(start);
     let run = {
         let _opening = PRIVATE_OPENING.lock().unwrap_or_else(|e| e.into_inner());
         forget_private(start, id)
@@ -1427,7 +1503,7 @@ mod tests {
         assert!(private_open(at, len) && !private_open(at, len + PAGE));
         // Opened as the worker opens a run a page table asked for.
         assert!(run_for(at, len, true).is_none(), "asked of the worker");
-        assert!(wait_private(), "the worker opened it or was refused");
+        assert!(wait_pending(None), "the worker opened it or was refused");
         let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) else {
             // Not open: only if the host itself refuses such a heap (a
             // driver or Windows without `ID3D12Device13`), said out loud.
@@ -1458,7 +1534,7 @@ mod tests {
         // protection (`XMemVirtualAlloc` at an address): let go if the host
         // refuses that as locked, and done either way.
         assert!(run_for(at, len, true).is_none());
-        assert!(wait_private());
+        assert!(wait_pending(None));
         let reopened = with_runs(|r| holding(&r.open, at, len)).is_some();
         let commit = || {
             // SAFETY: our allocation's first page, committed already.
@@ -1477,7 +1553,7 @@ mod tests {
         // still holds its heap: the pages stay locked, and the title's free
         // still lets the heap go first.
         assert!(run_for(at, len, true).is_none());
-        assert!(wait_private());
+        assert!(wait_pending(None));
         if let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) {
             let id = run.id;
             crate::memory::ran_with(key, run);
@@ -1489,6 +1565,54 @@ mod tests {
         } else {
             assert_ne!(free(), 0, "and freed");
         }
+    }
+
+    /// The title frees private memory while the worker opens a run over it:
+    /// the open stops once the run is registered ([`stall`]) and the free
+    /// begins then, so it always lands mid-open. The free waits for the open,
+    /// lets the run go and works; nothing is left open, locked or pinned.
+    #[test]
+    fn a_title_free_during_an_open_waits_for_it_and_works() {
+        use windows_sys::Win32::System::Memory as mem;
+        let len = 4 * PAGE;
+        // SAFETY: plain allocation, freed below.
+        let at = unsafe { mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        // Reported, as the runtime reports the title's private heaps.
+        merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+        stall::arm(at);
+        assert!(run_for(at, len, true).is_none(), "asked of the worker");
+        assert!(stall::stopped(), "the open stopped, registered");
+        assert!(locked(at / PAGE), "locked before the heap opens");
+        assert!(crate::pinned::title_memory_held());
+        let freer = std::thread::spawn(move || {
+            // SAFETY: our allocation.
+            crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) })
+        });
+        let freed = freer.join().unwrap();
+        stall::arm(0);
+        assert_ne!(freed, 0, "freed after the open let go");
+        assert!(wait_pending(None));
+        assert!(with_runs(|r| holding(&r.open, at, len)).is_none(), "nothing open there");
+        assert!(!locked(at / PAGE), "nothing locks it");
+        assert!(locked_ranges().keys().all(|&(s, _)| s != at), "unregistered");
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of::<mem::MEMORY_BASIC_INFORMATION>()) };
+        assert_eq!(info.State, mem::MEM_FREE);
+    }
+
+    /// The wait for the worker ends when the last asked run is done, woken
+    /// rather than polled, and a bounded wait with one left says so.
+    #[test]
+    fn the_wait_for_the_worker_ends_with_the_last_asked_run() {
+        PRIVATE_PENDING.fetch_add(1, Ordering::Relaxed);
+        let asked = Asked(true);
+        assert!(!wait_pending(Some(std::time::Duration::ZERO)), "one left");
+        let done = std::thread::spawn(move || drop(asked));
+        assert!(wait_pending(None));
+        done.join().unwrap();
     }
 
     /// Spans merge touching ranges, and a page counts as within one only
