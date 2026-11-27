@@ -218,6 +218,9 @@ pub(crate) enum C {
     /// changed, or unmade holding a view record), of the `SyncSlots`
     /// looked at.
     SyncChanged,
+    /// Nanoseconds threads waited for a copy's stale page lock another
+    /// held (a riding pull holds them over its submission's wait).
+    StaleLockWaitNs,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -559,7 +562,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans; {:.0} pulls run under their submission's wait",
+        "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans; {:.0} pulls run under their submission's wait; {:.2} ms waited on stale page locks",
         ms(c[C::MarkedPullUs as usize]),
         ms(c[C::MarkedBackWallUs as usize]),
         ms(c[C::MarkedOverlapUs as usize]),
@@ -571,6 +574,7 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::MarkedRetakeUs as usize]),
         c[C::MarkedSpans as usize],
         c[C::PullsRiding as usize],
+        c[C::StaleLockWaitNs as usize] / 1e6,
     );
     tracing::info!(
         "  null UAV barriers per frame: title buffer barriers {:.0} read to read, {:.0} begin only, {:.0} other; {:.0} the title's own; {:.0} for barrier groups; {:.0} indirect clamps ({:.0} with no shader write since the one before); {:.1} MB refreshed into video memory only",

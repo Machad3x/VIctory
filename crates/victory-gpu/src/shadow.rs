@@ -1223,7 +1223,7 @@ impl Shadow {
     /// The mirror is behind video memory over offsets `[from, to)`.
     fn stale(&self, from: usize, to: usize) {
         let Some(v) = &self.vram else { return };
-        let mut bits = v.stale.lock().unwrap_or_else(|e| e.into_inner());
+        let mut bits = lock_stale(&v.stale);
         for k in from / PAGE..to.div_ceil(PAGE) {
             bits[k / 64] |= 1 << (k % 64);
         }
@@ -1247,7 +1247,7 @@ impl Shadow {
         };
         let len = self.len as usize;
         let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
-        let bits = v.stale.lock().unwrap_or_else(|e| e.into_inner());
+        let bits = lock_stale(&v.stale);
         for k in from / PAGE..to.div_ceil(PAGE).min(len.div_ceil(PAGE)) {
             if bits[k / 64] >> (k % 64) & 1 == 0 {
                 continue;
@@ -1659,7 +1659,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
 // shortcut: shaders' writes outside every declared range and marked page
 // (to the copy, not to title memory) stay in video memory: the mirror keeps
 // the bytes from before until a later range brings them.
-pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
+/// Recording a riding pull, it returns the stale pages' locks, for the
+/// submission to hold until its wait ([`bring_back`]).
+pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) -> Held<'_> {
     // Whole pages, so that the pages pulled are current in the mirror.
     let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
     for (copy, address, len) in ranges {
@@ -1676,7 +1678,7 @@ pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) {
         );
         runs.push((copy, from, to - from));
     }
-    bring_back(&mut runs);
+    bring_back(&mut runs)
 }
 
 /// Before a submission whose lists declared that shaders write title
@@ -1732,10 +1734,11 @@ pub(crate) fn snapshots_done(ranges: &[(Arc<Shadow>, usize, usize)]) {
 /// its page again once the lock is released, so the bit is not lost.
 /// Its `copy_now` is recorded instead while the thread records a riding
 /// pull (`crate::host::riding_active`): that needs a single submitting
-/// thread, the one whose submission runs the recorded list.
-fn bring_back(runs: &mut [(&Shadow, usize, usize)]) {
+/// thread, the one whose submission runs the recorded list. The locks are
+/// then returned, to be held until the submission's wait.
+fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
     if runs.is_empty() {
-        return;
+        return Held(Vec::new());
     }
     runs.sort_unstable_by_key(|r| (std::ptr::from_ref(r.0) as usize, r.1));
     // Overlapping or adjacent runs of a copy as one region.
@@ -1751,17 +1754,19 @@ fn bring_back(runs: &mut [(&Shadow, usize, usize)]) {
         merged.push((copy, at, n));
     }
     // Locked in address order (the runs are sorted by copy).
-    let mut locked = Vec::new();
+    let mut locked: Vec<(&Shadow, std::sync::MutexGuard<'_, Vec<u64>>, Vec<(usize, usize)>)> = Vec::new();
     let mut regions = Vec::with_capacity(merged.len());
     for &(copy, at, n) in &merged {
         let Some(v) = &copy.vram else { continue };
-        if !locked.last().is_some_and(|(c, _)| std::ptr::eq(*c, copy)) {
-            locked.push((copy, v.stale.lock().unwrap_or_else(|e| e.into_inner())));
+        if !locked.last().is_some_and(|(c, ..)| std::ptr::eq(*c, copy)) {
+            locked.push((copy, lock_stale(&v.stale), Vec::new()));
         }
-        let bits = &mut locked.last_mut().expect("just pushed").1;
-        for k in at / PAGE..(at + n).div_ceil(PAGE) {
+        let (_, bits, pages) = locked.last_mut().expect("just pushed");
+        let (from, to) = (at / PAGE, (at + n).div_ceil(PAGE));
+        for k in from..to {
             bits[k / 64] &= !(1 << (k % 64));
         }
+        pages.push((from, to));
         regions.push((&v.mirror, at as u64, &copy.buffer, at as u64, n as u64));
     }
     #[cfg(test)]
@@ -1771,6 +1776,49 @@ fn bring_back(runs: &mut [(&Shadow, usize, usize)]) {
     if let Some(host) = host() {
         host.copy_now(&regions);
     }
+    if crate::host::riding_active() {
+        // Copies with no page brought back are not held over the wait.
+        return Held(
+            locked.into_iter().filter(|(.., pages)| !pages.is_empty()).map(|(_, bits, pages)| (bits, pages)).collect(),
+        );
+    }
+    Held(Vec::new())
+}
+
+/// Stale page locks a riding pull holds until its copies ran, with the
+/// pages (index ranges) it marked current under each.
+pub(crate) struct Held<'a>(Vec<(std::sync::MutexGuard<'a, Vec<u64>>, Vec<(usize, usize)>)>);
+
+impl Held<'_> {
+    /// The copies may not have run: their pages are stale again.
+    pub(crate) fn restale(&mut self) {
+        for (bits, pages) in &mut self.0 {
+            for k in pages.iter().flat_map(|&(a, b)| a..b) {
+                bits[k / 64] |= 1 << (k % 64);
+            }
+        }
+    }
+
+    /// Unlocks them.
+    pub(crate) fn release(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// A copy's stale bits, locked; with diagnostics, time spent waiting for
+/// another holder (a riding pull holds them over its submission) counted.
+fn lock_stale(stale: &Mutex<Vec<u64>>) -> std::sync::MutexGuard<'_, Vec<u64>> {
+    #[cfg(feature = "diagnostics")]
+    match stale.try_lock() {
+        Ok(bits) => return bits,
+        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::StaleLockWaitNs);
+            return stale.lock().unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    stale.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// GPU copies [`bring_back`] made (tests).
@@ -2543,6 +2591,17 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Pages a riding pull marked current are stale again on `restale`,
+    /// and unlocked on `release`.
+    #[test]
+    fn held_stale_pages_come_back_on_restale() {
+        let stale = Mutex::new(vec![0u64; 2]);
+        let mut held = Held(vec![(stale.lock().unwrap(), vec![(1, 3), (64, 65)])]);
+        held.restale();
+        held.release();
+        assert_eq!(*stale.lock().unwrap(), [0b110, 1]);
+    }
     use windows::Win32::Graphics::Direct3D12::*;
 
     /// Runs this binary's test `name` again in a child process with

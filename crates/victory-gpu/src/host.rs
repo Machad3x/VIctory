@@ -113,11 +113,14 @@ struct PullList {
 unsafe impl Send for PullList {}
 
 /// A pull recorded to run after a submission's lists: the list (locked
-/// until the wait) and the buffers it copies between.
-struct Riding {
+/// until the wait), the buffers it copies between, and the locks of the
+/// stale pages it brings back (held until the wait, as `copy_now` holds
+/// them: a reader meanwhile would take the mirror for current).
+struct Riding<'a> {
     guard: std::sync::MutexGuard<'static, PullList>,
     list: ID3D12CommandList,
     _regions: Regions,
+    stale: crate::shadow::Held<'a>,
 }
 
 /// Whether a submission's pull runs right after its lists, under their
@@ -1868,6 +1871,15 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        // The riding copies ran, or never will: their pages unlock before
+        // anything here reads a mirror. Not waited for, they may run later:
+        // their pages stay stale.
+        if let Some(Some(r)) = &mut riding {
+            if unwaited {
+                r.stale.restale();
+            }
+            r.stale.release();
+        }
         #[cfg(feature = "diagnostics")]
         let waited_at = std::time::Instant::now();
         let gpu = prepared.elapsed();
@@ -4899,7 +4911,10 @@ impl Host {
     /// the pull is still due after the wait (no list, or the last one's run
     /// was not waited for); the stale bits it cleared stay cleared, and it
     /// copies its ranges whole again.
-    fn pull_riding(&self, snapshots: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> Option<Option<Riding>> {
+    fn pull_riding<'a>(
+        &self,
+        snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) -> Option<Option<Riding<'a>>> {
         static LIST: OnceLock<Option<Mutex<PullList>>> = OnceLock::new();
         let list = LIST.get_or_init(|| {
             // SAFETY: plain creation; the list is closed until used.
@@ -4934,7 +4949,7 @@ impl Host {
         }
         RIDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
         let recording = Recording;
-        crate::shadow::pull(snapshots);
+        let mut stale = crate::shadow::pull(snapshots);
         let regions = RIDING.with(|r| r.borrow_mut().take()).unwrap_or_default();
         drop(recording);
         if regions.is_empty() {
@@ -4953,9 +4968,10 @@ impl Host {
             })
         };
         match recorded {
-            Ok(list) => Some(Some(Riding { guard, list, _regions: regions })),
+            Ok(list) => Some(Some(Riding { guard, list, _regions: regions, stale })),
             Err(e) => {
                 tracing::warn!(error = %e, "pull list not recorded: the pull waits on its own");
+                stale.restale();
                 None
             }
         }
