@@ -103,6 +103,16 @@
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
 //!   down: GPU faults at low addresses).
+//! * **Slot map** (added 2026-11-27, only where the host keeps one,
+//!   [`slot_map`]): every heap index a program computes from a title
+//!   descriptor address (tables and the resource heap itself, not
+//!   samplers) is clamped below [`heap_views`] and replaced by dword
+//!   [`heap_views`] + index of the view-stride table (`t`[`VIEW_STRIDES`]):
+//!   the host slot holding that slot's view. Title slots holding the same
+//!   record then share one host descriptor; the host keeps the entry of
+//!   every other index (its own slots, the nulls) at the index itself, and
+//!   every table it indexes there (strides, marks, view addresses, read
+//!   marks) follows the slot looked up.
 //! * **Views off 16 bytes** (added 2026-11-25): the host makes a
 //!   structured view raw from the 16 bytes at or below its first byte, in
 //!   its buffer's own copy, and keeps the bytes skipped in the top bits of
@@ -262,7 +272,7 @@ pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, PORTABLE_TITLE_VIEWS, PORTABLE_VIEWS, ROOT_CBV_SPACE,
     SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS,
     VIEW_SIGNED, VIEW_SKIP_SHIFT, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
-    heap_views, null_buffer_view, set_heap_views,
+    heap_views, null_buffer_view, set_heap_views, set_slot_map, slot_map,
 };
 
 /// The loop limit without an override: 2^20.

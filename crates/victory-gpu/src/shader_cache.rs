@@ -72,10 +72,11 @@ fn build() -> &'static [u8; 32] {
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
 /// The view heap size translations are made for, once the device has said
-/// what it takes.
+/// what it takes, with bit 31 set where they read the slot map
+/// (`VICTORY_DESC_MAP=on`; heap sizes stay below 2^22).
 pub(crate) fn view_limit() -> u32 {
     crate::host::heap_views();
-    victory_shader::emit::heap_views()
+    victory_shader::emit::heap_views() | u32::from(victory_shader::emit::slot_map()) << 31
 }
 
 fn key(translator: &str, encoding: &[u8], limit: u32, views: u32) -> [u8; 32] {

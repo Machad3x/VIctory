@@ -77,6 +77,40 @@ pub fn set_heap_views(views: u32) -> u32 {
     *HOST_VIEWS.get_or_init(|| views)
 }
 
+static SLOT_MAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SLOT_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether title heap indices go through the host's slot map (`emit`,
+/// "Slot map"): the host says so before any translation
+/// ([`set_slot_map`]), else not. Fixed for the process at first use, and
+/// part of every translation: caches must key on it.
+pub fn slot_map() -> bool {
+    #[cfg(test)]
+    if TEST_SLOT_MAP.with(std::cell::Cell::get) {
+        return true;
+    }
+    *SLOT_MAP.get_or_init(|| false)
+}
+
+/// The host keeps a slot map (`on`). Returns the setting in effect: the
+/// other one if [`slot_map`] was fixed before this call.
+pub fn set_slot_map(on: bool) -> bool {
+    *SLOT_MAP.get_or_init(|| on)
+}
+
+/// Runs `f` with the slot map on, on this thread (tests).
+#[cfg(test)]
+pub(crate) fn with_slot_map<R>(f: impl FnOnce() -> R) -> R {
+    TEST_SLOT_MAP.with(|c| c.set(true));
+    let r = f();
+    TEST_SLOT_MAP.with(|c| c.set(false));
+    r
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes

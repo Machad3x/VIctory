@@ -274,6 +274,11 @@ fn probe_view_heap(device: &ID3D12Device) {
     } else if takes != HEAP_VIEWS {
         tracing::info!(views = takes, "the host caps view heaps: shader heap indices clamped below it");
     }
+    let map = crate::descriptor::host::share_mode() == crate::descriptor::host::Share::On;
+    if victory_shader::emit::set_slot_map(map) != map {
+        // Shaders and heaps would disagree on what a heap index names.
+        tracing::error!(map, "shaders translated before the slot map was set: VICTORY_DESC_MAP ignored");
+    }
 }
 
 /// The host GPU, created on first use; `None` without one (a run then

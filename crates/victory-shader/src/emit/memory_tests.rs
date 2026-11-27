@@ -650,7 +650,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -664,9 +664,13 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
-    })
-    .expect("lower");
+    };
+    let l = lower::lower(&parts).expect("lower");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
+    // With a slot map, the table's heap index is looked up in it: the
+    // view-stride table that holds it is bound.
+    let mapped = super::shader::with_slot_map(|| lower::lower(&parts)).expect("lower");
+    assert_eq!(mapped.root_srvs, [super::VIEW_STRIDES], "the slot map");
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()
