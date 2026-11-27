@@ -202,6 +202,14 @@ const SPAN_GAP: usize = 256;
 // A compare without a snapshot marks whole 64-byte windows as one run.
 const _: () = assert!(SPAN_GAP >= 64);
 
+/// `VICTORY_REFRESH_SERIAL=1`: video-memory refresh writes on the
+/// preparing thread, not in the copy pool.
+fn refresh_serial() -> bool {
+    static SERIAL: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_REFRESH_SERIAL").is_some_and(|v| v == "1"));
+    *SERIAL
+}
+
 /// Writes the runs `[start, end)` of `merged` (title memory as read, with
 /// the shaders' bytes in the runs) into title memory at `at`, and nothing
 /// far from them: the title's threads write the same pages while a
@@ -1134,8 +1142,9 @@ impl Shadow {
 
     /// As [`Shadow::copy`], queued where the caller collects a
     /// submission's refreshes ([`crate::copy_pool::queued`]): for copies
-    /// nothing reads back before they are made. A mirrored copy, and a
-    /// range with bytes saved for a copy-back, are copied at once.
+    /// nothing reads back before they are made. A mirrored copy queues its
+    /// video-memory writes ([`Shadow::copy_video`]); a range with bytes
+    /// saved for a copy-back is copied at once.
     fn copy_queued(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
@@ -1146,7 +1155,9 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
+            if self.vram.is_none() || refresh_serial() {
+                crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
+            }
             return self.copy(from, to);
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
@@ -1205,12 +1216,15 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::VideoBytes, (to - from) as u64);
         // SAFETY: inside the video memory mapping (offsets within the copy).
         let at = unsafe { v.data.add(from) };
-        crate::host::copy_mapped(
-            at,
-            (self.start as usize + from) as *const u8,
-            to - from,
-            false,
-        );
+        let src = (self.start as usize + from) as *const u8;
+        if refresh_serial() {
+            crate::host::copy_mapped(at, src, to - from, false);
+        } else {
+            // Pooled: nothing reads video memory before the pool's run returns, ahead of the submission.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::RefreshPoolBytes, (to - from) as u64);
+            crate::copy_pool::copy(at, src, to - from);
+        }
         self.stale(from, to);
     }
 
