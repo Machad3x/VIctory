@@ -90,7 +90,7 @@ static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
 /// ([`wait_for_pipelines`]), and it is made at once.
 pub(crate) fn note(p: &Arc<Pending>) {
     PIPELINES.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(p));
-    make::begin(p);
+    make::begin_builder(p);
 }
 
 /// A dispatch of the builder's pipeline `p` was not run on the host (`why`):
