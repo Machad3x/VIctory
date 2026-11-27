@@ -639,11 +639,12 @@ impl Staged {
         if unsafe { FlushViewOfFile(self.at.cast(), self.len) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: our open file's handle.
-        if let Some(file) = &self.file
-            && unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(file.as_raw_handle()) } == 0
-        {
-            return Err(std::io::Error::last_os_error());
+        if let Some(file) = &self.file {
+            // SAFETY: our open file's handle.
+            let flushed = unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(file.as_raw_handle()) };
+            if flushed == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
         }
         self.close();
         let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());

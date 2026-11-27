@@ -1886,7 +1886,7 @@ mod tests {
         drop(held);
         // SAFETY: our allocation.
         assert_ne!(crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
-        assert!(ask(Vec::new(), true) == false, "no pages, no ask");
+        assert!(!ask(Vec::new(), true), "no pages, no ask");
     }
 
     /// The title protects private memory while a run over it opens, then
