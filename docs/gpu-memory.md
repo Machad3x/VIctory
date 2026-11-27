@@ -240,8 +240,13 @@ for hot data.
   (`victory_gpu::title_memory_own`). A heap locks the view it is opened on
   (protect, free and unmap fail with `ERROR_INVALID_PARAMETER` while it
   lives), so the title's views stay free to be guarded and remapped.
-  Private memory with no copy is not covered: the misses-by-kind frame
-  line says how much of it there is.
+  Private memory (`MEM_PRIVATE`: `xmem`'s heaps, the title's own
+  `VirtualAlloc`s) is out of scope: its pages with no copy stay misses,
+  as without the switch. A heap there would lock the title's addresses,
+  so its `VirtualProtect`/`VirtualFree` and the write guards would fail
+  (`crate::pinned` is how such a holder would let go first). The opening
+  thread refuses any range that is not one mapped view. The
+  misses-by-kind frame line says how much private memory misses.
 - **Runs.** A page-table rewrite cuts the uncovered pages into runs of
   pages our view shows one after another, one per section view, at most
   256 MiB. A run not open yet is asked of the `victory-in-place` thread
@@ -256,8 +261,12 @@ for hot data.
 - **Going.** When a section goes, its view's runs are forgotten
   (`victory_gpu::title_memory_own_gone`) and the view stays mapped until
   no page table names them: at a frame's end, with no submission running,
-  the tables drop them and the view is unmapped (retried for 100 ms, as
-  the system unlocks late).
+  the tables drop them (when a submission runs then, the next submission
+  does, before it prepares anything), their heaps are released on the
+  release thread, and the view is unmapped at a later frame's end (tried
+  once a frame for up to 600 frames, as the system unlocks late). Nothing
+  waits: a section going while a run over its view is being opened keeps
+  the view mapped until the open ends, instead of waiting for it.
 - **Title memory changes.** The title's `VirtualFree(Ex)`,
   `VirtualProtect(Ex)` and `UnmapViewOfFile(Ex/2)` (HLE module
   `memoryapi`), and `xmem`'s own unmapping and frees, go through

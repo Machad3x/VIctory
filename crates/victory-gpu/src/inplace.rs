@@ -27,13 +27,24 @@
 //! guarded and remapped, since a heap locks only the view it is opened on.
 //! Runs are opened on a thread of their own, joined with the open runs they
 //! overlap, once checked to be views of ours still (a table written over a
-//! view since gone may ask for an address holding other memory). The heaps
-//! stay open while the section lives; when the runtime lets go of our view,
-//! its runs are forgotten and the view stays mapped until no page table
-//! names them (a frame's end, [`settle`]).
-//! shortcut: private memory with no copy is not covered: a heap over it
-//! would make the title's and the guards' protections fail; open it once
-//! the counters show such misses.
+//! view since gone may ask for an address holding other memory) and mapped
+//! views at all ([`mapped_view`]). No lock is held over an open: a view
+//! going meanwhile is kept mapped until the open ends. The heaps stay open
+//! while the section lives; when the runtime lets go of our view, its runs
+//! are forgotten and the view stays mapped until no page table names them
+//! (a frame's end, [`settle`], tried again at the frames after while the
+//! system has not unlocked the pages yet).
+//!
+//! Private memory (`MEM_PRIVATE`: `xmem`'s heaps, the title's
+//! `VirtualAlloc`s) is out of scope and falls back to what it was without
+//! the backstop: pages no copy holds stay misses (zeros, writes dropped,
+//! writes withheld). A heap over private memory would lock the title's own
+//! addresses, so the title's `VirtualProtect`/`VirtualFree` and the write
+//! guards would fail there (`crate::pinned` is how they would let go
+//! first). Nothing opens it: runs come only from views of our own, and
+//! [`open_run`] refuses any range that is not one mapped view.
+//! shortcut: private memory with no copy is not covered; open it (through
+//! `crate::pinned`) once the misses-by-kind frame line shows such misses.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -115,12 +126,20 @@ unsafe impl Sync for Run {}
 /// Our view of a section the runtime let go, held mapped until no page
 /// table names a run over it.
 struct Gone {
+    at: usize,
+    len: usize,
     runs: Vec<Arc<Run>>,
     /// Unmaps it; nonzero when that worked.
     unmap: Box<dyn FnMut() -> i32 + Send>,
     /// Frame ends it has waited.
     frames: u32,
+    /// A run over it was being opened when it went: kept until that ends.
+    opening: bool,
 }
+
+/// Frame ends (~10 s) a view gone waits for page tables to let its runs go,
+/// and for the system to unlock its pages, before it is left mapped.
+const FRAMES_KEPT: u32 = 600;
 
 #[derive(Default)]
 struct Runs {
@@ -133,6 +152,9 @@ struct Runs {
     /// Ids of runs over views gone that page tables may still name.
     dead: Vec<u64>,
     gone: Vec<Gone>,
+    /// The range the worker is opening now: a view going over it is kept
+    /// mapped until the open ends ([`title_memory_own_gone`]).
+    opening: Option<(usize, usize)>,
 }
 
 static RUNS: Mutex<Option<Runs>> = Mutex::new(None);
@@ -141,9 +163,6 @@ fn with_runs<R>(f: impl FnOnce(&mut Runs) -> R) -> R {
     f(RUNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
-/// Held from a run's open to its insertion, and by a view's going: a view
-/// never goes between its run's open and the run's insertion.
-static OPENING: Mutex<()> = Mutex::new(());
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Bumped when what the backstop would name changes: views of our own
@@ -234,6 +253,27 @@ pub(crate) fn allocation_end(at: usize) -> usize {
     end
 }
 
+/// Whether `[at, at + len)` lies in one mapped view (`MEM_MAPPED`, reserved
+/// or committed): never private memory, which the backstop leaves alone.
+pub(crate) fn mapped_view(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = at.saturating_add(len);
+    let (mut p, mut base) = (at, None);
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
+            || info.Type != MEM_MAPPED
+            || *base.get_or_insert(info.AllocationBase) != info.AllocationBase
+        {
+            return false;
+        }
+        p = info.BaseAddress as usize + info.RegionSize;
+    }
+    len != 0
+}
+
 /// The open run holding `[at, at + len)` in `open`, and where the range
 /// starts in it.
 fn holding(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
@@ -307,13 +347,15 @@ fn worker(at: usize, len: usize) {
 /// until rewritten); on the opening thread.
 fn open_run(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
-    let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
+    // Set before the checks: a view going from here on stays mapped until
+    // this open ends; one gone before has its views forgotten already
+    // (the runtime forgets them before letting go of the section).
+    with_runs(|r| r.opening = Some((at, len)));
     // Asked from a table written over views since gone: the address may
-    // hold other memory now, which a heap would lock. (Open runs it joins
-    // are over live views: a view's going removes them under `OPENING`.)
-    if !crate::watch::own_views_show(at, len) {
-        with_runs(|r| r.pending.remove(&(at, len)));
+    // hold other memory now, which a heap would lock. Never private memory.
+    if !crate::watch::own_views_show(at, len) || !mapped_view(at, len) {
+        with_runs(|r| finish(r, at, len, None));
         return;
     }
     let ((start, bytes), over, replaced) = with_runs(|r| {
@@ -323,7 +365,7 @@ fn open_run(at: usize, len: usize) {
     });
     if OPEN.load(Ordering::Relaxed) + bytes > budget() + replaced {
         STATS[0].fetch_add(1, Ordering::Relaxed);
-        with_runs(|r| r.pending.remove(&(at, len)));
+        with_runs(|r| finish(r, at, len, None));
         return;
     }
     let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
@@ -341,7 +383,7 @@ fn open_run(at: usize, len: usize) {
         }
         Err(error) => {
             with_runs(|r| {
-                r.pending.remove(&(at, len));
+                finish(r, at, len, None);
                 r.refused.insert((at, len));
             });
             if STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
@@ -350,48 +392,75 @@ fn open_run(at: usize, len: usize) {
             return;
         }
     };
-    with_runs(|r| {
-        r.pending.remove(&(at, len));
-        for s in over {
-            if let Some(old) = r.open.remove(&s) {
-                OPEN.fetch_sub(old.len, Ordering::Relaxed);
-            }
-        }
-        r.open.insert(start, run);
-    });
-    OPEN.fetch_add(bytes, Ordering::Relaxed);
-    GENERATION.fetch_add(1, Ordering::Relaxed);
     STATS[5].fetch_add(1, Ordering::Relaxed);
     STATS[6].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-    tracing::debug!(at = format_args!("{start:#x}"), len = bytes, "title memory opened in place");
+    if with_runs(|r| finish(r, at, len, Some((start, run, over)))) {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(at = format_args!("{start:#x}"), len = bytes, "title memory opened in place");
+    }
+}
+
+/// The open of `[at, at + len)` ended, with the run opened (at `start`, and
+/// the open runs it replaces) or not: it is open now, or, its view gone
+/// meanwhile, held by that view's going until no one else holds it. Whether
+/// it is open.
+fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, Vec<usize>)>) -> bool {
+    r.opening = None;
+    r.pending.remove(&(at, len));
+    let mut went = false;
+    for g in r.gone.iter_mut().filter(|g| g.opening) {
+        g.opening = false;
+        if !went && let Some((_, run, _)) = &opened {
+            r.dead.push(run.id);
+            g.runs.push(run.clone());
+        }
+        went = true;
+    }
+    let Some((start, run, over)) = opened.filter(|_| !went) else {
+        return false;
+    };
+    for s in over {
+        if let Some(old) = r.open.remove(&s) {
+            OPEN.fetch_sub(old.len, Ordering::Relaxed);
+        }
+    }
+    OPEN.fetch_add(run.len, Ordering::Relaxed);
+    // A run at the same address that the join left out (past LONGEST).
+    if let Some(old) = r.open.insert(start, run) {
+        OPEN.fetch_sub(old.len, Ordering::Relaxed);
+    }
+    true
 }
 
 /// The runtime lets go of our own view `[at, at + len)` of a section:
 /// `unmap` unmaps it (nonzero when that worked). With no run over it, now;
 /// else the runs are forgotten, and the view stays mapped until no page
 /// table names them ([`settle`], at a frame's end): their heaps lock it.
-pub fn title_memory_own_gone(at: usize, len: usize, mut unmap: Box<dyn FnMut() -> i32 + Send>) {
-    let opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
-    let runs = with_runs(|r| {
-        let end = at.saturating_add(len);
+/// Never waits: a run being opened over it meanwhile keeps it mapped until
+/// that open ends.
+pub fn title_memory_own_gone(at: usize, len: usize, unmap: Box<dyn FnMut() -> i32 + Send>) {
+    let end = at.saturating_add(len);
+    let now = with_runs(|r| {
         let over: Vec<usize> = r.open.range(..end).filter(|(s, run)| **s + run.len > at).map(|(s, _)| *s).collect();
         let runs: Vec<Arc<Run>> = over.into_iter().filter_map(|s| r.open.remove(&s)).collect();
         r.refused.retain(|&(s, n)| s + n <= at || end <= s);
-        runs
-    });
-    if runs.is_empty() {
-        drop(opening);
-        unmap();
-        return;
-    }
-    for run in &runs {
-        OPEN.fetch_sub(run.len, Ordering::Relaxed);
-    }
-    GENERATION.fetch_add(1, Ordering::Relaxed);
-    with_runs(|r| {
+        let opening = r.opening.is_some_and(|(s, n)| s < end && at < s + n);
+        if runs.is_empty() && !opening {
+            return Some(unmap);
+        }
+        if !runs.is_empty() {
+            for run in &runs {
+                OPEN.fetch_sub(run.len, Ordering::Relaxed);
+            }
+            GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
         r.dead.extend(runs.iter().map(|run| run.id));
-        r.gone.push(Gone { runs, unmap, frames: 0 });
+        r.gone.push(Gone { at, len, runs, unmap, frames: 0, opening });
+        None
     });
+    if let Some(mut unmap) = now {
+        unmap();
+    }
 }
 
 /// Ids of runs over views gone that page tables may still name: the
@@ -400,43 +469,56 @@ pub(crate) fn dead() -> Vec<u64> {
     with_runs(|r| r.dead.clone())
 }
 
-/// At a frame's end, after the page tables dropped the [`dead`] runs:
-/// views gone whose runs nothing else holds are unmapped (tried again for
-/// a moment: the system unlocks a heap's pages late); after ~10 s of
-/// frames a view still held is left mapped.
+/// At a frame's end, after the page tables dropped the [`dead`] runs: the
+/// heaps of views gone whose runs nothing else holds are let go (off this
+/// thread), and such views with no run left are unmapped. Nothing here
+/// waits: a view the system has not unlocked yet is tried again at the
+/// next frame's end; after [`FRAMES_KEPT`] a view is left mapped.
 pub(crate) fn settle() {
     use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
-    let gone = with_runs(|r| std::mem::take(&mut r.gone));
-    if gone.is_empty() {
-        return;
-    }
-    let mut kept = Vec::new();
-    for mut g in gone {
-        if g.runs.iter().any(|run| Arc::strong_count(run) > 1) {
-            g.frames += 1;
-            if g.frames < 600 {
-                kept.push(g);
+    let ready = with_runs(|r| {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < r.gone.len() {
+            let g = &mut r.gone[i];
+            if g.opening {
+                i += 1;
+            } else if g.runs.iter().any(|run| Arc::strong_count(run) > 1) {
+                g.frames += 1;
+                if g.frames < FRAMES_KEPT {
+                    i += 1;
+                } else {
+                    tracing::warn!(at = format_args!("{:#x}", g.at), g.len, "a view of title memory held in place stays mapped: a page table still names it");
+                    r.gone.swap_remove(i);
+                }
+            } else if !g.runs.is_empty() {
+                // Released on a thread of its own (kernel calls); unmapped
+                // from the next frame's end on.
+                crate::host::release_later(Box::new(std::mem::take(&mut g.runs)));
+                i += 1;
             } else {
-                tracing::warn!("a view of title memory held in place stays mapped: a page table still names it");
+                ready.push(r.gone.swap_remove(i));
             }
+        }
+        let live: Vec<u64> = r.gone.iter().flat_map(|g| g.runs.iter().map(|run| run.id)).collect();
+        r.dead.retain(|id| live.contains(id));
+        ready
+    });
+    // Unmapped outside the lock (the unmap waits for writes through our views).
+    for mut g in ready {
+        if (g.unmap)() != 0 {
             continue;
         }
-        drop(std::mem::take(&mut g.runs));
-        let started = std::time::Instant::now();
-        while (g.unmap)() == 0
-            // SAFETY: plain reads of this thread's last error.
-            && unsafe { GetLastError() } == ERROR_INVALID_PARAMETER
-            && started.elapsed() < std::time::Duration::from_millis(100)
-        {
-            std::thread::yield_now();
+        // SAFETY: plain read of this thread's last error.
+        let error = unsafe { GetLastError() };
+        g.frames += 1;
+        if error == ERROR_INVALID_PARAMETER && g.frames < FRAMES_KEPT {
+            // The system unlocks a released heap's pages late.
+            with_runs(|r| r.gone.push(g));
+        } else {
+            tracing::warn!(at = format_args!("{:#x}", g.at), g.len, error, "a view of title memory held in place could not be unmapped: left mapped");
         }
     }
-    with_runs(|r| {
-        // Views gone meanwhile are in `r.gone` already.
-        let live: Vec<u64> = kept.iter().chain(&r.gone).flat_map(|g| g.runs.iter().map(|run| run.id)).collect();
-        r.dead.retain(|id| live.contains(id));
-        r.gone.extend(kept);
-    });
 }
 
 /// The last page table written named `pages` in place.
@@ -537,11 +619,53 @@ mod tests {
         let at = unsafe { mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, BYTES) }.Value as usize;
         assert_ne!(at, 0);
         assert_eq!(allocation_end(at + PAGE), at + BYTES);
-        // SAFETY: our view and handle.
+        assert!(mapped_view(at, BYTES) && mapped_view(at + PAGE, PAGE));
+        assert!(!mapped_view(at, BYTES + PAGE), "past the view");
+        // SAFETY: plain allocation, released below.
+        let private = unsafe { mem::VirtualAlloc(std::ptr::null(), PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) };
+        assert!(!private.is_null());
+        assert!(!mapped_view(private as usize, PAGE), "private memory is never opened in place");
+        // SAFETY: our view, handle and allocation.
         unsafe {
+            mem::VirtualFree(private, 0, mem::MEM_RELEASE);
             mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void });
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+
+    /// A view going while a run over it is opened stays mapped until the
+    /// open ends, with no wait; a view the system has not unlocked yet is
+    /// unmapped at a later frame's end, not waited for.
+    #[test]
+    fn a_view_going_mid_open_is_unmapped_after_it_frame_by_frame() {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, SetLastError};
+        let at = 0x7e00_0000_0000usize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counting = |refusals: usize| -> Box<dyn FnMut() -> i32 + Send> {
+            let c = calls.clone();
+            Box::new(move || {
+                let k = c.fetch_add(1, Ordering::SeqCst);
+                // SAFETY: plain write of this thread's last error.
+                unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+                i32::from(k >= refusals)
+            })
+        };
+        with_runs(|r| r.opening = Some((at + PAGE, PAGE)));
+        title_memory_own_gone(at, 4 * PAGE, counting(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "kept mapped while the open runs");
+        settle();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "still opening");
+        assert!(!with_runs(|r| finish(r, at + PAGE, PAGE, None)));
+        settle();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "refused as locked: kept");
+        settle();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "unmapped");
+        settle();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "gone");
+        // Nothing over it and nothing opening: unmapped at once.
+        title_memory_own_gone(at, 4 * PAGE, counting(0));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(with_runs(|r| r.gone.is_empty()));
     }
 
     #[test]
