@@ -5053,6 +5053,15 @@ impl Host {
         } else {
             heap
         };
+        // Small ones are placed in heaps made ahead (`VICTORY_MEMSYS`),
+        // unless the diagnostics above move them.
+        #[cfg(feature = "diagnostics")]
+        let placed = !self.copies_in_video_memory();
+        #[cfg(not(feature = "diagnostics"))]
+        let placed = true;
+        if placed && let Some(made) = crate::memsys::heaps::buffer(&self.device, upload, size) {
+            return Some(made);
+        }
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: size.max(1),

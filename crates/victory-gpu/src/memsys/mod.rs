@@ -19,6 +19,8 @@ use std::sync::{Mutex, OnceLock};
 
 pub(crate) mod dirty;
 pub(crate) mod gate;
+#[cfg(windows)]
+pub(crate) mod heaps;
 pub(crate) mod pages;
 pub(crate) mod queue;
 pub(crate) mod ring;
