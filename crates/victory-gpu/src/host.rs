@@ -185,22 +185,13 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
-/// What a [`Ticket`] borrows, kept by [`Host::submit`]'s caller until the
-/// ticket is retired.
-#[derive(Default)]
-pub(crate) struct Sending {
-    uploads: Option<crate::bindless::Uploads>,
-    snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-}
-
 /// A submission sent to the host GPU, its last group not yet waited for
-/// and nothing settled ([`Host::submit`], [`Host::retire`]).
-// shortcut: not Send: the riding pull's stale page locks (`shadow::Held`)
-// and `Sending` are borrowed; an async retire needs them owned.
+/// and nothing settled ([`Host::submit`], [`Host::retire`]). It owns what
+/// it needs, its lists as `L` (references, or `Arc`s to retire elsewhere).
 #[must_use = "a sent submission is settled only by Host::retire"]
-pub(crate) struct Ticket<'a>(Option<Sent<'a>>);
+pub(crate) struct Ticket<'h, L: std::ops::Deref<Target = HostList>>(Option<Sent<'h, L>>);
 
-impl Drop for Ticket<'_> {
+impl<L: std::ops::Deref<Target = HostList>> Drop for Ticket<'_, L> {
     /// Not retired (a bug, or an unwind): what it locks and predicts goes,
     /// its writes to title memory are lost.
     fn drop(&mut self) {
@@ -217,8 +208,17 @@ impl Drop for Ticket<'_> {
     }
 }
 
+/// A ticket's lists in the order they ran: the upload list first.
+fn lists_of<'s, L: std::ops::Deref<Target = HostList>>(
+    uploads: &'s Option<crate::bindless::Uploads>,
+    runs: &'s [L],
+) -> Vec<&'s HostList> {
+    uploads.iter().map(|u| u.list()).chain(runs.iter().map(|l| &**l)).collect()
+}
+
 /// What a [`Ticket`] holds.
-pub(crate) struct Sent<'a> {
+pub(crate) struct Sent<'h, L: std::ops::Deref<Target = HostList>> {
+    _host: std::marker::PhantomData<&'h Host>,
     /// The fence value of its last group.
     value: u64,
     started: std::time::Instant,
@@ -229,16 +229,18 @@ pub(crate) struct Sent<'a> {
     #[cfg(feature = "diagnostics")]
     traced: bool,
     #[cfg(feature = "diagnostics")]
-    clock: Option<&'a crate::gpumeasure::Clock>,
+    clock: Option<&'h crate::gpumeasure::Clock>,
     /// Flight study: when the first lists went to the card.
     #[cfg(feature = "diagnostics")]
     sent: Option<std::time::Instant>,
     heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
-    runs: Vec<&'a HostList>,
+    /// The texture uploads run first, kept until they ran.
+    uploads: Option<crate::bindless::Uploads>,
+    runs: Vec<L>,
     /// Kept until they have run.
     lists: Vec<Option<ID3D12CommandList>>,
     groups: usize,
-    snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     batch: Batch,
     prepared: std::time::Instant,
     riding: Option<Option<Riding>>,
@@ -703,8 +705,7 @@ pub(crate) mod tests {
         list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
         list.close();
         let mut lock = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sending = super::Sending::default();
-        let ticket = host.submit(&mut lock, &[&list], &mut sending);
+        let ticket = host.submit(&mut lock, vec![&list]);
         let value = *lock;
         assert_eq!(ticket.0.as_ref().map(|t| t.value), Some(value));
         assert_eq!(word.get(), 0, "written when settled");
@@ -724,8 +725,7 @@ pub(crate) mod tests {
         let list = host.new_list().unwrap();
         list.close();
         let mut lock = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sending = super::Sending::default();
-        let ticket = host.submit(&mut lock, &[&list], &mut sending);
+        let ticket = host.submit(&mut lock, vec![&list]);
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ticket)));
         assert_eq!(dropped.is_err(), cfg!(debug_assertions));
         // The GPU is done with the list before it goes.
@@ -1727,13 +1727,11 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _here = Submitting::enter();
-        let mut sending = Sending::default();
-        let ticket = self.submit(&mut submitted, runs, &mut sending);
+        let ticket = self.submit(&mut submitted, runs.to_vec());
         #[cfg(feature = "diagnostics")]
         let traced = ticket.0.as_ref().is_some_and(|t| t.traced);
+        // The upload list and snapshots go in it, before the lock.
         self.retire(ticket);
-        // The upload list and snapshots go before the lock, as they did.
-        drop(sending);
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
@@ -1756,8 +1754,9 @@ impl Host {
     /// Prepares closed lists and sends them to the host GPU; the last group
     /// is waited for and settled by [`Host::retire`]. `submitted` is the
     /// submission lock's value, held by the caller from here to the retire.
-    pub(crate) fn submit<'a>(&'a self, submitted: &mut u64, runs: &[&'a HostList], sending: &'a mut Sending) -> Ticket<'a> {
-        let Sending { uploads: kept_uploads, snapshots: kept_snapshots } = sending;
+    pub(crate) fn submit<'h, L: std::ops::Deref<Target = HostList>>(&'h self, submitted: &mut u64, runs: Vec<L>) -> Ticket<'h, L> {
+        let given = runs;
+        let runs: Vec<&HostList> = given.iter().map(|l| &**l).collect();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1814,13 +1813,12 @@ impl Host {
             .collect();
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
-        *kept_uploads = (!heaps.is_empty() || !textures.is_empty())
+        let uploads = (!heaps.is_empty() || !textures.is_empty())
             .then(|| crate::bindless::uploads(&heaps, &textures))
             .flatten();
-        let uploads: &'a Option<crate::bindless::Uploads> = kept_uploads;
         #[cfg(feature = "diagnostics")]
         drop(uploading);
-        let all: Vec<&'a HostList> = uploads
+        let all: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
             .into_iter()
@@ -1851,7 +1849,7 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         // Snapshots of copies in video memory read their mirrors: brought up
         // to date at once, and kept so until the copy-backs.
-        *kept_snapshots = runs
+        let snapshots: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = runs
             .iter()
             .flat_map(|l| {
                 l.deferred()
@@ -1866,8 +1864,7 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)] = kept_snapshots;
-        crate::shadow::snapshots_ahead(snapshots);
+        crate::shadow::snapshots_ahead(&snapshots);
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         {
@@ -1929,13 +1926,14 @@ impl Host {
         // are set again by any refresh after, and video memory written
         // before is seen by the copies.
         let riding = if pull_same_execute() && !snapshots.is_empty() {
-            self.pull_riding(snapshots)
+            self.pull_riding(&snapshots)
         } else {
             None
         };
         // The pull ran and was waited for with the last group.
         let pulled = matches!(riding, Some(None));
         let mut t = Sent {
+            _host: std::marker::PhantomData,
             groups: groups.len(),
             value: *submitted,
             started,
@@ -1950,7 +1948,8 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             sent: None,
             heaps,
-            runs: all,
+            uploads,
+            runs: given,
             lists,
             snapshots,
             batch,
@@ -1994,13 +1993,20 @@ impl Host {
             }
         }
         // Pending until retired, for queue waits to read ahead.
-        crate::queue::labels_sent(t.value, t.runs.iter().flat_map(|l| l.deferred().writes.clone()));
+        crate::queue::labels_sent(t.value, lists_of(&t.uploads, &t.runs).iter().flat_map(|l| l.deferred().writes.clone()));
         Ticket(Some(t))
     }
 
     /// Waits for group `i` of a ticket, sent at `started`: false when the
     /// device is gone and no more of it may run.
-    fn end_group(&self, t: &mut Sent<'_>, i: usize, started: std::time::Instant, waited: windows::core::Result<()>) -> bool {
+    fn end_group<L: std::ops::Deref<Target = HostList>>(
+        &self,
+        t: &mut Sent<'_, L>,
+        i: usize,
+        started: std::time::Instant,
+        waited: windows::core::Result<()>,
+    ) -> bool {
+        let all = lists_of(&t.uploads, &t.runs);
         let mut ended = Waited::Done;
         let last = i + 1 == t.groups;
         // SAFETY: the fence and event are ours.
@@ -2018,7 +2024,7 @@ impl Host {
                         |secs| {
                             tracing::warn!(
                                 secs,
-                                lists = t.runs.len(),
+                                lists = all.len(),
                                 "host submission still on the GPU"
                             );
                         },
@@ -2043,8 +2049,8 @@ impl Host {
                 "host GPU has not finished a submission of {} lists in {STALL_SECS} s and reports \
                  no removal: the GPU has most likely faulted or hung (on Linux the kernel log \
                  names a fault){}",
-                t.runs.len(),
-                last_notes(&t.runs)
+                all.len(),
+                last_notes(&all)
             )),
         }
         // `ended` stays `Done` when the wait could not be set up.
@@ -2070,15 +2076,15 @@ impl Host {
         if t.groups > 1 {
             // SAFETY: a plain query.
             let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-            gpu_times(started.elapsed(), &t.runs[i].slowest(frequency, usize::MAX));
+            gpu_times(started.elapsed(), &all[i].slowest(frequency, usize::MAX));
         }
         #[cfg(feature = "diagnostics")]
         if t.groups > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
             // SAFETY: a plain query.
             let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-            let commands = t.runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let commands = all[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
             tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-            for (ms, op) in t.runs[i].slowest(frequency, 6) {
+            for (ms, op) in all[i].slowest(frequency, 6) {
                 tracing::warn!("slow list command, {ms:.1} ms: {op}");
             }
         }
@@ -2093,13 +2099,14 @@ impl Host {
     /// Waits for a submission [`Host::submit`] sent and settles it: what
     /// shaders wrote goes back to title memory, then the deferred copies,
     /// work and bottom-of-pipe writes.
-    pub(crate) fn retire(&self, mut ticket: Ticket<'_>) {
+    pub(crate) fn retire<L: std::ops::Deref<Target = HostList>>(&self, mut ticket: Ticket<'_, L>) {
         let Some(mut t) = ticket.0.take() else { return };
         if let Some((i, started, waited)) = t.last.take() {
             self.end_group(&mut t, i, started, waited);
         }
-        let Sent { value, started, heaps, runs, snapshots, batch, prepared, mut riding, pulled, removed_in, unwaited, .. } = t;
-        let runs = &runs[..];
+        let Sent { value, started, heaps, uploads, runs: given, snapshots, batch, prepared, mut riding, pulled, removed_in, unwaited, .. } = t;
+        let lists = lists_of(&uploads, &given);
+        let runs = &lists[..];
         // The riding copies ran, or never will: their pages unlock before
         // anything here reads a mirror. Not waited for, they may run later:
         // their pages stay stale.
