@@ -244,6 +244,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Heap handles made (resource and sampler heaps).
+    pub heap_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -331,6 +333,7 @@ impl Shader {
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            heap_handles: 0,
             threads: None,
             wave_size: None,
             compute_derivatives: false,
@@ -720,6 +723,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        self.heap_handles += 1;
         let asked = index;
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.

@@ -272,6 +272,9 @@ pub(crate) enum C {
     /// when its record changed.
     DescShared,
     DescPromoted,
+    /// `VICTORY_DESC_MAP=on`: records made in a dynamic slot while their
+    /// own slot keeps its descriptor for work in flight.
+    DescMoved,
     /// `VICTORY_DESC_MAP=check`: slots made from a record another slot holds
     /// that view the same host resource as that slot, and that view another.
     DescCheckSame,
@@ -683,12 +686,13 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "  view slots by record per frame: {:.0} made from a record another slot holds, {:.0} from one no other holds; {:.0} copied, {:.0} shared, {:.0} stand-ins; check {:.0} same, {:.0} other; heaps (records now/most): {}; heap descriptor fetches {:.0} ({:.0} per lane); clamps after an argument barrier {:.0}",
+        "  view slots by record per frame: {:.0} made from a record another slot holds, {:.0} from one no other holds; {:.0} copied, {:.0} shared, {:.0} stand-ins, {:.0} kept from work in flight; check {:.0} same, {:.0} other; heaps (records now/most): {}; heap descriptor fetches {:.0} ({:.0} per lane); clamps after an argument barrier {:.0}",
         c[C::DescKeyHit as usize],
         c[C::DescKeyMiss as usize],
         c[C::DescCopied as usize],
         c[C::DescShared as usize],
         c[C::DescPromoted as usize],
+        c[C::DescMoved as usize],
         c[C::DescCheckSame as usize],
         c[C::DescCheckDiffer as usize],
         desc_heaps(),

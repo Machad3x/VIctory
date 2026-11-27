@@ -134,8 +134,33 @@ struct Canon {
     sharers: std::collections::HashMap<u32, std::collections::HashSet<u32>>,
     /// Slots sharing another's now.
     sharing: u64,
-    /// The host heap's number, for its gauges.
+    /// The host heap's number, for its gauges (diagnostics).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     heap: u32,
+    /// [`Share::On`]: slots others shared since the last retire ([`epoch`]
+    /// then): work in flight may have read the map's entry naming them, so
+    /// their own descriptor keeps the record it had until that work has run.
+    owned_at: std::collections::HashMap<u32, u64>,
+    /// Title slots whose record lives in a dynamic slot meanwhile (none:
+    /// read null), with their record's handle and the epoch: made in place
+    /// once that epoch is past ([`HostHeap::settle`]).
+    moving: std::collections::HashMap<u32, (u32, u64, u64)>,
+    /// Dynamic slots such records lived in, given back once their epoch is
+    /// past (the map named them until then).
+    freeing: Vec<(u32, u64)>,
+}
+
+/// Retires of the work that was running ([`retired`]): what work in flight
+/// read before epoch `e` has run once the epoch is past `e`.
+static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The submission has run with none running (`crate::host::release_retired`).
+pub(crate) fn retired() {
+    EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+fn epoch() -> u64 {
+    EPOCH.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// A record held by title slots ([`Canon`]).
@@ -300,6 +325,7 @@ impl Canon {
             }
         }
         self.sharers.entry(to).or_default().insert(index);
+        self.owned_at.insert(to, epoch());
         self.note_sharing();
     }
 
@@ -334,10 +360,11 @@ impl Canon {
     }
 
     /// Slot `index` was made from `key` with view-mark entry `mark` and
-    /// skip `skip`: the record's slot if it has none yet.
-    fn made(&mut self, index: u32, key: u64, mark: Option<(u32, u32)>, skip: u32) {
+    /// skip `skip`: the record's slot if it has none yet, or if `take` (the
+    /// record's slot holds no resource: given up, or never made).
+    fn made(&mut self, index: u32, key: u64, mark: Option<(u32, u32)>, skip: u32, take: bool) {
         if let Some(e) = self.keys.get_mut(&key)
-            && (e.slot == NONE || e.slot == index)
+            && (e.slot == NONE || e.slot == index || take)
         {
             (e.slot, e.mark, e.skip) = (index, mark, skip);
         }
@@ -505,7 +532,9 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
-        let twins = (cache && !sampler)
+        // A slot map needs twins too: a stand-in takes the descriptor of the
+        // slot it stands in for as it is (`stand_in`).
+        let twins = ((cache || share == Share::On) && !sampler)
             .then(|| {
                 // SAFETY: plain heap creation.
                 let twins: ID3D12DescriptorHeap = unsafe {
@@ -549,7 +578,7 @@ impl HostHeap {
             viewed: Default::default(),
             #[cfg(feature = "diagnostics")]
             stale_seen: Default::default(),
-            canon: (!sampler && (cfg!(feature = "diagnostics") || twins.is_some() || share != Share::Off)).then(|| {
+            canon: (!sampler && (twins.is_some() || share != Share::Off)).then(|| {
                 static HEAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 Mutex::new(Canon {
                     shares: if share == Share::On { vec![NONE; count as usize] } else { Vec::new() },
@@ -1110,10 +1139,13 @@ impl HostHeap {
             let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[c as usize].clone();
             let buffer = buffer_range(view).is_some() || matches!(view, View::Constant(..));
             if let Some((res, copy)) = held
-                && (!buffer
-                    || shown_copy(view).is_some_and(|s| {
+                && if buffer {
+                    shown_copy(view).is_some_and(|s| {
                         windows::core::Interface::as_raw(&s.buffer) == windows::core::Interface::as_raw(&res)
-                    }))
+                    })
+                } else {
+                    shows_texture(view, windows::core::Interface::as_raw(&res))
+                }
             {
                 // SAFETY: slots of our heaps, copied from the CPU-only one.
                 unsafe {
@@ -1158,53 +1190,70 @@ impl HostHeap {
         if old != key && self.share == Share::On {
             canon.unshare(index);
             if let Some(sharers) = canon.sharers.remove(&index) {
-                self.stand_in(canon, old, sharers);
+                self.stand_in(canon, index, old, sharers);
             }
         }
         canon.moved(index, old, key);
     }
 
-    /// The slot others of record `key` shared is made from another record:
-    /// one of `sharers` (all holding `key`) is made from it and the others
-    /// share that one, before the slot is made again. Shaders reading the
-    /// slot map meanwhile read the old slot's descriptor (a record it held
-    /// until now) or the stand-in's, never another record's.
-    // shortcut: a shader that looked the map up just before reads the old
-    // slot's new descriptor; the console reads a slot rewritten under a
-    // running shader likewise.
-    fn stand_in(&self, canon: &mut Canon, key: u64, sharers: std::collections::HashSet<u32>) {
+    /// Slot `from`, which `sharers` (all holding record `key`) share, is
+    /// made from another record next. One of them takes `from`'s descriptor
+    /// as it is (a copy from the twins: nothing made or prepared under the
+    /// slot lock) and the others share that one, the map entries written
+    /// before `from` changes. `from` itself keeps its descriptor until the
+    /// work in flight, which may have read the old entries, has run
+    /// (`owned_at`, `HostHeap::mirror`). A released record (no view): every
+    /// sharer is nulled and its own again.
+    fn stand_in(&self, canon: &mut Canon, from: u32, key: u64, sharers: std::collections::HashSet<u32>) {
+        canon.owned_at.insert(from, epoch());
+        let found = view_at(key as u32, (key >> 32) as u32);
+        let Some((view, _pin)) = &found else {
+            for &o in &sharers {
+                canon.unshare(o);
+                self.make_null(o);
+                self.write_map(o, o);
+            }
+            return;
+        };
         let Some(&d) = sharers.iter().next() else { return };
         canon.unshare(d);
-        let found = view_at(key as u32, (key >> 32) as u32);
-        let (mark, skip) = match &found {
-            Some((view, _pin)) => {
-                self.note_address(d, Some(view));
-                // As `mirror` leaves them: made once a shader reads them.
-                let later = is_placed_texture(view) && !made_without_new_texture(view);
-                let (kept, mark, skip) = if later {
-                    crate::shadow::forget_read(d);
-                    (None, None, 0)
-                } else {
-                    self.make_slot(&[], None, d, key, view)
+        let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[from as usize].clone();
+        let entry = canon.keys.get(&key).copied();
+        let (mark, skip) = entry.map_or((None, 0), |e| (e.mark, e.skip));
+        self.note_address(d, Some(view));
+        match (&self.twins, host(), held) {
+            (Some((_, base)), Some(host), Some(held)) => {
+                let twin = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: base + i as usize * self.step as usize,
                 };
+                let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                // SAFETY: slots of our heaps, copied from the CPU-only one.
+                unsafe {
+                    host.device.CopyDescriptorsSimple(1, twin(d), twin(from), kind);
+                    host.device.CopyDescriptorsSimple(1, self.cpu(d), twin(from), kind);
+                }
                 self.set_stride(d, Some(view), skip);
                 self.set_mark(d, mark);
-                if kept.is_none() {
-                    null_for(view, self.cpu(d));
-                }
-                self.viewed.set(d, Some(view), kept.is_some());
-                self.keep(d, kept.flatten());
-                self.owners_seen.lock().unwrap_or_else(|e| e.into_inner())[d as usize] = crate::shadow::owners();
-                (mark, skip)
+                self.viewed.set(d, Some(view), true);
+                self.keep(d, Some(held));
+                let mut seen = self.owners_seen.lock().unwrap_or_else(|e| e.into_inner());
+                seen[d as usize] = seen[from as usize];
             }
-            // Released: they read nothing, as a heap sync leaves them.
-            None => {
-                self.make_null(d);
-                (None, 0)
+            // `from` holds nothing (given up, never made, no twins): `d` is
+            // left as `from` is, null, and made again where read (a read
+            // mark, a draw: its owners never seen).
+            _ => {
+                null_for(view, self.cpu(d));
+                self.set_stride(d, Some(view), 0);
+                self.set_mark(d, None);
+                self.viewed.set(d, Some(view), false);
+                self.keep(d, None);
+                crate::shadow::forget_read(d);
+                self.owners_seen.lock().unwrap_or_else(|e| e.into_inner())[d as usize] = u64::MAX;
             }
-        };
+        }
         if let Some(e) = canon.keys.get_mut(&key) {
-            (e.slot, e.mark, e.skip) = (d, mark, skip);
+            e.slot = d;
         }
         self.write_map(d, d);
         for &o in sharers.iter().filter(|&&o| o != d) {
@@ -1215,6 +1264,56 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DescPromoted, 1);
     }
 
+    /// [`Share::On`]: slot `index`'s record goes to a dynamic slot until the
+    /// work in flight has run, rather than into the slot itself: others
+    /// shared it since the last retire, or its record lives elsewhere already.
+    fn keeps_its_descriptor(canon: &Canon, index: u32) -> bool {
+        canon.moving.contains_key(&index) || canon.owned_at.get(&index) == Some(&epoch())
+    }
+
+    /// Slot `index` no longer has its record elsewhere: that dynamic slot is
+    /// given back once the work that may read it has run.
+    fn moved_back(canon: &mut Canon, index: u32) {
+        if let Some((slot, ..)) = canon.moving.remove(&index)
+            && slot != NONE
+        {
+            canon.freeing.push((slot, epoch()));
+        }
+    }
+
+    /// [`Share::On`], before a heap sync (no work running): slots whose
+    /// record waited in a dynamic slot past a retire are made in place, and
+    /// dynamic slots no map entry names any more are given back.
+    pub(crate) fn settle(&self) {
+        if self.share != Share::On {
+            return;
+        }
+        let now = epoch();
+        let (ready, free) = {
+            let _made = self.lock_made();
+            let Some(mut canon) = self.lock_canon() else { return };
+            canon.owned_at.retain(|_, &mut e| e == now);
+            let ready: Vec<(u32, u64)> = canon
+                .moving
+                .iter()
+                .filter(|&(_, &(_, _, e))| e < now)
+                .map(|(&c, &(_, handle, _))| (c, handle))
+                .collect();
+            for &(c, _) in &ready {
+                Self::moved_back(&mut canon, c);
+            }
+            let (free, keep): (Vec<_>, Vec<_>) = canon.freeing.drain(..).partition(|&(_, e)| e < now);
+            canon.freeing = keep;
+            (ready, free)
+        };
+        for (slot, _) in free {
+            self.make_null(slot);
+            self.release(slot, 1);
+        }
+        for (c, handle) in ready {
+            self.mirror_with(c, handle, false, true);
+        }
+    }
     /// A heap sync of slots `first..last`, whose records are at `start` +
     /// index × `step`: [`HostHeap::mirror`] of each slot whose record
     /// differs from what the slot holds, the rest passed by as `mirror`
@@ -1358,6 +1457,12 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<(View, Option<crate::resource::Pin>)> {
+        self.mirror_with(index, handle, for_draw, false)
+    }
+
+    /// [`HostHeap::mirror`], made again even if unchanged where `force`
+    /// ([`HostHeap::settle`]: its record waited in a dynamic slot).
+    fn mirror_with(&self, index: u32, handle: u64, for_draw: bool, force: bool) -> Option<(View, Option<crate::resource::Pin>)> {
         #[cfg(feature = "diagnostics")]
         slot_use::note(index);
         if index >= self.count {
@@ -1393,14 +1498,28 @@ impl HostHeap {
         let Some((view, pin)) = found else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                if let Some(mut canon) = self.lock_canon() {
-                    self.moved_slot(&mut canon, index, made[index as usize], 0);
+            if made[index as usize] != 0 || force {
+                let mut canon = self.lock_canon();
+                let mut keep_own = false;
+                if let Some(canon) = canon.as_deref_mut() {
+                    self.moved_slot(canon, index, made[index as usize], 0);
+                    keep_own = self.share == Share::On && Self::keeps_its_descriptor(canon, index);
+                    Self::moved_back(canon, index);
+                    if keep_own {
+                        // Work in flight may read its descriptor: shaders
+                        // read the heap's null view for it meanwhile.
+                        canon.moving.insert(index, (NONE, handle, epoch()));
+                    }
                 }
+                drop(canon);
                 made[index as usize] = 0;
-                self.make_null(index);
-                self.write_map(index, index);
-                self.note_address(index, None);
+                if keep_own {
+                    self.write_map(index, crate::host::heap_views() - 1);
+                } else {
+                    self.make_null(index);
+                    self.write_map(index, index);
+                    self.note_address(index, None);
+                }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::MirrorNull, 1);
             }
@@ -1422,6 +1541,9 @@ impl HostHeap {
                 if shared != Some(to) {
                     let old = std::mem::replace(&mut made[index as usize], key);
                     self.moved_slot(&mut canon, index, old, key);
+                    // Its record elsewhere meanwhile, if it was: given back
+                    // once the map stops naming it.
+                    Self::moved_back(&mut canon, index);
                     canon.share(index, to);
                     self.write_map(index, to);
                     // Its own descriptor is read no more: what it held goes
@@ -1494,7 +1616,7 @@ impl HostHeap {
             }
             !shown
         };
-        if made[index as usize] == key && !needs_remake() && !owner_moved() {
+        if !force && made[index as usize] == key && !needs_remake() && !owner_moved() {
             return Some((view, pin));
         }
         // Shaders index the heap itself (`crate::bindless`): buffer views
@@ -1524,22 +1646,20 @@ impl HostHeap {
                 drop(made);
                 // The old view's release need not wait for the new one.
                 drop(pin);
-                return self.mirror(index, handle, for_draw);
+                return self.mirror_with(index, handle, for_draw, force);
             }
-            if made[index as usize] == key && !needs_remake() && !owner_moved() {
+            if !force && made[index as usize] == key && !needs_remake() && !owner_moved() {
                 return Some((view, pin));
             }
         }
         {
-            self.note_address(index, Some(&view));
-            if later {
-                // Made once a shader reads it (`crate::shadow::take_reads`).
-                crate::shadow::forget_read(index);
-            }
             let old = std::mem::replace(&mut made[index as usize], key);
             let mut canon = self.lock_canon();
             // The other slot of the record, to compare with (`Share::Check`).
             let mut peer = None;
+            // `Share::On`: the dynamic slot the record goes to meanwhile, if
+            // the slot keeps its descriptor for work in flight.
+            let mut temp = None;
             if let Some(canon) = canon.as_deref_mut() {
                 self.moved_slot(canon, index, old, key);
                 // Shared meanwhile (while its view was prepared), made now:
@@ -1555,13 +1675,27 @@ impl HostHeap {
                     },
                     1,
                 );
+                if self.share == Share::On && Self::keeps_its_descriptor(canon, index) {
+                    temp = self.dynamic(1);
+                    if temp.is_none() {
+                        static ONCE: std::sync::Once = std::sync::Once::new();
+                        ONCE.call_once(|| tracing::warn!("no dynamic slot for a record kept from work in flight: made in place"));
+                    }
+                }
+            }
+            // Where the record is made: its own slot, or the dynamic one.
+            let at = temp.unwrap_or(index);
+            self.note_address(at, Some(&view));
+            if later {
+                // Made once a shader reads it (`crate::shadow::take_reads`).
+                crate::shadow::forget_read(at);
             }
             #[cfg(feature = "diagnostics")]
             let making = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MirrorMakeNs);
             let (kept, mark, skip) = if later {
                 (None, None, 0)
             } else {
-                self.make_slot(&made, canon.as_deref(), index, key, &view)
+                self.make_slot(&made, canon.as_deref(), at, key, &view)
             };
             #[cfg(feature = "diagnostics")]
             {
@@ -1569,28 +1703,48 @@ impl HostHeap {
                 crate::copystat::add(crate::copystat::C::MirrorMade, 1);
             }
             if let Some(canon) = canon.as_deref_mut() {
-                canon.made(index, key, mark, skip);
+                Self::moved_back(canon, index);
+                match temp {
+                    Some(t) => {
+                        canon.moving.insert(index, (t, handle, epoch()));
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::DescMoved, 1);
+                    }
+                    None => {
+                        // Take the record over from a slot holding nothing
+                        // (not where others share it: they read that one).
+                        let take = self.share != Share::On
+                            && kept.as_ref().is_some_and(Option::is_some)
+                            && canon.keys.get(&key).is_some_and(|entry| {
+                                entry.slot != NONE
+                                    && entry.slot != index
+                                    && self.kept.lock().unwrap_or_else(|e| e.into_inner())[entry.slot as usize].is_none()
+                            });
+                        canon.made(index, key, mark, skip, take);
+                    }
+                }
             }
             drop(canon);
-            self.set_stride(index, Some(&view), skip);
-            self.set_mark(index, mark);
+            self.set_stride(at, Some(&view), skip);
+            self.set_mark(at, mark);
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                null_for(&view, self.cpu(at));
             }
-            if !self.sampler {
-                self.viewed.set(index, Some(&view), kept.is_some());
+            if !self.sampler && at < self.count {
+                self.viewed.set(at, Some(&view), kept.is_some());
             }
-            self.keep(index, kept.flatten());
-            self.owners_seen.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = owners;
-            self.write_map(index, index);
+            self.keep(at, kept.flatten());
+            if at == index {
+                self.owners_seen.lock().unwrap_or_else(|e| e.into_inner())[index as usize] = owners;
+            }
+            self.write_map(index, at);
             if self.share == Share::Check
                 && !later
                 && let Some(peer) = peer
             {
                 self.check_peer(index, peer, &view);
             }
-        }
-        Some((view, pin))
+        }        Some((view, pin))
     }
 
     /// [`Share::Check`]: slot `index`, just made from the record slot
@@ -2180,6 +2334,27 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// Whether host resource `held` (raw) is what a slot made from texture view
+/// `view` now would view: the host texture of its resource or a plane of
+/// that texture's twin, as `HostHeap::mirror` checks a placed one's. Views
+/// without a resource (acceleration structures) view nothing to follow.
+fn shows_texture(view: &View, held: *mut std::ffi::c_void) -> bool {
+    let (View::Shader(r, _) | View::Unordered(r, ..)) = *view else {
+        return true;
+    };
+    if r == 0 {
+        return true;
+    }
+    crate::resource::host_copy(r as crate::object::This).is_some_and(|copy| {
+        windows::core::Interface::as_raw(&copy.texture) == held
+            || copy
+                .twin
+                .get()
+                .and_then(Option::as_ref)
+                .is_some_and(|t| t.planes.iter().any(|p| windows::core::Interface::as_raw(&p.texture) == held))
+    })
 }
 
 /// The host resource a slot made by [`make`] views, if any, and the view's
@@ -3816,13 +3991,27 @@ mod tests {
         assert_eq!((held(&heap, 1), held(&heap, 2)), (None, None), "sharers hold nothing");
         assert_eq!((heap.map_at(0), heap.map_at(1), heap.map_at(2)), (Some(0), Some(0), Some(0)));
         assert_eq!(heap.sync_slots(0, 3, handle, 32), 0, "shared slots are not stale");
-        // Slot 0 cleared: a stand-in among 1 and 2 first.
+        // Slot 0 cleared: a stand-in among 1 and 2 first, which takes slot
+        // 0's descriptor as it is; slot 0 keeps it for work in flight and
+        // reads the null view meanwhile.
+        let viewed = held(&heap, 0);
         records[..4].fill(0);
+        // Other tests retire work too: the wait is checked only if none did.
+        let e = epoch();
         assert!(heap.mirror(0, handle, false).is_none());
         let d = if held(&heap, 1).is_some() { 1 } else { 2 };
         let other = 3 - d;
-        assert!(held(&heap, d).is_some() && held(&heap, other).is_none());
-        assert_eq!((heap.map_at(0), heap.map_at(d), heap.map_at(other)), (Some(0), Some(d), Some(d)));
+        assert!(held(&heap, d) == viewed && held(&heap, other).is_none());
+        let null = crate::host::heap_views() - 1;
+        assert_eq!((heap.map_at(0), heap.map_at(d), heap.map_at(other)), (Some(null), Some(d), Some(d)));
+        heap.settle();
+        if epoch() == e {
+            assert_eq!(heap.map_at(0), Some(null), "until the work in flight has run");
+        }
+        retired();
+        heap.settle();
+        assert_eq!(heap.map_at(0), Some(0), "its own, null, once it has");
+        assert!(held(&heap, 0).is_none());
         {
             let canon = heap.canon.as_ref().unwrap().lock().unwrap();
             assert_eq!((canon.shared(d), canon.shared(other), canon.sharing), (None, Some(d), 1));
@@ -3836,6 +4025,55 @@ mod tests {
         crate::shadow::unregister(0xD2, start);
     }
 
+    /// A slot others share, rewritten with another record: one of them
+    /// takes its descriptor first, and the slot's own descriptor keeps the
+    /// old record until the work that may have read the old map entries has
+    /// run (the new one in a dynamic slot meanwhile); then the slot is made
+    /// in place and the dynamic slot given back after one more retire.
+    #[test]
+    fn a_rewritten_shared_slot_keeps_its_descriptor_until_work_in_flight_has_run() {
+        let Some(_) = host() else { return };
+        #[repr(align(256))]
+        struct Aligned([u8; 512]);
+        static OLD: Aligned = Aligned([0; 512]);
+        static NEW: Aligned = Aligned([0; 512]);
+        let (old, new) = (OLD.0.as_ptr() as u64, NEW.0.as_ptr() as u64);
+        let Some(heap) = HostHeap::with(false, 4, false, Share::On) else { return };
+        if heap.strides.is_none() || heap.twins.is_none() {
+            return; // no table for the map, or no twins, here
+        }
+        let mut records = [0u64; 16];
+        let handle = records.as_mut_ptr() as u64;
+        records_of_one_view(0xD6, old, handle, 2);
+        heap.mirror(0, handle, true).unwrap();
+        heap.mirror(1, handle + 32, false).unwrap();
+        assert_eq!(heap.map_at(1), Some(0));
+        let a = held(&heap, 0);
+        assert!(a.is_some());
+        // Slot 0 gets another record.
+        records_of_one_view(0xD7, new, handle, 1);
+        let e = epoch();
+        heap.mirror(0, handle, true).unwrap();
+        assert_eq!((held(&heap, 1), heap.map_at(1)), (a, Some(1)), "the stand-in");
+        assert_eq!(held(&heap, 0), a, "slot 0 keeps the old record's view");
+        let t = heap.map_at(0).unwrap();
+        assert!(t >= heap.count, "the new record in a dynamic slot");
+        let b = held(&heap, t);
+        assert!(b.is_some() && b != a);
+        heap.settle();
+        if epoch() == e {
+            assert_eq!(heap.map_at(0), Some(t), "nothing has run yet");
+        }
+        retired();
+        heap.settle();
+        assert_eq!((heap.map_at(0), held(&heap, 0)), (Some(0), b), "made in place");
+        assert_eq!(held(&heap, t), b, "the dynamic slot until one more retire");
+        retired();
+        heap.settle();
+        assert!(held(&heap, t).is_none(), "given back");
+        crate::shadow::unregister(0xD6, old);
+        crate::shadow::unregister(0xD7, new);
+    }
     /// The record lock is taken inside the slot lock, never the other way
     /// round: a slot lock taken with the record lock held is caught (debug
     /// builds) before it could deadlock against a mirror.

@@ -5134,6 +5134,8 @@ pub(crate) fn retire(resource: ID3D12Resource, copy: Option<std::sync::Arc<crate
 
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
+    // View heap slots kept for work in flight may be made again now.
+    crate::descriptor::host::retired();
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     if !retired.is_empty() {
         release_later(Box::new(retired));

@@ -1829,7 +1829,7 @@ impl<'a> Lower<'a> {
             view_marks: self.s.view_writes.is_some(),
             view_stores: self.s.view_stores,
             nonuniform_handles: self.s.nonuniform_handles,
-            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap").count() as u32,
+            heap_handles: self.s.heap_handles,
             #[cfg(test)]
             barrier_modes: self
                 .s

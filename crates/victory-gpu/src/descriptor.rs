@@ -194,6 +194,8 @@ pub(crate) fn sync_heaps() {
         // TODO: count draws reading title slots past `host.count()` (now only
         // the `mirror` warning) to size a remap into the host heap.
         let count = u64::from(heap.desc.count.min(host.count()));
+        // Records kept from work that has run since go to their own slots.
+        host.settle();
         for (from, to) in written.take(start as usize, usize::MAX) {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
