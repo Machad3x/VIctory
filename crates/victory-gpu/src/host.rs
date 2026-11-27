@@ -3392,11 +3392,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
     // A page that cannot be read fails either way and is found below.
-    let whole = if title_dst {
-        read(src, dst, len)
+    // `_copied`: the destination's bytes written (a prefix).
+    let (whole, _copied) = if title_dst {
+        let copied = read_copied(src, dst, len);
+        (copied == len, copied)
     } else {
         // SAFETY: the destination is host memory of `len` bytes.
-        unsafe { crate::title_copy::copy(dst, src, len) }
+        (unsafe { crate::title_copy::copy(dst, src, len) }, 0)
     };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -3411,6 +3413,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
     if title_dst && !crate::texture::committed(dst, len) {
+        #[cfg(feature = "diagnostics")]
+        if _copied != 0 {
+            crate::copystat::ours_wrote(dst as usize, _copied);
+        }
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -3449,6 +3455,12 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// page is not readable or a destination page not writable (the bytes
 /// before that page may have been copied).
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    read_copied(src, dst, len) == len
+}
+
+/// [`read`], returning the bytes copied: all `len`, or those before the
+/// first page that could not be read or written.
+fn read_copied(src: *const u8, dst: *mut u8, len: usize) -> usize {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
@@ -3456,7 +3468,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // memory or title memory; the kernel checks both ranges, and a page it
     // cannot read or write fails the call instead of faulting.
     let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
-    ok && done == len
+    if ok { len } else { done.min(len) }
 }
 
 /// Copies host memory into title memory after a submission (what shaders
@@ -3468,7 +3480,19 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
 /// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
 /// per frame.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| read(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+    write_mapped_each(dst, src, len, |_, _| {});
+}
+
+/// [`write_mapped`], calling `wrote(at, bytes)` for the destination's bytes
+/// it wrote (some more than once).
+pub(crate) fn write_mapped_each(dst: *mut u8, src: *const u8, len: usize, mut wrote: impl FnMut(usize, usize)) {
+    let mut write = |at: usize, n: usize| {
+        let copied = read_copied(src.wrapping_add(at - dst as usize), at as *mut u8, n);
+        if copied != 0 {
+            wrote(at, copied);
+        }
+        copied == n
+    };
     if len == 0 || write(dst as usize, len) {
         return;
     }

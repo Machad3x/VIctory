@@ -96,9 +96,11 @@ impl Vram {
     /// [`crate::copy_pool::Then`] of a pooled video-memory write: `vram` a
     /// `&Vram`, `dst` and `len` the bytes of its copy that landed.
     fn landed(vram: usize, dst: usize, len: usize) {
-        // SAFETY: the copy holding it outlives the pool's run, which makes
-        // the queued write and calls this before it returns (the write's
-        // destination lives as long).
+        // SAFETY: `copy_pool::run` calls this before it returns, and the
+        // `Vram` lives as long as its `Shadow`: `Batch::flush` queues the
+        // write while `Batch::current` holds the copy's `Arc` (taken in
+        // `update_all`), cleared only by `Batch::title_written` after the
+        // flush's run returned (a test holds its copy itself).
         let v = unsafe { &*(vram as *const Vram) };
         let from = dst - v.data as usize;
         v.behind(from, from + len);
@@ -2957,13 +2959,21 @@ pub(crate) mod tests {
         let (p, len, copy) = mirrored_buffer(pages);
         copy.freshen(0, len);
         let _serial = crate::copy_pool::test_lock();
+        // Off again on every way out, a failed assertion too.
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                REFRESH_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         REFRESH_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
+        let off = Off;
         for page in 0..pages {
             // SAFETY: our pool's bytes.
             unsafe { ((p + page * PAGE + 100) as *mut u8).write_volatile(0xC3) };
         }
         let (_, pieces) = crate::copy_pool::queued(|| copy.update(p, len));
-        REFRESH_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+        drop(off);
         assert!(pieces.is_empty(), "nothing queued");
         for page in 0..pages {
             assert_eq!(gpu_bytes(&copy, p + page * PAGE + 100, 1), [0xC3], "page {page}");

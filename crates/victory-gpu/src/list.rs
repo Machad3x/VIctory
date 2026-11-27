@@ -1188,9 +1188,11 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
             } else {
                 (data + at) as *const u8
             };
-            crate::host::write_mapped((title + at) as *mut u8, src, n);
+            // Only the bytes written count as ours (unmapped pages are left).
             #[cfg(feature = "diagnostics")]
-            crate::copystat::ours_wrote(title + at, n);
+            crate::host::write_mapped_each((title + at) as *mut u8, src, n, crate::copystat::ours_wrote);
+            #[cfg(not(feature = "diagnostics"))]
+            crate::host::write_mapped((title + at) as *mut u8, src, n);
         }
     });
 }

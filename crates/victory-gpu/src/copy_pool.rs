@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Called once a copy's bytes landed: `(f, context)`, as
-/// `f(context, destination, bytes)` (for each piece a copy is cut into).
+/// `f(context, destination, bytes)`, on the thread that asked for the copy
+/// (or called [`run`]), never on a worker: a hook may block (on a lock a
+/// riding pull holds over its GPU wait) without holding up the pool.
 pub(crate) type Then = (fn(usize, usize, usize), usize);
 
 /// A copy of title memory into host memory: destination, source, bytes,
@@ -40,8 +42,8 @@ pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize) {
     copy_then(dst, src, len, None);
 }
 
-/// As [`copy`], calling `then` once the bytes landed (at once, or on the
-/// thread that made the queued copy, before [`run`] returns).
+/// As [`copy`], calling `then` once the bytes landed (at once, or for a
+/// queued copy in [`run`], after the pool's part and before it returns).
 pub(crate) fn copy_then(dst: *mut u8, src: *const u8, len: usize, then: Option<Then>) {
     let piece = (dst as usize, src as usize, len, then);
     let queued = QUEUE.with(|q| q.borrow_mut().as_mut().map(|q| q.push(piece)).is_some());
@@ -116,15 +118,24 @@ pub(crate) fn run(pieces: Vec<Piece>) {
         return;
     };
     let mut cut = Vec::with_capacity(pieces.len() + total / PIECE);
+    let mut thens = Vec::new();
     for (dst, src, len, then) in pieces {
+        if let Some(then) = then {
+            thens.push((then, dst, len));
+        }
         let mut at = 0;
         while at < len {
             let n = (len - at).min(PIECE);
-            cut.push((dst + at, src + at, n, then));
+            cut.push((dst + at, src + at, n, None));
             at += n;
         }
     }
     pool.run(cut);
+    // After the pool's run released it: a hook waiting on a lock holds up
+    // only this caller, not the next run.
+    for ((f, context), dst, len) in thens {
+        f(context, dst, len);
+    }
 }
 
 /// One [`run`]'s pieces, taken by index by whichever thread is free.
@@ -267,8 +278,8 @@ mod tests {
         assert!(dst == src, "every byte where it belongs");
     }
 
-    /// A copy's `then` is called once its bytes landed, for each piece it
-    /// was cut into, together covering it, on the workers too.
+    /// A copy's `then` is called once its bytes landed, once per copy (a
+    /// big one cut into pieces too), on the thread that ran them.
     #[test]
     fn then_follows_each_piece_once_its_bytes_landed() {
         static LANDED: AtomicUsize = AtomicUsize::new(0);
@@ -284,7 +295,8 @@ mod tests {
                     std::slice::from_raw_parts(dst as *const u8, len),
                 )
             };
-            if s != d {
+            let on_worker = std::thread::current().name().is_some_and(|n| n.starts_with("victory refresh"));
+            if s != d || on_worker {
                 WRONG.fetch_add(1, Ordering::Relaxed);
             }
             LANDED.fetch_add(len, Ordering::Relaxed);
@@ -302,9 +314,11 @@ mod tests {
             copy(unsafe { d.add(9 << 20) }, unsafe { s.add(9 << 20) }, 3 << 20);
         });
         assert_eq!(LANDED.load(Ordering::Relaxed), 0, "not before the run");
+        // Not with a test switching the pool's threads meanwhile.
+        let _serial = test_lock();
         run(pieces);
         assert_eq!(LANDED.load(Ordering::Relaxed), 9 << 20, "every byte once");
-        assert_eq!(WRONG.load(Ordering::Relaxed), 0, "called after the bytes landed");
+        assert_eq!(WRONG.load(Ordering::Relaxed), 0, "called after the bytes landed, not on a worker");
         assert!(dst == src, "every byte where it belongs");
         // Outside `queued`: at once.
         dst[..16].fill(0);
