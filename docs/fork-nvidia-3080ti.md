@@ -1165,6 +1165,37 @@ title skip them: GPU writes the copy-back withholds that the title reads
 back, occlusion queries measured on a black first frame, and timestamps that
 report CPU time.
 
+## Compute waits and a descriptor mirror race, `gpu281` to `gpu285`
+
+`gpu281` measured two branches, not merged yet:
+
+- A native pipeline stub for device methods `0x1c8` and `0x218`. It ran
+  without trouble.
+- A texture freshness audit (diagnostics only). Of about 165 textures audited
+  a frame, none changed unseen, and no write-watch guard was lost.
+
+`gpu282` and `gpu283` ran with `VICTORY_COMPUTE_WAIT=1`: compute pipelines
+are waited for like passes over the screen. Both were lit. `gpu284` ran with
+that wait on by default (`02fc024c`) and came out half lit, with no compute
+pipeline waited for. The wait stays as policy, since a dispatch should never
+be dropped, but it is not the fix for the dark interior.
+
+`gpu285` (`9ef5cdde`) fixes a race: a late mirror of a descriptor slot could
+null a newer view there until the title wrote that page again. A test
+reproduces it. The run was lit, with no change in frame time.
+
+Medians of the last 15 frames:
+
+| Run | Build | Prep / sync heaps / GPU / settle ms | Frame ms | Picture |
+|---|---|---|---|---|
+| `gpu282` | main + gpu281 branches, `VICTORY_COMPUTE_WAIT=1` | 131.2 / 49.9 / 96.3 / 59.4 | 271 | Lit |
+| `gpu283` | main + gpu281 branches, `VICTORY_COMPUTE_WAIT=1` | 132.1 / 51.2 / 100.8 / 59.5 | 304 | Lit |
+| `gpu284` | compute wait by default | 126.2 / 49.6 / 93.8 / 51.1 | 290 | Half lit; no compute pipeline waited for |
+| `gpu285` | descriptor mirror race fix | 128.2 / 51.4 / 93.3 / 52.5 | 302 | Lit |
+
+The dark interior is still intermittent. Lit runs bind the 7 lighting
+compute pipelines; dark runs do not.
+
 ## Open problems
 
 - About 1 frame per second.
