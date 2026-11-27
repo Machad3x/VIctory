@@ -1374,8 +1374,13 @@ missed 97 private and 117 mapped pages and wrote 268 pages in place, and
 the page tables had waited their whole 100 ms for the opening thread.
 With `VICTORY_RT_MEMORY` the copies of lists that missed went back to title
 memory (so that ray-tracing structures were whole); they are withheld again,
-as without it. In-place writes cannot be withheld, so page tables now wait
-up to 2 s a frame for runs being opened, within the frame's one allowance.
+as without it. In-place stores cannot be withheld after a list ran, so a
+table written while a miss withholds, or while title memory is still being
+opened, names its in-place runs load-only (a null unordered access view:
+loads read, stores are dropped). The title's submission waits for runs
+being opened before it takes any lock, at most 500 ms a frame from the
+frame's one allowance; texture read-backs of a list that missed are
+withheld with its copies.
 
 ## Open problems
 
