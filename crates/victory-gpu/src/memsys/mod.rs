@@ -17,6 +17,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+pub(crate) mod dirty;
+pub(crate) mod gate;
+pub(crate) mod pages;
+pub(crate) mod queue;
+pub(crate) mod ring;
+
 /// Whether the new memory paths are on: `VICTORY_MEMSYS=1`. Asked once.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -74,6 +80,63 @@ pub(crate) enum Class {
 
 impl Class {
     const COUNT: usize = 6;
+}
+
+/// The heap type the title gave a buffer: all that is left of what it
+/// meant the memory for (the console's own memory types are not kept).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Heap {
+    Default,
+    Upload,
+    Readback,
+}
+
+/// What is known of a range of title memory the GPU uses.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Traits {
+    /// A texture (tiled in title memory, so never usable where it lies).
+    pub(crate) texture: bool,
+    /// A title buffer covers it. Not covered, shaders reach it only at
+    /// addresses they compute, and it has no copy.
+    pub(crate) covered: bool,
+    /// Shaders use atomics on it, or write it scattered.
+    pub(crate) atomics: bool,
+    pub(crate) bytes: u64,
+    /// Bytes shaders read of it per frame (an estimate).
+    pub(crate) gpu_read: u64,
+    pub(crate) gpu_writes: bool,
+    /// The title's CPU reads what shaders wrote there, after a fence.
+    pub(crate) cpu_reads: bool,
+    pub(crate) heap: Option<Heap>,
+}
+
+/// From this size a buffer is hot whatever is read of it: one pass over
+/// it from system memory costs more than keeping it in video memory.
+const HOT_BYTES: u64 = 1 << 20;
+
+/// Where a range with these traits belongs, on a host with (`bar`) or
+/// without video memory the CPU can write.
+///
+/// Video memory is the rule: shaders read it some thirty times faster
+/// than system memory, and scattered writes or atomics over the bus have
+/// removed the device. The title's own pages serve where there is no copy
+/// at all (they read as zeros otherwise), and for small results the
+/// title's CPU reads, which then need no copy back.
+pub(crate) fn place(t: &Traits, bar: bool) -> Class {
+    let video = if bar { Class::Bar } else { Class::Shared };
+    if t.texture {
+        return Class::Vram;
+    }
+    if !t.covered {
+        return Class::InPlace;
+    }
+    if t.atomics || t.bytes >= HOT_BYTES || t.gpu_read >= t.bytes.saturating_mul(4) {
+        return video;
+    }
+    if t.gpu_writes && (t.cpu_reads || t.heap == Some(Heap::Readback)) {
+        return Class::InPlace;
+    }
+    video
 }
 
 /// What is counted besides buffers made.
@@ -166,6 +229,41 @@ pub(crate) fn frame(frame: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranges_are_placed_by_what_uses_them() {
+        let small = Traits {
+            texture: false,
+            covered: true,
+            atomics: false,
+            bytes: 64 << 10,
+            gpu_read: 64 << 10,
+            gpu_writes: false,
+            cpu_reads: false,
+            heap: None,
+        };
+        // Read by shaders, written by the CPU: video memory through the
+        // BAR, or system memory where the host has none.
+        assert_eq!(place(&small, true), Class::Bar);
+        assert_eq!(place(&small, false), Class::Shared);
+        assert_eq!(place(&Traits { texture: true, covered: false, ..small }, true), Class::Vram);
+        // No copy at all: the title's pages, whatever else is known.
+        let uncovered = Traits { covered: false, atomics: true, bytes: 64 << 20, ..small };
+        assert_eq!(place(&uncovered, true), Class::InPlace);
+        // A small result the CPU reads stays where the title reads it,
+        // named so by a counter or by the title's heap type.
+        let result = Traits { gpu_writes: true, cpu_reads: true, ..small };
+        assert_eq!(place(&result, true), Class::InPlace);
+        let by_heap = Traits { gpu_writes: true, heap: Some(Heap::Readback), ..small };
+        assert_eq!(place(&by_heap, true), Class::InPlace);
+        // Never under atomics, when hot, or when large.
+        assert_eq!(place(&Traits { atomics: true, ..result }, true), Class::Bar);
+        assert_eq!(place(&Traits { gpu_read: 256 << 10, ..result }, true), Class::Bar);
+        assert_eq!(place(&Traits { bytes: 1 << 20, gpu_read: 0, ..result }, true), Class::Bar);
+        // Shaders write it and nobody reads it on the CPU: video memory.
+        assert_eq!(place(&Traits { gpu_writes: true, ..small }, true), Class::Bar);
+        assert_eq!(place(&Traits { heap: Some(Heap::Upload), ..small }, true), Class::Bar);
+    }
 
     /// Each counter has a slot of its own.
     #[test]
