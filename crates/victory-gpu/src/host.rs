@@ -1801,6 +1801,9 @@ impl Host {
         let mut sent: Option<std::time::Instant> = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            // Before the lists go: what reads view heap slots from here on
+            // is covered by this value ([`sent`]).
+            SENT.fetch_max(*submitted, Ordering::SeqCst);
             let mut ended = Waited::Done;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -5134,10 +5137,41 @@ pub(crate) fn retire(resource: ID3D12Resource, copy: Option<std::sync::Arc<crate
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((resource, copy));
 }
 
+/// The host fence value of the last group sent to the GPU (stored before its
+/// lists go, so work that reads memory written before this call is covered
+/// by the value returned): with [`completed`], what view heaps wait for
+/// before they rewrite a slot work in flight may read (`crate::descriptor`).
+// On branch `pipeline`: `Host::submit` stores it where it sets `t.value`.
+static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn sent() -> u64 {
+    #[cfg(test)]
+    if let Some((sent, _)) = FENCE.get() {
+        return sent;
+    }
+    SENT.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's [`sent`] and [`completed`] values, not the host's
+    /// (work in flight without a submission).
+    pub(crate) static FENCE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The host fence's completed value: every group up to it has run (all of
+/// them without a device: nothing runs).
+pub(crate) fn completed() -> u64 {
+    #[cfg(test)]
+    if let Some((_, completed)) = FENCE.get() {
+        return completed;
+    }
+    // SAFETY: a live fence.
+    host().map_or(u64::MAX, |h| unsafe { h.fence.GetCompletedValue() })
+}
+
 /// After a submission has run, with none running: the retired resources go.
 pub(crate) fn release_retired() {
-    // View heap slots kept for work in flight may be made again now.
-    crate::descriptor::host::retired();
     let retired = std::mem::take(&mut *RETIRED.lock().unwrap_or_else(|e| e.into_inner()));
     if !retired.is_empty() {
         release_later(Box::new(retired));

@@ -137,31 +137,26 @@ struct Canon {
     /// The host heap's number, for its gauges (diagnostics).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     heap: u32,
-    /// [`Share::On`]: slots others shared since the last retire ([`epoch`]
-    /// then): work in flight may have read the map's entry naming them, so
-    /// their own descriptor keeps the record it had until that work has run.
+    /// [`Share::On`]: slots map entries named (others shared them): work
+    /// in flight may have read such an entry, so their own descriptor keeps
+    /// the record it had until that work has run. Tagged ([`NAMED`]).
     owned_at: std::collections::HashMap<u32, u64>,
     /// Title slots whose record lives in a dynamic slot meanwhile (none:
-    /// read null), with their record's handle and the epoch: made in place
-    /// once that epoch is past ([`HostHeap::settle`]).
+    /// read null), with their record's handle and a tag ([`NAMED`]): made in place
+    /// once the work that read the slot's own descriptor has run
+    /// ([`HostHeap::settle`]).
     moving: std::collections::HashMap<u32, (u32, u64, u64)>,
-    /// Dynamic slots such records lived in, given back once their epoch is
-    /// past (the map named them until then).
+    /// Dynamic slots such records lived in, given back once the work that
+    /// read them through the map has run. Tagged ([`NAMED`]).
     freeing: Vec<(u32, u64)>,
 }
 
-/// Retires of the work that was running ([`retired`]): what work in flight
-/// read before epoch `e` has run once the epoch is past `e`.
-static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The submission has run with none running (`crate::host::release_retired`).
-pub(crate) fn retired() {
-    EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-}
-
-fn epoch() -> u64 {
-    EPOCH.load(std::sync::atomic::Ordering::Acquire)
-}
+/// A slot map change's tag (host fence value) until the next heap sync, which
+/// sets it to `crate::host::sent` read under the slot lock, after the map
+/// writes of the change (work sent before them is covered by that value):
+/// the work that may have read the old entries has run once
+/// `crate::host::completed` reaches it.
+const NAMED: u64 = u64::MAX;
 
 /// A record held by title slots ([`Canon`]).
 #[derive(Clone, Copy)]
@@ -325,7 +320,7 @@ impl Canon {
             }
         }
         self.sharers.entry(to).or_default().insert(index);
-        self.owned_at.insert(to, epoch());
+        self.owned_at.insert(to, NAMED);
         self.note_sharing();
     }
 
@@ -1205,7 +1200,7 @@ impl HostHeap {
     /// (`owned_at`, `HostHeap::mirror`). A released record (no view): every
     /// sharer is nulled and its own again.
     fn stand_in(&self, canon: &mut Canon, from: u32, key: u64, sharers: std::collections::HashSet<u32>) {
-        canon.owned_at.insert(from, epoch());
+        canon.owned_at.insert(from, NAMED);
         let found = view_at(key as u32, (key >> 32) as u32);
         let Some((view, _pin)) = &found else {
             for &o in &sharers {
@@ -1265,10 +1260,16 @@ impl HostHeap {
     }
 
     /// [`Share::On`]: slot `index`'s record goes to a dynamic slot until the
-    /// work in flight has run, rather than into the slot itself: others
-    /// shared it since the last retire, or its record lives elsewhere already.
+    /// work in flight has run, rather than into the slot itself: map entries
+    /// naming it may have been read by work still running, or its record
+    /// lives elsewhere already. Called with the slot lock held: a [`NAMED`]
+    /// tag's map writes are done, so `sent` now covers what read them.
     fn keeps_its_descriptor(canon: &Canon, index: u32) -> bool {
-        canon.moving.contains_key(&index) || canon.owned_at.get(&index) == Some(&epoch())
+        canon.moving.contains_key(&index)
+            || canon
+                .owned_at
+                .get(&index)
+                .is_some_and(|&t| crate::host::completed() < t.min(crate::host::sent()))
     }
 
     /// Slot `index` no longer has its record elsewhere: that dynamic slot is
@@ -1277,36 +1278,62 @@ impl HostHeap {
         if let Some((slot, ..)) = canon.moving.remove(&index)
             && slot != NONE
         {
-            canon.freeing.push((slot, epoch()));
+            canon.freeing.push((slot, NAMED));
         }
     }
 
-    /// [`Share::On`], before a heap sync (no work running): slots whose
-    /// record waited in a dynamic slot past a retire are made in place, and
-    /// dynamic slots no map entry names any more are given back.
+    /// [`Share::On`], before a heap sync: [`NAMED`] tags take the value
+    /// sent so far, slots whose record waited in a dynamic slot until the
+    /// work that read their own descriptor has run are made in place, and
+    /// dynamic slots no map entry has named since work still running was
+    /// sent are given back.
     pub(crate) fn settle(&self) {
         if self.share != Share::On {
             return;
         }
-        let now = epoch();
         let (ready, free) = {
             let _made = self.lock_made();
             let Some(mut canon) = self.lock_canon() else { return };
-            canon.owned_at.retain(|_, &mut e| e == now);
+            // Under the slot lock, so every map write before is in.
+            let (sent, done) = (crate::host::sent(), crate::host::completed());
+            // Waiting (and its tag settled) if work sent at `t` still runs.
+            let waits = |t: &mut u64| {
+                if *t == NAMED {
+                    *t = sent;
+                }
+                done < *t
+            };
+            let canon = &mut *canon;
+            // Freed before records move back: the dynamic slots those give
+            // up are named until their slot is made in place below.
+            let mut free = Vec::new();
+            canon.freeing.retain_mut(|(slot, t)| {
+                waits(t) || {
+                    free.push(*slot);
+                    false
+                }
+            });
+            let sharers = &canon.sharers;
+            canon.owned_at.retain(|s, t| {
+                if sharers.contains_key(s) {
+                    // Still named.
+                    *t = NAMED;
+                    true
+                } else {
+                    waits(t)
+                }
+            });
             let ready: Vec<(u32, u64)> = canon
                 .moving
-                .iter()
-                .filter(|&(_, &(_, _, e))| e < now)
-                .map(|(&c, &(_, handle, _))| (c, handle))
+                .iter_mut()
+                .filter_map(|(&c, (_, handle, t))| (!waits(t)).then_some((c, *handle)))
                 .collect();
             for &(c, _) in &ready {
-                Self::moved_back(&mut canon, c);
+                Self::moved_back(canon, c);
             }
-            let (free, keep): (Vec<_>, Vec<_>) = canon.freeing.drain(..).partition(|&(_, e)| e < now);
-            canon.freeing = keep;
             (ready, free)
         };
-        for (slot, _) in free {
+        for slot in free {
             self.make_null(slot);
             self.release(slot, 1);
         }
@@ -1508,7 +1535,7 @@ impl HostHeap {
                     if keep_own {
                         // Work in flight may read its descriptor: shaders
                         // read the heap's null view for it meanwhile.
-                        canon.moving.insert(index, (NONE, handle, epoch()));
+                        canon.moving.insert(index, (NONE, handle, NAMED));
                     }
                 }
                 drop(canon);
@@ -1706,7 +1733,7 @@ impl HostHeap {
                 Self::moved_back(canon, index);
                 match temp {
                     Some(t) => {
-                        canon.moving.insert(index, (t, handle, epoch()));
+                        canon.moving.insert(index, (t, handle, NAMED));
                         #[cfg(feature = "diagnostics")]
                         crate::copystat::add(crate::copystat::C::DescMoved, 1);
                     }
@@ -3996,8 +4023,8 @@ mod tests {
         // reads the null view meanwhile.
         let viewed = held(&heap, 0);
         records[..4].fill(0);
-        // Other tests retire work too: the wait is checked only if none did.
-        let e = epoch();
+        let fence = &crate::host::FENCE;
+        fence.set(Some((1, 0))); // work in flight
         assert!(heap.mirror(0, handle, false).is_none());
         let d = if held(&heap, 1).is_some() { 1 } else { 2 };
         let other = 3 - d;
@@ -4005,11 +4032,10 @@ mod tests {
         let null = crate::host::heap_views() - 1;
         assert_eq!((heap.map_at(0), heap.map_at(d), heap.map_at(other)), (Some(null), Some(d), Some(d)));
         heap.settle();
-        if epoch() == e {
-            assert_eq!(heap.map_at(0), Some(null), "until the work in flight has run");
-        }
-        retired();
+        assert_eq!(heap.map_at(0), Some(null), "until the work in flight has run");
+        fence.set(Some((1, 1)));
         heap.settle();
+        fence.set(None);
         assert_eq!(heap.map_at(0), Some(0), "its own, null, once it has");
         assert!(held(&heap, 0).is_none());
         {
@@ -4029,7 +4055,7 @@ mod tests {
     /// takes its descriptor first, and the slot's own descriptor keeps the
     /// old record until the work that may have read the old map entries has
     /// run (the new one in a dynamic slot meanwhile); then the slot is made
-    /// in place and the dynamic slot given back after one more retire.
+    /// in place and the dynamic slot given back after one more heap sync.
     #[test]
     fn a_rewritten_shared_slot_keeps_its_descriptor_until_work_in_flight_has_run() {
         let Some(_) = host() else { return };
@@ -4052,7 +4078,8 @@ mod tests {
         assert!(a.is_some());
         // Slot 0 gets another record.
         records_of_one_view(0xD7, new, handle, 1);
-        let e = epoch();
+        let fence = &crate::host::FENCE;
+        fence.set(Some((1, 0))); // work in flight
         heap.mirror(0, handle, true).unwrap();
         assert_eq!((held(&heap, 1), heap.map_at(1)), (a, Some(1)), "the stand-in");
         assert_eq!(held(&heap, 0), a, "slot 0 keeps the old record's view");
@@ -4061,15 +4088,18 @@ mod tests {
         let b = held(&heap, t);
         assert!(b.is_some() && b != a);
         heap.settle();
-        if epoch() == e {
-            assert_eq!(heap.map_at(0), Some(t), "nothing has run yet");
-        }
-        retired();
+        assert_eq!(heap.map_at(0), Some(t), "nothing has run yet");
+        fence.set(Some((1, 1)));
         heap.settle();
         assert_eq!((heap.map_at(0), held(&heap, 0)), (Some(0), b), "made in place");
-        assert_eq!(held(&heap, t), b, "the dynamic slot until one more retire");
-        retired();
+        assert_eq!(held(&heap, t), b, "the dynamic slot until one more heap sync");
+        // Sent while the map still named it: given back once that has run.
+        fence.set(Some((2, 1)));
         heap.settle();
+        assert_eq!(held(&heap, t), b, "until the work sent meanwhile has run");
+        fence.set(Some((2, 2)));
+        heap.settle();
+        fence.set(None);
         assert!(held(&heap, t).is_none(), "given back");
         crate::shadow::unregister(0xD6, old);
         crate::shadow::unregister(0xD7, new);
