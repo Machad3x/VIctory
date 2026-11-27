@@ -1754,14 +1754,14 @@ fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
         merged.push((copy, at, n));
     }
     // Locked in address order (the runs are sorted by copy).
-    let mut locked: Vec<(&Shadow, std::sync::MutexGuard<'_, Vec<u64>>, Vec<(usize, usize)>)> = Vec::new();
+    let mut locked: Vec<(&Shadow, Locked<'_>)> = Vec::new();
     let mut regions = Vec::with_capacity(merged.len());
     for &(copy, at, n) in &merged {
         let Some(v) = &copy.vram else { continue };
-        if !locked.last().is_some_and(|(c, ..)| std::ptr::eq(*c, copy)) {
-            locked.push((copy, lock_stale(&v.stale), Vec::new()));
+        if !locked.last().is_some_and(|(c, _)| std::ptr::eq(*c, copy)) {
+            locked.push((copy, (lock_stale(&v.stale), Vec::new())));
         }
-        let (_, bits, pages) = locked.last_mut().expect("just pushed");
+        let (_, (bits, pages)) = locked.last_mut().expect("just pushed");
         let (from, to) = (at / PAGE, (at + n).div_ceil(PAGE));
         for k in from..to {
             bits[k / 64] &= !(1 << (k % 64));
@@ -1779,15 +1779,19 @@ fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
     if crate::host::riding_active() {
         // Copies with no page brought back are not held over the wait.
         return Held(
-            locked.into_iter().filter(|(.., pages)| !pages.is_empty()).map(|(_, bits, pages)| (bits, pages)).collect(),
+            locked.into_iter().map(|(_, held)| held).filter(|(_, pages)| !pages.is_empty()).collect(),
         );
     }
     Held(Vec::new())
 }
 
+/// A copy's stale bits, locked, and the pages (index ranges) marked
+/// current under the lock.
+type Locked<'a> = (std::sync::MutexGuard<'a, Vec<u64>>, Vec<(usize, usize)>);
+
 /// Stale page locks a riding pull holds until its copies ran, with the
 /// pages (index ranges) it marked current under each.
-pub(crate) struct Held<'a>(Vec<(std::sync::MutexGuard<'a, Vec<u64>>, Vec<(usize, usize)>)>);
+pub(crate) struct Held<'a>(Vec<Locked<'a>>);
 
 impl Held<'_> {
     /// The copies may not have run: their pages are stale again.
@@ -1809,16 +1813,17 @@ impl Held<'_> {
 /// another holder (a riding pull holds them over its submission) counted.
 fn lock_stale(stale: &Mutex<Vec<u64>>) -> std::sync::MutexGuard<'_, Vec<u64>> {
     #[cfg(feature = "diagnostics")]
-    match stale.try_lock() {
-        Ok(bits) => return bits,
-        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+    let bits = match stale.try_lock() {
+        Ok(bits) => bits,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::StaleLockWaitNs);
-            return stale.lock().unwrap_or_else(|e| e.into_inner());
+            stale.lock().unwrap_or_else(|e| e.into_inner())
         }
-    }
+    };
     #[cfg(not(feature = "diagnostics"))]
-    stale.lock().unwrap_or_else(|e| e.into_inner())
+    let bits = stale.lock().unwrap_or_else(|e| e.into_inner());
+    bits
 }
 
 /// GPU copies [`bring_back`] made (tests).

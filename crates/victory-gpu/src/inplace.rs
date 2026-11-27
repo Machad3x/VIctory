@@ -414,8 +414,8 @@ pub(crate) fn settle() {
         }
         drop(std::mem::take(&mut g.runs));
         let started = std::time::Instant::now();
-        // SAFETY: plain reads of this thread's last error.
         while (g.unmap)() == 0
+            // SAFETY: plain reads of this thread's last error.
             && unsafe { GetLastError() } == ERROR_INVALID_PARAMETER
             && started.elapsed() < std::time::Duration::from_millis(100)
         {

@@ -119,7 +119,7 @@ fn pin_shift() -> u32 {
         let count = cpu_count();
         let asked = std::env::var("VICTORY_PIN_SHIFT").ok();
         let shift = asked.as_deref().map_or(Some(0), |text| {
-            text.trim().parse().ok().filter(|n: &u32| *n < count && n % 2 == 0)
+            text.trim().parse().ok().filter(|n: &u32| *n < count && n.is_multiple_of(2))
         });
         if shift.is_none() {
             tracing::warn!(

@@ -2047,12 +2047,15 @@ impl Host {
                 r.guard.busy &= unsafe { self.fence.GetCompletedValue() } < *submitted;
             }
         }
-        struct Kept(Regions);
+        /// Held only to be dropped with the submission's buffers.
+        struct Kept {
+            _regions: Regions,
+        }
         // SAFETY: D3D12 resources are free-threaded; only released there.
         unsafe impl Send for Kept {}
         // Not waited for: its buffers go with the submission's (`back`).
         let kept = match riding.take() {
-            Some(Some(r)) if unwaited => Some(Kept(r._regions)),
+            Some(Some(r)) if unwaited => Some(Kept { _regions: r._regions }),
             _ => None,
         };
         static RETAKE_ALL: std::sync::LazyLock<bool> =
