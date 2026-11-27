@@ -1100,6 +1100,36 @@ for them, and `gpu259` (393 still being made) was dark, 6.2 / 5.2.
 
 Lit, no draws dropped, no device removal; the frame is in the same range.
 
+## Remap counters and heap sync diff, `gpu261` to `gpu278`
+
+`gpu261` measured a sparse title-to-host slot remap (counters only, on a
+diagnostics branch not merged): title view pages holding a current view peak
+at 14,587 against a host pool of 11,272 pages of 64 slots, so the remap does
+not fit as designed; dynamic slots peak at 135,873; no heap-direct reads past
+the cap. The picture was dark.
+
+Heap syncs now compare each slot's record with what the slot was made from
+and its view entry's generation, read under one views lock per range, and
+send only changed slots to `mirror` (a superset of the old ones, never
+fewer). View generations moved to their own column.
+
+Medians of the last 15 frames:
+
+| Run | Build | Prep / sync heaps / GPU / settle ms | Frame ms | Page faults | Picture |
+|---|---|---|---|---|---|
+| `gpu273` | main before the change | 136.3 / 57.1 / 89.4 / 50.9 | 297 | ~8k | Lit |
+| `gpu275` | first sync diff | 190.3 / 106.2 / 114.3 / 55.9 | 364 | ~77k | Dark |
+| `gpu278` | sync diff, generations read in place | 131.4 / 51.7 / 94.2 / 49.8 | 290 | ~8.7k | Lit |
+
+`gpu274` and `gpu275` copied the whole generation column (~9 MB) at each
+sync: fresh pages and soft faults every time, under the heaps' lock. That
+copy was dropped; `gpu278` is kept.
+
+Picture notes: the dark interior is still intermittent across runs and
+branches. Bleached, near-white hair showed in `gpu277` and `gpu278` on
+different branches, cause not established; `gpu278` also showed blocky
+rectangles on a poster.
+
 ## Open problems
 
 - About 1 frame per second.
