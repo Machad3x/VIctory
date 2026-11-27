@@ -141,10 +141,10 @@ struct Layout {
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
-    /// Entries no copy holds that name title memory in place
-    /// ([`crate::inplace::backstop`]; empty without it), and the runs they
-    /// name, kept while the table may run.
-    backstopped: Vec<bool>,
+    /// Per entry no copy holds that names title memory in place, its run's
+    /// index in `runs` plus 1, else 0 ([`crate::inplace::backstop`]; empty
+    /// without it); the runs, kept while the table may run.
+    backstopped: Vec<u32>,
     runs: Vec<Arc<crate::inplace::Run>>,
 }
 
@@ -189,6 +189,7 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
 #[cfg(windows)]
 pub(crate) fn release(key: usize) {
     shared().retain(|(k, _)| *k != key);
+    with_ran(|m| m.remove(&key));
 }
 
 /// Whether view heap `key` has a page table.
@@ -341,6 +342,7 @@ pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
     crate::inplace::log_frame();
+    drop_dead_runs();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
@@ -627,7 +629,7 @@ impl Shared {
         blocks: &[usize],
         owner: &[Option<usize>],
     ) -> (Vec<bool>, Vec<Arc<crate::inplace::Run>>) {
-        let mut backstopped = vec![false; owner.len()];
+        let mut backstopped = vec![0u32; owner.len()];
         let mut runs: Vec<Arc<crate::inplace::Run>> = Vec::new();
         let mut named = 0u64;
         // Block 0 is the null one.
@@ -654,16 +656,20 @@ impl Shared {
                         pair
                     }
                 };
+                let index = match runs.iter().position(|r| r.id == placed.id) {
+                    Some(i) => i,
+                    None => {
+                        runs.push(placed);
+                        runs.len() - 1
+                    }
+                };
                 for (k, &(page, _)) in run.iter().enumerate() {
                     let entry = b * BLOCK + (page - first);
                     dwords[LEVEL1 + 2 * entry] = pair;
                     dwords[LEVEL1 + 2 * entry + 1] = crate::inplace::entry_base((page << 16) as u64, offset + k * crate::watch::PAGE);
-                    backstopped[entry] = true;
+                    backstopped[entry] = index as u32 + 1;
                 }
                 named += run.len() as u64;
-                if !runs.iter().any(|r| r.id == placed.id) {
-                    runs.push(placed);
-                }
             }
         }
         self.run_pairs.retain(|id, &mut pair| {
@@ -677,6 +683,77 @@ impl Shared {
         crate::inplace::named(named);
         (backstopped, runs)
     }
+
+    /// Drops the runs `dead` names from the table: their entries become
+    /// null (missing) in the mapped table and in a new layout. Only while no
+    /// submission runs (the GPU reads the table).
+    fn drop_runs(&mut self, dead: &[u64]) {
+        let l = &self.layout;
+        if !l.runs.iter().any(|r| dead.contains(&r.id)) {
+            return;
+        }
+        let kept: Vec<Arc<crate::inplace::Run>> = l.runs.iter().filter(|r| !dead.contains(&r.id)).cloned().collect();
+        let index_of = |old: u32| -> u32 {
+            let id = l.runs[old as usize - 1].id;
+            kept.iter().position(|r| r.id == id).map_or(0, |i| i as u32 + 1)
+        };
+        let mut backstopped = l.backstopped.clone();
+        let table = self.data as *mut u32;
+        for (entry, run) in backstopped.iter_mut().enumerate() {
+            if *run == 0 {
+                continue;
+            }
+            *run = index_of(*run);
+            if *run == 0 {
+                // SAFETY: an entry of the mapped table, which has room for
+                // every entry a layout names; no submission runs.
+                unsafe {
+                    table.add(LEVEL1 + 2 * entry).write(self.null);
+                    table.add(LEVEL1 + 2 * entry + 1).write(0);
+                }
+            }
+        }
+        let layout = Arc::new(Layout {
+            copies: l.copies.clone(),
+            bits: l.bits.clone(),
+            blocks: l.blocks.clone(),
+            owner: l.owner.clone(),
+            backstopped,
+            runs: kept,
+        });
+        crate::host::release_later(Box::new(std::mem::replace(&mut self.layout, layout)));
+    }
+}
+
+/// At a frame's end, with the backstop on: the page tables drop the runs
+/// over views the runtime let go, with no submission running, so that
+/// those views can be unmapped ([`crate::inplace::settle`]).
+fn drop_dead_runs() {
+    if !crate::inplace::backstop() {
+        return;
+    }
+    let dead = crate::inplace::dead();
+    if !dead.is_empty()
+        && let Some(host) = crate::host::host()
+    {
+        host.between_submissions(|| {
+            for (_, s) in shared().iter_mut() {
+                s.drop_runs(&dead);
+            }
+            // What lists ran with: all of them ran.
+            with_ran(|m| m.clear());
+        });
+    }
+    crate::inplace::settle();
+}
+
+/// The layout each view heap's lists last ran with ([`prepare`]): what
+/// their marks are read against after the run, even if the table changed
+/// or went since.
+static RAN: Mutex<Option<fx::Map<usize, Arc<Layout>>>> = Mutex::new(None);
+
+fn with_ran<R>(f: impl FnOnce(&mut fx::Map<usize, Arc<Layout>>) -> R) -> R {
+    f(RAN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
 /// The bytes of copies persistent misses may get in all
@@ -989,9 +1066,12 @@ fn name_missing(pages: &[u64], regions: &[usize], programs: &std::collections::B
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
+/// The page table of view heap `key` its lists last ran with ([`RAN`]),
+/// else as the last submission using it left it.
 fn layout(key: usize) -> Arc<Layout> {
+    if let Some(l) = with_ran(|m| m.get(&key).cloned()) {
+        return l;
+    }
     shared()
         .iter()
         .find(|(k, _)| *k == key)
@@ -1018,6 +1098,9 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         Some(s.layout.clone())
     })
     .flatten();
+    if let Some(l) = &layout {
+        with_ran(|m| m.insert(key, l.clone()));
+    }
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
@@ -1092,7 +1175,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let held = l.owner.get(entry).is_some_and(|o| o.is_some()) || l.backstopped.get(entry) == Some(&true);
+                let held = l.owner.get(entry).is_some_and(|o| o.is_some()) || l.backstopped.get(entry).is_some_and(|&r| r != 0);
                 if entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || !held {
                     return true;
                 }
@@ -1133,7 +1216,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     // A page no copy holds is a miss, byte for byte or not.
                     Some(Some(_)) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) => writes.push((*k, at)),
-                    _ if backstopped.get(entry) == Some(&true) => landed.push(at as usize),
+                    _ if backstopped.get(entry).is_some_and(|&r| r != 0) => landed.push(at as usize),
                     _ => {
                         pages += 1;
                         #[cfg(feature = "diagnostics")]
@@ -1150,7 +1233,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             measure_misses(&missed_at, &missed_in);
         }
         if !landed.is_empty() {
-            crate::inplace::written(landed.len() as u64);
+            // In place, writes land whether or not the list's others are
+            // withheld: counted apart.
+            let n = landed.len() as u64;
+            crate::inplace::written(n, if pages + regions > 0 || withholding() { n } else { 0 });
             // Every tracker over them (texture stagings among them) takes
             // title memory again.
             for at in landed {

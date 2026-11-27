@@ -1580,6 +1580,13 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
+    /// Runs `f` with no submission running, and none starting meanwhile.
+    /// Not from inside a submission (the lock is not reentrant).
+    pub(crate) fn between_submissions<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _one = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.

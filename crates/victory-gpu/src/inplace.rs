@@ -25,8 +25,10 @@
 //! covered, through our own view of their section
 //! (`crate::watch::title_memory_own`): the title's views stay free to be
 //! guarded and remapped, since a heap locks only the view it is opened on.
-//! The heaps stay open while the section lives; the runtime's unmapping of
-//! our view lets them go first (`crate::pinned`).
+//! Runs are opened on a thread of their own, joined with the open runs they
+//! overlap. The heaps stay open while the section lives; when the runtime
+//! lets go of our view, its runs are forgotten and the view stays mapped
+//! until no page table names them (a frame's end, [`settle`]).
 //! shortcut: private memory with no copy is not covered: a heap over it
 //! would make the title's and the guards' protections fail; open it once
 //! the counters show such misses.
@@ -86,8 +88,11 @@ fn budget() -> usize {
     MB.saturating_mul(1 << 20)
 }
 
-/// The longest run: one 256 MiB region of the page table.
+/// The longest run asked for: one 256 MiB region of the page table.
 const MOST: usize = 1 << 28;
+/// The longest run opened: asked-for runs joined with the open ones they
+/// overlap, up to a raw view's reach (2^27 dwords).
+const LONGEST: usize = 2 * MOST;
 
 /// Our own view's `[at, at + len)` open in place: a heap over it and one
 /// buffer placed over all of it.
@@ -105,19 +110,49 @@ unsafe impl Send for Run {}
 // SAFETY: as above.
 unsafe impl Sync for Run {}
 
-/// Runs open now, by address.
-static RUNS: Mutex<BTreeMap<usize, Arc<Run>>> = Mutex::new(BTreeMap::new());
-/// Where the host refused to open a run: not asked again.
-static REFUSED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+/// Our view of a section the runtime let go, held mapped until no page
+/// table names a run over it.
+struct Gone {
+    runs: Vec<Arc<Run>>,
+    /// Unmaps it; nonzero when that worked.
+    unmap: Box<dyn FnMut() -> i32 + Send>,
+    /// Frame ends it has waited.
+    frames: u32,
+}
+
+#[derive(Default)]
+struct Runs {
+    /// Runs open now, by address.
+    open: BTreeMap<usize, Arc<Run>>,
+    /// Asked for and not open yet (the worker opens them), and refused by
+    /// the host (not asked again).
+    pending: std::collections::BTreeSet<(usize, usize)>,
+    refused: std::collections::BTreeSet<(usize, usize)>,
+    /// Ids of runs over views gone that page tables may still name.
+    dead: Vec<u64>,
+    gone: Vec<Gone>,
+}
+
+static RUNS: Mutex<Option<Runs>> = Mutex::new(None);
+
+fn with_runs<R>(f: impl FnOnce(&mut Runs) -> R) -> R {
+    f(RUNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+}
+
+/// Held from a run's open to its insertion, and by a view's going: a view
+/// never goes between its run's open and the run's insertion.
+static OPENING: Mutex<()> = Mutex::new(());
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Bumped when what the backstop would name changes: views of our own
-/// mapped or gone, a run let go. Page tables are rewritten when it moves.
+/// mapped or gone, a run opened or let go. Page tables are rewritten when
+/// it moves.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-/// Since the start: runs refused for the budget, refused by the host; the
-/// pages named by the last table written; pages shaders wrote in place
-/// since the last frame line.
-static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Runs refused for the budget and by the host since the start; pages the
+/// last table named; since the last frame line: pages shaders wrote in
+/// place, those of them in lists or frames whose writes are withheld,
+/// runs opened, and the microseconds opening took (on the worker).
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
@@ -157,74 +192,202 @@ pub(crate) fn runs(pages: &[(usize, usize)]) -> Vec<&[(usize, usize)]> {
     out
 }
 
-/// The run holding our view's `[at, at + len)`, and where it starts in
-/// it: one open already, else opened now (the pages committed through our
-/// view too, which commits nothing new: the title's view committed them).
-/// None if the budget or the host refuses.
-pub(crate) fn run_for(at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
-    {
-        let runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-        for (&start, run) in runs.range(..=at).rev() {
-            if at - start >= MOST {
-                break;
-            }
-            if at + len <= start + run.len {
-                return Some((run.clone(), at - start));
-            }
+/// The open run holding `[at, at + len)` in `open`, and where the range
+/// starts in it.
+fn holding(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
+    for (&start, run) in open.range(..=at).rev() {
+        if at - start >= LONGEST {
+            break;
+        }
+        if at + len <= start + run.len {
+            return Some((run.clone(), at - start));
         }
     }
-    if REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&at) {
-        return None;
-    }
-    if OPEN.load(Ordering::Relaxed) + len > budget() {
-        STATS[0].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let host = crate::host::host()?;
-    // SAFETY: our own view of a section whose pages the title's view
-    // committed.
-    let committed = !unsafe { VirtualAlloc(at as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();
-    let opened = if committed {
-        open_at(&host.device, at, len).map_err(|e| e.to_string())
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
-    };
-    let (heap, buffer) = match opened {
-        Ok(opened) => opened,
-        Err(error) => {
-            REFUSED.lock().unwrap_or_else(|e| e.into_inner()).insert(at);
-            if STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::warn!(at = format_args!("{at:#x}"), len, %error, "title memory not opened in place: it reads as missing");
-            }
-            return None;
-        }
-    };
-    crate::host::name(&buffer, || format!("title memory in place {at:#x}+{len:#x}"));
-    let run = Arc::new(Run { id: NEXT.fetch_add(1, Ordering::Relaxed), len, buffer, _heap: heap });
-    RUNS.lock().unwrap_or_else(|e| e.into_inner()).insert(at, run.clone());
-    OPEN.fetch_add(len, Ordering::Relaxed);
-    // Let go before our view is unmapped.
-    // shortcut: a page table naming the run keeps its heap until rewritten,
-    // so an unmap meanwhile fails after its retries and leaves our view
-    // mapped; sections are freed rarely (the pool is made once).
-    let id = run.id;
-    let _ = crate::pinned::pin(at, len, Box::new(move || let_go(at, id)));
-    tracing::debug!(at = format_args!("{at:#x}"), len, "title memory opened in place");
-    Some((run, 0))
+    None
 }
 
-/// The run `id` at `at` is let go: page tables name it no more.
-fn let_go(at: usize, id: u64) {
-    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    if runs.get(&at).is_some_and(|r| r.id == id)
-        && let Some(run) = runs.remove(&at)
-    {
-        OPEN.fetch_sub(run.len, Ordering::Relaxed);
-        GENERATION.fetch_add(1, Ordering::Relaxed);
-        drop(runs);
-        crate::host::release_later(Box::new(run));
+/// `[at, at + len)` joined with the open runs it overlaps, if that stays
+/// within [`LONGEST`]: the range to open and the runs it replaces.
+fn joined(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> ((usize, usize), Vec<usize>) {
+    let (mut start, mut end) = (at, at + len);
+    let mut over = Vec::new();
+    for (&s, run) in open.range(at.saturating_sub(LONGEST)..at + len) {
+        if s + run.len > at {
+            over.push(s);
+            start = start.min(s);
+            end = end.max(s + run.len);
+        }
     }
+    if end - start > LONGEST {
+        return ((at, len), Vec::new());
+    }
+    ((start, end - start), over)
+}
+
+/// The run holding our view's `[at, at + len)`, and where the range starts
+/// in it; None while it is not open yet: it is asked of the worker, which
+/// opens it off the submitting thread (a later table names it), unless the
+/// host refused it before.
+pub(crate) fn run_for(at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
+    let ask = with_runs(|r| {
+        if let Some(found) = holding(&r.open, at, len) {
+            return Err(found);
+        }
+        Ok(!r.refused.contains(&(at, len)) && r.pending.insert((at, len)))
+    });
+    match ask {
+        Err(found) => Some(found),
+        Ok(true) => {
+            worker(at, len);
+            None
+        }
+        Ok(false) => None,
+    }
+}
+
+/// Sends `[at, at + len)` to the opening thread.
+fn worker(at: usize, len: usize) {
+    static WORK: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = std::sync::OnceLock::new();
+    let work = WORK.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        let _ = std::thread::Builder::new()
+            .name("victory-in-place".into())
+            .spawn(move || rx.into_iter().for_each(|(at, len)| open_run(at, len)));
+        Mutex::new(tx)
+    });
+    if work.lock().unwrap_or_else(|e| e.into_inner()).send((at, len)).is_err() {
+        with_runs(|r| r.pending.remove(&(at, len)));
+    }
+}
+
+/// Opens our view's `[at, at + len)`, joined with the open runs it
+/// overlaps, which it replaces (the page tables naming them keep them
+/// until rewritten); on the opening thread.
+fn open_run(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    let started = std::time::Instant::now();
+    let ((start, bytes), over, replaced) = with_runs(|r| {
+        let (range, over) = joined(&r.open, at, len);
+        let replaced: usize = over.iter().filter_map(|s| r.open.get(s)).map(|run| run.len).sum();
+        (range, over, replaced)
+    });
+    if OPEN.load(Ordering::Relaxed) + bytes > budget() + replaced {
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        with_runs(|r| r.pending.remove(&(at, len)));
+        return;
+    }
+    let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
+        // SAFETY: our own view of sections whose pages the title's views
+        // committed: commits nothing new.
+        if unsafe { VirtualAlloc(start as *const c_void, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        open_at(&host.device, start, bytes).map_err(|e| e.to_string())
+    });
+    let run = match opened {
+        Ok((heap, buffer)) => {
+            crate::host::name(&buffer, || format!("title memory in place {start:#x}+{bytes:#x}"));
+            Arc::new(Run { id: NEXT.fetch_add(1, Ordering::Relaxed), len: bytes, buffer, _heap: heap })
+        }
+        Err(error) => {
+            with_runs(|r| {
+                r.pending.remove(&(at, len));
+                r.refused.insert((at, len));
+            });
+            if STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(at = format_args!("{start:#x}"), len = bytes, %error, "title memory not opened in place: it reads as missing");
+            }
+            return;
+        }
+    };
+    with_runs(|r| {
+        r.pending.remove(&(at, len));
+        for s in over {
+            if let Some(old) = r.open.remove(&s) {
+                OPEN.fetch_sub(old.len, Ordering::Relaxed);
+            }
+        }
+        r.open.insert(start, run);
+    });
+    OPEN.fetch_add(bytes, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    STATS[5].fetch_add(1, Ordering::Relaxed);
+    STATS[6].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    tracing::debug!(at = format_args!("{start:#x}"), len = bytes, "title memory opened in place");
+}
+
+/// The runtime lets go of our own view `[at, at + len)` of a section:
+/// `unmap` unmaps it (nonzero when that worked). With no run over it, now;
+/// else the runs are forgotten, and the view stays mapped until no page
+/// table names them ([`settle`], at a frame's end): their heaps lock it.
+pub fn title_memory_own_gone(at: usize, len: usize, mut unmap: Box<dyn FnMut() -> i32 + Send>) {
+    let opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    let runs = with_runs(|r| {
+        let end = at.saturating_add(len);
+        let over: Vec<usize> = r.open.range(..end).filter(|(s, run)| **s + run.len > at).map(|(s, _)| *s).collect();
+        let runs: Vec<Arc<Run>> = over.into_iter().filter_map(|s| r.open.remove(&s)).collect();
+        r.refused.retain(|&(s, n)| s + n <= at || end <= s);
+        runs
+    });
+    if runs.is_empty() {
+        drop(opening);
+        unmap();
+        return;
+    }
+    for run in &runs {
+        OPEN.fetch_sub(run.len, Ordering::Relaxed);
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    with_runs(|r| {
+        r.dead.extend(runs.iter().map(|run| run.id));
+        r.gone.push(Gone { runs, unmap, frames: 0 });
+    });
+}
+
+/// Ids of runs over views gone that page tables may still name: the
+/// tables drop them at a frame's end, with no submission running.
+pub(crate) fn dead() -> Vec<u64> {
+    with_runs(|r| r.dead.clone())
+}
+
+/// At a frame's end, after the page tables dropped the [`dead`] runs:
+/// views gone whose runs nothing else holds are unmapped (tried again for
+/// a moment: the system unlocks a heap's pages late); after ~10 s of
+/// frames a view still held is left mapped.
+pub(crate) fn settle() {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+    let gone = with_runs(|r| std::mem::take(&mut r.gone));
+    if gone.is_empty() {
+        return;
+    }
+    let mut kept = Vec::new();
+    for mut g in gone {
+        if g.runs.iter().any(|run| Arc::strong_count(run) > 1) {
+            g.frames += 1;
+            if g.frames < 600 {
+                kept.push(g);
+            } else {
+                tracing::warn!("a view of title memory held in place stays mapped: a page table still names it");
+            }
+            continue;
+        }
+        drop(std::mem::take(&mut g.runs));
+        let started = std::time::Instant::now();
+        // SAFETY: plain reads of this thread's last error.
+        while (g.unmap)() == 0
+            && unsafe { GetLastError() } == ERROR_INVALID_PARAMETER
+            && started.elapsed() < std::time::Duration::from_millis(100)
+        {
+            std::thread::yield_now();
+        }
+    }
+    with_runs(|r| {
+        // Views gone meanwhile are in `r.gone` already.
+        let live: Vec<u64> = kept.iter().chain(&r.gone).flat_map(|g| g.runs.iter().map(|run| run.id)).collect();
+        r.dead.retain(|id| live.contains(id));
+        r.gone.extend(kept);
+    });
 }
 
 /// The last page table written named `pages` in place.
@@ -232,9 +395,12 @@ pub(crate) fn named(pages: u64) {
     STATS[2].store(pages, Ordering::Relaxed);
 }
 
-/// Shaders wrote `pages` pages in place.
-pub(crate) fn written(pages: u64) {
+/// Shaders wrote `pages` pages in place, `withheld` of them where their
+/// writes are withheld (in lists that missed, or frames that withhold):
+/// in place those land anyway.
+pub(crate) fn written(pages: u64, withheld: u64) {
     STATS[3].fetch_add(pages, Ordering::Relaxed);
+    STATS[4].fetch_add(withheld, Ordering::Relaxed);
 }
 
 /// The frame line, with the backstop on.
@@ -243,14 +409,18 @@ pub(crate) fn log_frame() {
         return;
     }
     let written = STATS[3].swap(0, Ordering::Relaxed);
+    let withheld = STATS[4].swap(0, Ordering::Relaxed);
+    let opened = STATS[5].swap(0, Ordering::Relaxed);
+    let took = STATS[6].swap(0, Ordering::Relaxed);
     let named = STATS[2].load(Ordering::Relaxed);
-    if named + written == 0 {
+    if named + written + opened == 0 {
         return;
     }
+    let (runs, waiting, gone) = with_runs(|r| (r.open.len(), r.pending.len(), r.gone.len()));
     tracing::info!(
-        "title memory in place (VICTORY_INPLACE_BACKSTOP): {} runs, {:.1} MB open, {named} pages named by the last page table, {written} pages written this frame; runs refused: {} past VICTORY_INPLACE_MB, {} by the host",
-        RUNS.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        "title memory in place (VICTORY_INPLACE_BACKSTOP): {runs} runs, {:.1} MB open, {named} pages named by the last page table, {written} pages written this frame ({withheld} of them where writes are withheld), {opened} runs opened in {:.1} ms off the submitting thread, {waiting} waiting, {gone} views gone kept mapped; runs refused: {} past VICTORY_INPLACE_MB, {} by the host",
         OPEN.load(Ordering::Relaxed) as f64 / 1e6,
+        took as f64 / 1e3,
         STATS[0].load(Ordering::Relaxed),
         STATS[1].load(Ordering::Relaxed)
     );

@@ -40,8 +40,10 @@ use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
 /// unlocks released pages within milliseconds.
 const SETTLE: Duration = Duration::from_millis(100);
 
-// Holders: title memory in place (`crate::inplace`, the backstop) and the
-// tests here.
+// Holders: none yet at title addresses but the tests here (title memory in
+// place opens our own views of sections, which the title never changes:
+// `crate::inplace::title_memory_own_gone` handles their going). A
+// private-memory backstop would register here.
 
 /// How a holder lets its range go; called once, outside the registry's
 /// lock, on the thread about to change the memory.
