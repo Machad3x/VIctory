@@ -180,7 +180,7 @@ pub(crate) struct Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        FRUITLESS_STALE.store(true, Ordering::Relaxed);
+        FRUITLESS_STALE[usize::from(self.private)].store(true, Ordering::Relaxed);
         if self.private {
             // The heap goes right after: the system unlocks the pages.
             locked_ranges().remove(&(self.at, self.id));
@@ -238,8 +238,13 @@ struct Runs {
 }
 
 /// A run went (room in the budget, pages no longer locked): what the worker
-/// found nothing to open in may open now.
-static FRUITLESS_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// found nothing to open in may open now; per kind (our views, private
+/// memory). Our views' runs are replaced all the time (joined with the
+/// ones beside them): with one flag every such drop asked the private
+/// memory again, all of it, and the private thread queried it every frame
+/// (gpu318, gpu319).
+static FRUITLESS_STALE: [std::sync::atomic::AtomicBool; 2] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; 2];
 
 /// What the worker found nothing to open in over `[start, end)` may be
 /// asked again.
@@ -692,6 +697,22 @@ fn wait_pending(limit: std::time::Duration) -> bool {
     let (mut settled, _) = SETTLED.wait_timeout_while(settled, limit, pending).unwrap_or_else(|e| e.into_inner());
     !pending(&mut settled)
 }
+/// Where the opening threads' time goes since the last frame line, per
+/// kind (own views, private memory): checking a range (memory queries),
+/// opening it (the host's heap and placed buffer), cutting asked pages into
+/// runs (memory queries), in microseconds; and opens, asks done.
+static PROFILE: [[AtomicU64; 5]; 2] = [const { [const { AtomicU64::new(0) }; 5] }; 2];
+
+/// Counts `since`'s time in `what` (0 checking, 1 opening, 2 cutting) for
+/// `private`'s kind, and one open (1) or ask (2).
+fn profile(private: bool, what: usize, since: std::time::Instant) {
+    let p = &PROFILE[usize::from(private)];
+    p[what].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if what >= 1 {
+        p[2 + what].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// What the opening thread is asked: a range to open, or pages a page
 /// table could not name, to work out what opens there ([`ask`]).
 enum Work {
@@ -709,24 +730,33 @@ fn worker(at: usize, len: usize, private: bool) {
     }
 }
 
-/// Hands `work` to the opening thread, started on first use; false if it
-/// is gone.
+/// Hands `work` to an opening thread, started on first use; false if it is
+/// gone. Two of them: private memory's (what page tables wait for, so that
+/// the builder's lists read no zeros) and our views' (never waited for).
+/// One queue made the private asks wait behind hundreds of views' opens of
+/// 10 to 20 ms each, and tables waited their whole 500 ms every frame
+/// (gpu318, gpu319).
 fn send(work: Work) -> bool {
-    static WORK: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Work>>> = std::sync::OnceLock::new();
-    let tx = WORK.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Work>();
-        let _ = std::thread::Builder::new()
-            .name("victory-in-place".into())
-            .spawn(move || {
+    type Tx = Mutex<std::sync::mpsc::Sender<Work>>;
+    static WORK: std::sync::OnceLock<[Tx; 2]> = std::sync::OnceLock::new();
+    let txs = WORK.get_or_init(|| {
+        [false, true].map(|private| {
+            let (tx, rx) = std::sync::mpsc::channel::<Work>();
+            let name = if private { "victory-in-place-private" } else { "victory-in-place" };
+            let _ = std::thread::Builder::new().name(name.into()).spawn(move || {
                 order::worker();
                 rx.into_iter().for_each(|w| match w {
                     Work::Open(at, len, private) => open_run(at, len, private, private),
                     Work::Cut(pages, private, key) => cut_and_open(pages, private, key),
                 })
             });
-        Mutex::new(tx)
+            Mutex::new(tx)
+        })
     });
-    tx.lock().unwrap_or_else(|e| e.into_inner()).send(work).is_ok()
+    let private = match &work {
+        Work::Open(_, _, p) | Work::Cut(_, p, _) => *p,
+    };
+    txs[usize::from(private)].lock().unwrap_or_else(|e| e.into_inner()).send(work).is_ok()
 }
 
 /// What a page table names in place for each of `addrs` (a page's address
@@ -751,10 +781,10 @@ pub(crate) fn ask(pages: Vec<(usize, usize)>, private: bool) -> bool {
         return false;
     };
     let key = (first.min(last), first.max(last) + PAGE, private);
-    let stale = FRUITLESS_STALE.swap(false, Ordering::Relaxed);
+    let stale = FRUITLESS_STALE[usize::from(private)].swap(false, Ordering::Relaxed);
     let asked = with_runs(|r| {
         if stale {
-            r.fruitless.clear();
+            r.fruitless.retain(|&(_, _, p)| p != private);
         }
         !r.fruitless.contains(&key) && r.asked.insert(key)
     });
@@ -779,6 +809,7 @@ pub(crate) fn ask(pages: Vec<(usize, usize)>, private: bool) -> bool {
 /// opened one by one.
 fn cut_and_open(pages: Vec<(usize, usize)>, private: bool, key: (usize, usize, bool)) {
     let _asked = Asked(private);
+    let cutting = std::time::Instant::now();
     let pieces: Vec<Vec<(usize, usize)>> = if private {
         let candidates: Vec<usize> = pages.iter().map(|&(page, _)| page).collect();
         let picked = private_pages(&candidates);
@@ -786,6 +817,7 @@ fn cut_and_open(pages: Vec<(usize, usize)>, private: bool, key: (usize, usize, b
     } else {
         runs(&pages, 0).into_iter().flat_map(|run| per_view(run, allocation_end)).map(<[_]>::to_vec).collect()
     };
+    profile(private, 2, cutting);
     let mut open = false;
     for piece in pieces {
         let (at, len) = (piece[0].1, piece.len() * PAGE);
@@ -835,13 +867,17 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
     // Set before the checks: a view going from here on stays mapped until
     // this open ends; one gone before has its views forgotten already
     // (the runtime forgets them before letting go of the section).
-    with_runs(|r| r.opening = Some((at, len)));
+    if !private {
+        with_runs(|r| r.opening = Some((at, len)));
+    }
     // Asked from a table written over views since gone: the address may
     // hold other memory now, which a heap would lock. Private memory only
     // as the one exception, asked as such ([`private_open`]).
+    let checking = std::time::Instant::now();
     let allowed = if private { private_open(at, len) } else { crate::watch::own_views_show(at, len) && mapped_view(at, len) };
+    profile(private, 0, checking);
     if !allowed {
-        with_runs(|r| finish(r, at, len, None));
+        with_runs(|r| finish(r, private, at, len, None));
         return;
     }
     let ((start, bytes), over, replaced) = with_runs(|r| {
@@ -851,7 +887,7 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
     });
     if OPEN.load(Ordering::Relaxed) + bytes > budget() + replaced {
         STATS[0].fetch_add(1, Ordering::Relaxed);
-        with_runs(|r| finish(r, at, len, None));
+        with_runs(|r| finish(r, private, at, len, None));
         return;
     }
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -875,12 +911,13 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
             locked_ranges().remove(&(start, id));
             LOCKED.fetch_sub(1, Ordering::Relaxed);
             unpin(id);
-            with_runs(|r| finish(r, at, len, None));
+            with_runs(|r| finish(r, private, at, len, None));
             return;
         }
     }
     // Errors say whether the host refused (for good, until the title commits
     // there again) or the title changed the memory meanwhile.
+    let opening = std::time::Instant::now();
     let opened = crate::host::host().ok_or_else(|| ("no host".to_owned(), true)).and_then(|host| {
         // SAFETY: our own view of sections whose pages the title's views
         // committed: commits nothing new.
@@ -898,6 +935,7 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
         }
         Ok(opened)
     });
+    profile(private, 1, opening);
     let run = match opened {
         Ok((heap, buffer)) => {
             crate::host::name(&buffer, || format!("title memory in place {start:#x}+{bytes:#x}"));
@@ -910,7 +948,7 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
                 unpin(id);
             }
             with_runs(|r| {
-                finish(r, at, len, None);
+                finish(r, private, at, len, None);
                 if by_host {
                     r.refused.insert((at, len));
                 }
@@ -923,7 +961,7 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
     };
     STATS[5].fetch_add(1, Ordering::Relaxed);
     STATS[6].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-    let Some(old) = with_runs(|r| finish(r, at, len, Some((start, run, over)))) else {
+    let Some(old) = with_runs(|r| finish(r, private, at, len, Some((start, run, over)))) else {
         return;
     };
     if private {
@@ -943,11 +981,15 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
 /// the open runs it replaces) or not: it is open now, or, its view gone
 /// meanwhile, held by that view's going until no one else holds it. The
 /// runs it replaced, if it is open.
-fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, Vec<usize>)>) -> Option<Vec<Arc<Run>>> {
-    r.opening = None;
+/// `private`: an open of private memory, on its own thread: views of ours
+/// going meanwhile are the other thread's (`opening` is that thread's).
+fn finish(r: &mut Runs, private: bool, at: usize, len: usize, opened: Option<(usize, Arc<Run>, Vec<usize>)>) -> Option<Vec<Arc<Run>>> {
     r.pending.remove(&(at, len));
     let mut went = false;
-    for g in r.gone.iter_mut().filter(|g| g.opening) {
+    if !private {
+        r.opening = None;
+    }
+    for g in r.gone.iter_mut().filter(|g| g.opening && !private) {
         g.opening = false;
         if !went && let Some((_, run, _)) = &opened {
             r.dead.push(run.id);
@@ -1464,6 +1506,21 @@ pub(crate) fn log_frame() {
     }
     let (runs, waiting, gone) = with_runs(|r| (r.open.len(), r.pending.len(), r.gone.len()));
     let flips = FLIPS.swap(0, Ordering::Relaxed);
+    let [views, private] = PROFILE.each_ref().map(|p| p.each_ref().map(|n| n.swap(0, Ordering::Relaxed)));
+    let ms = |us: u64| us as f64 / 1e3;
+    tracing::info!(
+        "opening threads this frame, our views / private memory: {} / {} opens ({:.1} / {:.1} ms checking, {:.1} / {:.1} ms opening), {} / {} asks cut in {:.1} / {:.1} ms",
+        views[3],
+        private[3],
+        ms(views[0]),
+        ms(private[0]),
+        ms(views[1]),
+        ms(private[1]),
+        views[4],
+        private[4],
+        ms(views[2]),
+        ms(private[2])
+    );
     tracing::info!(
         "title memory in place (VICTORY_INPLACE_BACKSTOP): {runs} runs, {:.1} MB open, {named} pages named by the last page table, {written} pages written this frame ({withheld} of them where writes are withheld), {opened} runs opened in {:.1} ms off the submitting thread, {waiting} waiting, {gone} views gone kept mapped; tables turned load-only or writable this frame: {flips}; runs refused: {} past VICTORY_INPLACE_MB, {} by the host",
         OPEN.load(Ordering::Relaxed) as f64 / 1e6,
@@ -1604,7 +1661,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "kept mapped while the open runs");
         settle();
         assert_eq!(calls.load(Ordering::SeqCst), 0, "still opening");
-        assert!(with_runs(|r| finish(r, at + PAGE, PAGE, None)).is_none());
+        assert!(with_runs(|r| finish(r, false, at + PAGE, PAGE, None)).is_none());
         settle();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "refused as locked: kept");
         settle();
@@ -1879,6 +1936,27 @@ mod tests {
         assert!(locked_ranges().keys().all(|&(s, _)| s != at), "unregistered");
         // The free's own answer says it was freed: a query here could find
         // the addresses taken again by another test's allocation.
+    }
+
+    /// Our views' runs going (replaced all the time) let only our views'
+    /// fruitless asks be asked again, not private memory's (which made the
+    /// private opening thread query all of it every frame).
+    #[test]
+    fn our_views_going_asks_private_memory_nothing_again() {
+        let _one = worker_tests();
+        let private = (0x6e00_0000_0000, 0x6e00_0001_0000, true);
+        let views = (0x6e10_0000_0000, 0x6e10_0001_0000, false);
+        with_runs(|r| {
+            r.fruitless.insert(private);
+            r.fruitless.insert(views);
+        });
+        FRUITLESS_STALE[0].store(true, Ordering::Relaxed);
+        // An ask of our views elsewhere (nothing opens there).
+        let at = 0x6e20_0000_0000usize;
+        ask(vec![(at / PAGE, at)], false);
+        assert!(with_runs(|r| r.fruitless.contains(&private)), "private memory not asked again");
+        assert!(with_runs(|r| !r.fruitless.contains(&views)), "our views' may be");
+        with_runs(|r| r.fruitless.remove(&private));
     }
 
     /// A table written while memory is still being opened (asks pending)

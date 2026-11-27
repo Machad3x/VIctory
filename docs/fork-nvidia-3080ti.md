@@ -1420,6 +1420,18 @@ held in place there.
 ms a frame; the page tables still waited the whole 500 ms for the opening
 thread every frame (3,668 times, 62.6 s in all) with no run opened and no
 open pending: the next priority.
+
+Why: the frame lines of `gpu319` show our views' runs opened at 10 to 20 ms
+each (136 in 2.5 s), hundreds a second through the world, on the one
+opening thread, and the private asks page tables wait for queued behind
+them; and each of our views' runs replaced (joined with its neighbours)
+marked every private ask that had found nothing to open as worth asking
+again, so private memory was asked and queried again all the time. Now
+private memory has an opening thread of its own, and only a private run
+going asks private memory again. A frame line says where the opening
+threads' time goes (checking, opening, cutting asks, per kind). Expected:
+the 500 ms a frame waited goes to about what new private memory takes to
+open (none in a steady scene). Not run yet.
 Still open: a list's first miss of memory no table knew of stores in place;
 a retire whose fence wait could not be set leaves the next table writable.
 
