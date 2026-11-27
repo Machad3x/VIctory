@@ -1731,6 +1731,10 @@ struct Deferred {
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
+    /// The same for work that takes what the list's shaders computed into
+    /// title memory (texture read-backs): not done when its copies are
+    /// withheld (the list missed memory).
+    after_results: Vec<Box<dyn Fn() + Send>>,
     /// Asked once the list has run, before anything goes back: whether its
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
@@ -2510,9 +2514,11 @@ impl Host {
                 .collect();
             crate::lightlog::submission(withholding, lists.into_iter());
         }
+        let mut withheld_lists = Vec::with_capacity(runs.len());
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
+            withheld_lists.push(missed);
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len, marked, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
@@ -2637,9 +2643,17 @@ impl Host {
         for &(dst, src, len) in &batch.late {
             copy_mapped(dst as *mut u8, src as *const u8, len, true);
         }
-        for list in runs {
-            for work in &list.deferred().after {
+        for (list, &withheld) in runs.iter().zip(&withheld_lists) {
+            let deferred = list.deferred();
+            for work in &deferred.after {
                 work();
+            }
+            // What a list that missed computed stays out of title memory,
+            // as its copies do.
+            if !withheld {
+                for work in &deferred.after_results {
+                    work();
+                }
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -3469,6 +3483,13 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// [`HostList::defer_after`] for work that takes what the list's
+    /// shaders computed into title memory: not done when its copies are
+    /// withheld.
+    pub(crate) fn defer_after_results(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after_results.push(Box::new(work));
+    }
+
     /// Its bottom-of-pipe writes alone, for a list whose commands do not
     /// run (`crate::queue`, a list that lost its slots): a query result
     /// is not resolved, so it is the visible one, as when not waited for.
@@ -3501,7 +3522,7 @@ impl HostList {
     /// over).
     pub(crate) fn is_empty(&self) -> bool {
         let d = self.deferred();
-        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.missed.is_empty();
+        let deferred_empty = d.copies.is_empty() && d.uploads.is_empty() && d.writes.is_empty() && d.after.is_empty() && d.after_results.is_empty() && d.missed.is_empty();
         drop(d);
         deferred_empty
             && self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
