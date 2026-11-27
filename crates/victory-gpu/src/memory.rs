@@ -359,6 +359,19 @@ pub(crate) fn log_frame() {
             m.pages.len() as u64 - m.committed,
             m.persistent
         );
+        let now = std::mem::take(&mut m.kinds_now);
+        let named = |k: &[u64; 4]| -> String {
+            KIND_NAMES.iter().zip(k).map(|(name, n)| format!("{n} {name}")).collect::<Vec<_>>().join(", ")
+        };
+        let in_place = m.kinds[PRIVATE as usize] + m.kinds[MAPPED as usize];
+        let in_place_now = now[PRIVATE as usize] + now[MAPPED as usize];
+        tracing::info!(
+            "title memory misses by kind: so far {} pages, this frame {} pages; in place would cover {:.1} MB so far ({:.1} MB of this frame's)",
+            named(&m.kinds),
+            named(&now),
+            (in_place << 16) as f64 / 1e6,
+            (in_place_now << 16) as f64 / 1e6
+        );
         if demand_budget().is_some() {
             tracing::info!(
                 "demand copies this frame: {} bytes made ({} in all) in {} us, {} persistent pages healed, still missed \
@@ -622,7 +635,18 @@ struct Missed {
     tried: bool,
     /// The frame of the last copy asked for and not made.
     failed: Option<u64>,
+    /// What was there when first missed ([`memory_kind`]).
+    kind: u8,
 }
+
+/// What a missed page is ([`memory_kind`]): nothing committed, private
+/// memory, a mapped view (physical pages), an image. Indexes
+/// [`Misses::kinds`].
+const EMPTY: u8 = 0;
+const PRIVATE: u8 = 1;
+const MAPPED: u8 = 2;
+const IMAGE: u8 = 3;
+const KIND_NAMES: [&str; 4] = ["empty", "private", "mapped", "image"];
 
 /// Every page missed so far. `new` and `persistent_now` count since the last
 /// report, the rest since the start.
@@ -632,6 +656,11 @@ struct Misses {
     pages: fx::Map<u64, Missed>,
     new: u64,
     committed: u64,
+    /// Distinct pages by kind since the start, and pages missed this frame
+    /// by kind (each once a frame): committed ones are what title memory
+    /// in place would cover.
+    kinds: [u64; 4],
+    kinds_now: [u64; 4],
     persistent: u64,
     persistent_now: u64,
     /// Bytes of demand copies, since the start (less those of copies
@@ -652,14 +681,17 @@ struct Misses {
 }
 
 impl Misses {
-    /// The page at `at` was missed in `frame`; `committed` is asked only the
+    /// The page at `at` was missed in `frame`; its `kind` is asked only the
     /// first time. True once per frame for a persistent page.
-    fn note(&mut self, at: u64, frame: u64, committed: impl FnOnce() -> bool) -> bool {
+    fn note(&mut self, at: u64, frame: u64, kind: impl FnOnce() -> u8) -> bool {
         let page = match self.pages.entry(at) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 self.new += 1;
-                self.committed += u64::from(committed());
-                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false, failed: None });
+                let kind = kind().min(IMAGE);
+                self.committed += u64::from(kind != EMPTY);
+                self.kinds[usize::from(kind)] += 1;
+                self.kinds_now[usize::from(kind)] += 1;
+                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false, failed: None, kind });
                 return false;
             }
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -667,6 +699,7 @@ impl Misses {
         if frame <= page.last {
             return false;
         }
+        self.kinds_now[usize::from(page.kind)] += 1;
         let since = u32::try_from(frame.wrapping_sub(page.last)).unwrap_or(u32::MAX);
         let kept = page.recent.checked_shl(since).unwrap_or(0);
         page.tried &= kept != 0;
@@ -783,6 +816,30 @@ static MISSES_SEEN: Mutex<Option<Misses>> = Mutex::new(None);
 /// budget.
 pub(crate) static DEMAND_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What the 64 KiB at `at` hold: the type of their first committed part
+/// ([`PRIVATE`], [`MAPPED`], [`IMAGE`]), or [`EMPTY`].
+fn memory_kind(at: u64) -> u8 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (mut p, end) = (at, at + (1 << 16));
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        if info.State == MEM_COMMIT {
+            return match info.Type {
+                MEM_PRIVATE => PRIVATE,
+                MEM_MAPPED => MAPPED,
+                _ => IMAGE,
+            };
+        }
+        p = (info.BaseAddress as u64 + info.RegionSize as u64).max(p + 0x1000);
+    }
+    EMPTY
+}
+
 /// Whether any of the 64 KiB at `at` is committed (private or mapped).
 fn committed(at: u64) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -812,7 +869,7 @@ fn measure_misses(pages: &[u64], regions: &[usize]) {
         let mut misses = MISSES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let misses = misses.get_or_insert_default();
         for &at in pages {
-            if misses.note(at, frame, || committed(at)) && demand_budget().is_some() {
+            if misses.note(at, frame, || memory_kind(at)) && demand_budget().is_some() {
                 misses.eligible.push(at);
             }
         }
@@ -1078,19 +1135,22 @@ mod tests {
     #[test]
     fn a_page_persists_when_missed_twice_in_sixteen_frames() {
         let mut m = Misses::default();
-        assert!(!m.note(0x10000, 0, || true));
+        assert!(!m.note(0x10000, 0, || PRIVATE));
         assert!(!m.note(0x10000, 0, || panic!("asked once")), "one frame, once");
         assert_eq!((m.new, m.committed, m.persistent), (1, 1, 0));
-        assert!(m.note(0x10000, 15, || false), "the oldest frame still counted");
-        assert!(!m.note(0x10000, 15, || false));
-        assert!(!m.note(0x10000, 14, || false), "an older frame, as the same one");
+        assert!(m.note(0x10000, 15, || EMPTY), "the oldest frame still counted");
+        assert!(!m.note(0x10000, 15, || EMPTY));
+        assert!(!m.note(0x10000, 14, || EMPTY), "an older frame, as the same one");
         assert_eq!((m.persistent, m.persistent_now), (1, 1));
-        assert!(!m.note(0x10000, 31, || false), "sixteen frames on");
-        assert!(m.note(0x10000, 32, || false));
+        assert!(!m.note(0x10000, 31, || EMPTY), "sixteen frames on");
+        assert!(m.note(0x10000, 32, || EMPTY));
         assert_eq!((m.persistent, m.persistent_now), (1, 2));
-        assert!(!m.note(0x10000, 1000, || false));
-        m.note(0x20000, 1000, || false);
+        assert!(!m.note(0x10000, 1000, || EMPTY));
+        m.note(0x20000, 1000, || EMPTY);
         assert_eq!((m.pages.len(), m.new, m.committed), (2, 2, 1));
+        assert_eq!(m.kinds, [1, 1, 0, 0]);
+        // Each page once a frame, by the kind it had when first missed.
+        assert_eq!(m.kinds_now, [1, 5, 0, 0]);
     }
 
     /// A persistent committed page asks for a copy until it gets one, with
@@ -1099,10 +1159,10 @@ mod tests {
     fn persistent_committed_pages_ask_for_a_copy_once() {
         let mut m = Misses::default();
         let miss = |m: &mut Misses, frame| {
-            assert!(m.note(0x10000, frame, || true));
+            assert!(m.note(0x10000, frame, || PRIVATE));
             m.eligible.push(0x10000);
         };
-        assert!(!m.note(0x10000, 0, || true));
+        assert!(!m.note(0x10000, 0, || PRIVATE));
         miss(&mut m, 8);
         m.heal(100, |_| false, |_, _, _| panic!("nothing there"));
         m.eligible.push(0x10000);
@@ -1111,7 +1171,7 @@ mod tests {
         m.heal(100, |_| panic!("not queried"), |_, _, _| panic!("asked already"));
         assert_eq!((m.bytes, m.healed, m.left_committed, m.left_empty), (60, 1, 1, 1));
         // After sixteen frames unmissed it asks again, with the rest.
-        m.note(0x10000, 40, || true);
+        m.note(0x10000, 40, || PRIVATE);
         miss(&mut m, 48);
         m.heal(100, |_| true, |_, _, room| {
             assert_eq!(room, 40);
@@ -1133,8 +1193,8 @@ mod tests {
         let mut m = Misses::default();
         let pages: Vec<u64> = (1..=70u64).chain([80, 82, 83]).map(|p| p << 16).collect();
         for &at in pages.iter().rev() {
-            m.note(at, 0, || true);
-            assert!(m.note(at, 1, || true));
+            m.note(at, 0, || PRIVATE);
+            assert!(m.note(at, 1, || PRIVATE));
             m.eligible.push(at);
         }
         let mut asked = Vec::new();

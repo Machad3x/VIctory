@@ -43,6 +43,8 @@ mod gpumeasure;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod lightlog;
 pub mod list;
