@@ -1765,6 +1765,7 @@ impl Host {
         let mut sent: Option<std::time::Instant> = None;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            crate::memsys::submission_sent(*submitted);
             let mut ended = Waited::Done;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -1813,7 +1814,12 @@ impl Host {
                 }
             }
             match ended {
-                Waited::Done => {}
+                // Run, unless a wait failed: then nothing says so.
+                Waited::Done => {
+                    if !unwaited {
+                        crate::memsys::submission_done(*submitted);
+                    }
+                }
                 // Nothing more runs on a removed device; reported below.
                 Waited::Removed => {
                     if groups.len() > 1 && removed_in.is_none() {
@@ -4663,6 +4669,22 @@ unsafe extern "system" fn give_back_table(size: *mut std::ffi::c_void) {
     TABLE_BYTES.fetch_sub(size as u64, Ordering::Relaxed);
 }
 
+/// Takes `bytes` of the budget host copies in GPU upload heaps share
+/// ([`UPLOAD_BUDGET`]), for a heap buffers are placed in
+/// (`crate::memsys::heaps`); false, with nothing taken, past it.
+pub(crate) fn charge_upload(bytes: u64) -> bool {
+    if UPLOAD_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes > UPLOAD_BUDGET {
+        UPLOAD_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// Gives back what [`charge_upload`] took (the heap was not made).
+pub(crate) fn uncharge_upload(bytes: u64) {
+    UPLOAD_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
 /// [`UPLOAD_BYTES`], for tests.
 #[cfg(test)]
 pub(crate) fn upload_bytes() -> u64 {
@@ -4725,6 +4747,11 @@ impl Host {
             return None;
         }
         let size = size.max(1);
+        // A small one goes into a heap made ahead (`VICTORY_MEMSYS`), which
+        // the budget counts whole: not charged again here.
+        if let Some(made) = crate::memsys::heaps::buffer(&self.device, true, size) {
+            return Some(made);
+        }
         if UPLOAD_BYTES.fetch_add(size, Ordering::Relaxed) + size > UPLOAD_BUDGET {
             UPLOAD_BYTES.fetch_sub(size, Ordering::Relaxed);
             static FULL: std::sync::Once = std::sync::Once::new();
@@ -5053,13 +5080,14 @@ impl Host {
         } else {
             heap
         };
-        // Small ones are placed in heaps made ahead (`VICTORY_MEMSYS`),
-        // unless the diagnostics above move them.
+        // Small ones in system memory are placed in heaps made ahead
+        // (`VICTORY_MEMSYS`), unless the diagnostics above move them; those
+        // in video memory were placed by `gpu_upload_buffer`, or are not.
         #[cfg(feature = "diagnostics")]
-        let placed = !self.copies_in_video_memory();
+        let placed = !upload && !self.copies_in_video_memory();
         #[cfg(not(feature = "diagnostics"))]
-        let placed = true;
-        if placed && let Some(made) = crate::memsys::heaps::buffer(&self.device, upload, size) {
+        let placed = !upload;
+        if placed && let Some(made) = crate::memsys::heaps::buffer(&self.device, false, size) {
             return Some(made);
         }
         let desc = D3D12_RESOURCE_DESC {

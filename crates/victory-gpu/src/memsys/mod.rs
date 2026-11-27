@@ -54,12 +54,29 @@ pub(crate) fn pooling() -> bool {
     part("VICTORY_MEMSYS_POOL", &ON)
 }
 
-/// Refreshes of copies in video memory written by the copy workers with
-/// a submission's other copies: `VICTORY_MEMSYS_VIDEO=0` keeps them on the
-/// submitting thread.
-pub(crate) fn video_later() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    part("VICTORY_MEMSYS_VIDEO", &ON)
+/// The last host submission sent to the GPU, and the last that has run.
+static SENT: AtomicU64 = AtomicU64::new(0);
+static DONE: AtomicU64 = AtomicU64::new(0);
+
+/// The host submission numbered `value` goes to the GPU now.
+pub(crate) fn submission_sent(value: u64) {
+    SENT.fetch_max(value, Ordering::Release);
+}
+
+/// The host submission numbered `value` has run (it was waited for).
+pub(crate) fn submission_done(value: u64) {
+    DONE.fetch_max(value, Ordering::Release);
+}
+
+/// The number of the last host submission sent to the GPU.
+pub(crate) fn sent() -> u64 {
+    SENT.load(Ordering::Acquire)
+}
+
+/// The number of the last host submission that has run: memory only
+/// submissions up to it used is the GPU's no more.
+pub(crate) fn done() -> u64 {
+    DONE.load(Ordering::Acquire)
 }
 
 /// Where a buffer's bytes live.
@@ -156,13 +173,9 @@ pub(crate) enum N {
     PooledBytes,
     /// Buffers a pool had no room for (made committed).
     PoolFull,
-    /// Refreshes of video memory left to the copy workers, and their
-    /// bytes.
-    VideoLater,
-    VideoLaterBytes,
 }
 
-const NS: usize = 9;
+const NS: usize = 7;
 /// Per class a count and bytes, then the [`N`]s.
 const TOTAL: usize = 2 * Class::COUNT + NS;
 
@@ -209,8 +222,7 @@ pub(crate) fn frame(frame: u64) {
         on = on(),
         "memory system per frame over the last {EVERY} (count, MiB): committed buffers made in video memory \
          {:.2?}, BAR {:.2?}, upload {:.2?}, read-back {:.2?}, shared {:.2?}; list uploads {:.2} {:.2}, list \
-         read-backs {:.2} {:.2}; pooled {:.2} {:.2}, no room in a pool {:.2}; video memory refreshes left to \
-         the copy workers {:.1} {:.2}",
+         read-backs {:.2} {:.2}; pooled {:.2} {:.2}, no room in a pool {:.2}",
         class(Class::Vram),
         class(Class::Bar),
         class(Class::Upload),
@@ -223,8 +235,6 @@ pub(crate) fn frame(frame: u64) {
         n(N::Pooled),
         n(N::PooledBytes) / MIB,
         n(N::PoolFull),
-        n(N::VideoLater),
-        n(N::VideoLaterBytes) / MIB,
     );
 }
 
@@ -272,12 +282,13 @@ mod tests {
     fn counters_do_not_share_slots() {
         let before: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
         made(Class::InPlace, 7);
-        add(N::VideoLaterBytes, 5);
+        add(N::PoolFull, 5);
         let after: Vec<u64> = COUNTS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        // At least: other tests count buffers meanwhile, never these two.
+        // Other tests count buffers meanwhile, never in place ones; a
+        // pool may be full meanwhile only with the pools switched on.
         assert_eq!(after[2 * Class::InPlace as usize] - before[2 * Class::InPlace as usize], 1);
         assert_eq!(after[2 * Class::InPlace as usize + 1] - before[2 * Class::InPlace as usize + 1], 7);
-        assert_eq!(after[TOTAL - 1] - before[TOTAL - 1], 5);
-        assert_eq!(N::VideoLaterBytes as usize, NS - 1, "NS counts every N");
+        assert!(after[TOTAL - 1] - before[TOTAL - 1] >= 5);
+        assert_eq!(N::PoolFull as usize, NS - 1, "NS counts every N");
     }
 }

@@ -1,7 +1,8 @@
 //! Runs of pages in a heap: a bit per page, first fit.
 //!
-//! A heap of 64 MiB in 64 KiB pages is 16 words, so a search reads a few
-//! cache lines and nothing is allocated after [`Pages::new`]. Sizes are
+//! A heap of 64 MiB in 64 KiB pages is 16 words, and a search goes over
+//! them a run of bits at a time, not a page at a time, so it reads a few
+//! cache lines; nothing is allocated after [`Pages::new`]. Sizes are
 //! not rounded past the page (rounding to powers of two would leave about
 //! a quarter of the video memory unused for the sizes host copies have).
 
@@ -16,7 +17,10 @@ pub(crate) struct Pages {
 impl Pages {
     /// `pages` pages, all free.
     pub(crate) fn new(pages: usize) -> Self {
-        Self { used: vec![0; pages.div_ceil(64)].into_boxed_slice(), pages, free: pages }
+        let mut made = Self { used: vec![0; pages.div_ceil(64)].into_boxed_slice(), pages, free: pages };
+        // The last word's bits past the last page are never free.
+        made.set(pages, made.used.len() * 64 - pages, true);
+        made
     }
 
     /// Pages not taken.
@@ -24,7 +28,7 @@ impl Pages {
         self.free
     }
 
-    fn is_used(&self, page: usize) -> bool {
+    pub(crate) fn is_used(&self, page: usize) -> bool {
         (self.used[page / 64] >> (page % 64)) & 1 == 1
     }
 
@@ -44,30 +48,35 @@ impl Pages {
         if n == 0 || n > self.free {
             return None;
         }
-        let (mut at, mut run, mut page) = (0, 0, 0);
-        while page < self.pages {
-            // A word with no free page.
-            if page % 64 == 0 && self.used[page / 64] == u64::MAX {
-                run = 0;
-                page += 64;
-                continue;
-            }
-            if self.is_used(page) {
-                run = 0;
-            } else {
+        // The free run so far: its first page and its pages.
+        let (mut at, mut run) = (0, 0);
+        let mut found = None;
+        'words: for (w, &word) in self.used.iter().enumerate() {
+            let mut bit = 0;
+            while bit < 64 {
+                let rest = word >> bit;
+                // Free pages from `bit` on in this word, else taken ones.
+                let free = (rest.trailing_zeros() as usize).min(64 - bit);
+                if free == 0 {
+                    run = 0;
+                    bit += rest.trailing_ones() as usize;
+                    continue;
+                }
                 if run == 0 {
-                    at = page;
+                    at = w * 64 + bit;
                 }
-                run += 1;
-                if run == n {
-                    self.set(at, n, true);
-                    self.free -= n;
-                    return Some(at);
+                run += free;
+                if run >= n {
+                    found = Some(at);
+                    break 'words;
                 }
+                bit += free;
             }
-            page += 1;
         }
-        None
+        let at = found?;
+        self.set(at, n, true);
+        self.free -= n;
+        Some(at)
     }
 
     /// Gives back the `n` pages from `at` that [`Pages::take`] gave.
@@ -115,6 +124,22 @@ mod tests {
         pages.give(0, 60);
         assert_eq!(pages.take(64), Some(0));
         assert_eq!(pages.take(36), Some(64));
+        assert_eq!(pages.free(), 0);
+    }
+
+    /// Holes of every size in words that are neither empty nor full.
+    #[test]
+    fn the_first_hole_that_fits_is_taken() {
+        let mut pages = Pages::new(192);
+        assert_eq!(pages.take(192), Some(0));
+        // Holes of 2 at 10, of 5 at 60 (over a word boundary), of 3 at 130.
+        pages.give(10, 2);
+        pages.give(60, 5);
+        pages.give(130, 3);
+        assert_eq!(pages.take(4), Some(60));
+        assert_eq!(pages.take(3), Some(130));
+        assert_eq!(pages.take(2), Some(10));
+        assert_eq!(pages.take(1), Some(64), "what was left of the hole of 5");
         assert_eq!(pages.free(), 0);
     }
 
