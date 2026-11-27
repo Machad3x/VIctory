@@ -741,18 +741,22 @@ fn open_run(at: usize, len: usize, private: bool) {
             return;
         }
     }
-    let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
+    // Errors say whether the host refused (for good, until the title commits
+    // there again) or the title changed the memory meanwhile.
+    let opened = crate::host::host().ok_or_else(|| ("no host".to_owned(), true)).and_then(|host| {
         // SAFETY: our own view of sections whose pages the title's views
         // committed: commits nothing new.
         if !private && unsafe { VirtualAlloc(start as *const c_void, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
+            return Err((std::io::Error::last_os_error().to_string(), true));
         }
-        let opened = open_at(&host.device, start, bytes).map_err(|e| e.to_string())?;
+        let opened = open_at(&host.device, start, bytes).map_err(|e| (e.to_string(), true))?;
         // And once open, when nothing can change it any more: a commit with
         // another protection (`XMemVirtualAlloc` tries the host first) may
-        // have come before the heap. Dropped here, before the run lets go.
+        // have come before the heap. Dropped here, before the run lets go;
+        // not refused: the title may make it read-write again with
+        // `VirtualProtect` alone, no commit, and RT would read zeros there.
         if private && !private_open(start, bytes) {
-            return Err("the title changed it while it was opened".to_owned());
+            return Err(("the title changed it while it was opened".to_owned(), false));
         }
         Ok(opened)
     });
@@ -761,7 +765,7 @@ fn open_run(at: usize, len: usize, private: bool) {
             crate::host::name(&buffer, || format!("title memory in place {start:#x}+{bytes:#x}"));
             Arc::new(Run { id, at: start, len: bytes, buffer, private, _heap: heap })
         }
-        Err(error) => {
+        Err((error, by_host)) => {
             if private {
                 locked_ranges().remove(&(start, id));
                 LOCKED.fetch_sub(1, Ordering::Relaxed);
@@ -769,9 +773,11 @@ fn open_run(at: usize, len: usize, private: bool) {
             }
             with_runs(|r| {
                 finish(r, at, len, None);
-                r.refused.insert((at, len));
+                if by_host {
+                    r.refused.insert((at, len));
+                }
             });
-            if STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
+            if by_host && STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(at = format_args!("{start:#x}"), len = bytes, %error, "title memory not opened in place: it reads as missing");
             }
             return;
@@ -1731,6 +1737,42 @@ mod tests {
         assert!(locked_ranges().keys().all(|&(s, _)| s != at), "unregistered");
         // The free's own answer says it was freed: a query here could find
         // the addresses taken again by another test's allocation.
+    }
+
+    /// The title protects private memory while a run over it opens, then
+    /// makes it read-write again with no commit: the range is not refused
+    /// for good, and the next ask opens it (RT reads no zeros there).
+    #[test]
+    fn a_title_protect_during_an_open_does_not_refuse_the_range() {
+        let _one = worker_tests();
+        use windows_sys::Win32::System::Memory as mem;
+        let len = 4 * PAGE;
+        // SAFETY: plain allocation, freed below.
+        let at = unsafe { mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+        let _unreport = Unreport(at, len);
+        let protect = move |to: u32| {
+            let mut old = 0;
+            // SAFETY: our allocation.
+            crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualProtect(at as *const c_void, len, to, &mut old) })
+        };
+        stall::arm(at);
+        assert!(run_for(at, len, true).is_none(), "asked of the worker");
+        assert!(stall::stopped(), "the open stopped, registered");
+        let protector = std::thread::spawn(move || protect(mem::PAGE_READONLY));
+        assert_ne!(protector.join().unwrap(), 0, "protected after the open let go");
+        stall::arm(0);
+        assert!(wait_pending(WORKER_WAIT));
+        assert_ne!(protect(mem::PAGE_READWRITE), 0, "read-write again, no commit");
+        assert!(!with_runs(|r| r.refused.contains(&(at, len))), "not refused for good");
+        let asked = run_for(at, len, true);
+        assert!(wait_pending(WORKER_WAIT));
+        let open = asked.is_some() || with_runs(|r| holding(&r.open, at, len)).is_some();
+        // Without a host GPU nothing opens; the range is still asked again.
+        assert!(open || crate::host::host().is_none() || with_runs(|r| r.refused.contains(&(at, len))));
+        // SAFETY: our allocation.
+        assert_ne!(crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
     }
 
     /// The wait for the worker ends when the last asked run is done, woken
