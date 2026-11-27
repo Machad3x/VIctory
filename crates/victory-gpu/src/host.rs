@@ -301,7 +301,12 @@ fn retirer() -> &'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>> {
         let _ = std::thread::Builder::new().name("victory retire".into()).spawn(move || {
             RETIRE_THREAD.set(true);
             for job in rx {
-                job();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    // Not idle again otherwise: every submission would wait.
+                    *flight() = None;
+                    IDLE.notify_all();
+                    fail(format_args!("a host submission's retire panicked"));
+                }
             }
         });
         tx
@@ -769,7 +774,7 @@ pub(crate) mod tests {
         let list = host.new_list().unwrap();
         list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
         list.close();
-        let mut lock = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lock = host.lock_idle();
         let ticket = host.submit(&mut lock, vec![&list]);
         let value = *lock;
         assert_eq!(ticket.0.as_ref().map(|t| t.value), Some(value));
@@ -811,7 +816,7 @@ pub(crate) mod tests {
         };
         let list = host.new_list().unwrap();
         list.close();
-        let mut lock = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lock = host.lock_idle();
         let ticket = host.submit(&mut lock, vec![&list]);
         let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ticket)));
         assert_eq!(dropped.is_err(), cfg!(debug_assertions));
@@ -829,7 +834,7 @@ pub(crate) mod tests {
     /// test submitting alongside would otherwise take first. `None` with no
     /// host GPU.
     pub(crate) fn no_submissions() -> Option<std::sync::MutexGuard<'static, u64>> {
-        super::host().map(|h| h.submitted.lock().unwrap_or_else(|e| e.into_inner()))
+        super::host().map(|h| h.lock_idle())
     }
 
     thread_local! {
@@ -952,7 +957,7 @@ pub(crate) mod tests {
     fn read_marks_of_both_bitmaps_are_taken() {
         let Some(host) = host() else { return };
         // No submission takes the marks meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.lock_idle();
         let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
         crate::shadow::tests::mark_read(false, plain);
         crate::shadow::tests::mark_read(true, memory);
@@ -1037,7 +1042,7 @@ pub(crate) mod tests {
         let texture = crate::resource::texture_at(address, &words).expect("its resource");
         let raw = windows::core::Interface::as_raw(&crate::resource::made_copy(texture).unwrap().texture) as usize;
         // No submission takes the marks meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.lock_idle();
         for _ in 0..2 {
             crate::shadow::tests::mark_read(false, 0);
             let slots = crate::shadow::reads_since();
@@ -1084,7 +1089,7 @@ pub(crate) mod tests {
         let (idle_frames, idle_ms) = (crate::resource::IDLE_FRAMES, crate::resource::IDLE_MS);
         {
             // No submission takes the marks meanwhile.
-            let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let _one = host.lock_idle();
             // Passes a third of the idle limits apart, over three times them.
             for k in 0..10 {
                 crate::shadow::tests::mark_read(false, 5);
@@ -1156,7 +1161,7 @@ pub(crate) mod tests {
         let viewed = std::sync::Arc::new(crate::bindless::Viewed::default());
         viewed.set(0, Some(&crate::descriptor::View::Shader(object as usize, Some(desc))), true);
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.lock_idle();
         // SAFETY: the texture's memory, 256-byte rows of 64 texels.
         unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, 64 * 64 * 4) };
         copy.unstamp();
@@ -1192,7 +1197,7 @@ pub(crate) mod tests {
             })
             .collect();
         // No submission uploads meanwhile.
-        let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _one = host.lock_idle();
         let _ = crate::bindless::uploads(std::slice::from_ref(&viewed), &[]);
         for &object in &objects {
             assert_eq!(crate::texture::uploads(object), 1, "each brought up once");
@@ -1840,11 +1845,10 @@ impl Host {
 
     /// The submission lock, once no retire is in flight ([`Host::execute_later`]).
     fn lock_idle(&self) -> std::sync::MutexGuard<'_, u64> {
+        // It would wait for itself.
+        debug_assert!(!RETIRE_THREAD.get(), "a host submission from the retire thread");
         let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        // The retire thread's own submissions (none today) follow its settle.
-        if !RETIRE_THREAD.get() {
-            drop(IDLE.wait_while(flight(), |f| f.is_some()).unwrap_or_else(|e| e.into_inner()));
-        }
+        drop(IDLE.wait_while(flight(), |f| f.is_some()).unwrap_or_else(|e| e.into_inner()));
         submitted
     }
 
@@ -1870,7 +1874,9 @@ impl Host {
         drop(submitted);
         let retiring = Retiring(ticket);
         let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let here = Submitting::enter();
             self.retire(retiring.into_ticket());
+            drop(here);
             then();
             // Work queued behind it, then idle.
             loop {
@@ -1889,6 +1895,8 @@ impl Host {
                     work();
                 }
             }
+            // Held work may wait for what it signalled or wrote.
+            crate::queue::wake_held();
         });
         if let Err(e) = retirer().send(job) {
             // No retire thread: here.
@@ -2137,6 +2145,12 @@ impl Host {
             if !self.end_group(&mut t, i, started, waited) {
                 break;
             }
+        }
+        // Its last group never went: the pull list did not either.
+        if t.last.is_none()
+            && let Some(Some(r)) = &t.riding
+        {
+            r.pull().busy = false;
         }
         // Pending until retired, for queue waits to read ahead.
         crate::queue::labels_sent(t.value, lists_of(&t.uploads, &t.runs).iter().flat_map(|l| l.deferred().writes.clone()));

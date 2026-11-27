@@ -305,10 +305,27 @@ fn pump(held: &mut Holding, why: Why) {
     static TIMER: std::sync::Once = std::sync::Once::new();
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut woken = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+            if !*woken {
+                woken = WAKE.1.wait_timeout(woken, std::time::Duration::from_millis(2)).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            *woken = false;
+            drop(woken);
             pump_held_if_free(Why::Timer);
         });
     });
+}
+
+/// Wakes the held-work timer early.
+#[cfg(windows)]
+static WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// A retire signalled fences and wrote labels: held work is tested again
+/// at once (by the timer's thread, which may submit; a retire may not).
+#[cfg(windows)]
+pub(crate) fn wake_held() {
+    *WAKE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    WAKE.1.notify_all();
 }
 
 /// Runs `then` once every host submission sent so far is retired: the
