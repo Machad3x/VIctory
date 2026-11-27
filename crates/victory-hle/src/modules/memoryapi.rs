@@ -1,7 +1,9 @@
 //! The memory functions the title shares with PC that change memory
 //! (`VirtualFree`, `VirtualProtect`, unmapping views): the host's, after the
 //! GPU side lets go of title memory it holds in place there
-//! (`victory_gpu::title_memory_change`). A GPU heap opened over memory
+//! (`victory_gpu::title_memory_change`). `VirtualAlloc` at an address the
+//! title names is the host's first, and lets go only if refused as locked
+//! (`victory_gpu::title_memory_retry`). A GPU heap opened over memory
 //! makes each of them fail on the host (`ERROR_INVALID_PARAMETER`) while it
 //! lives; on the console the GPU reads title memory in place and these
 //! always work. Everything else in these DLLs is the host's directly.
@@ -136,6 +138,54 @@ pub extern "system" fn VirtualProtectEx(
     }
 }
 
+/// Allocates at `at` with `allocate` (a host call): over memory the GPU
+/// side holds in place, a commit with another protection is refused as
+/// locked, so the GPU side lets go and it is tried again
+/// (`victory_gpu::title_memory_retry`). Elsewhere, the host's answer.
+fn allocate_at(
+    at: *const c_void,
+    size: usize,
+    mut allocate: impl FnMut() -> *mut c_void,
+) -> *mut c_void {
+    if at.is_null() || size == 0 {
+        return allocate();
+    }
+    let mut out = std::ptr::null_mut();
+    victory_gpu::title_memory_retry(at as usize, size, || {
+        out = allocate();
+        BOOL::from(!out.is_null())
+    });
+    out
+}
+
+pub extern "system" fn VirtualAlloc(
+    at: *const c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    // SAFETY: the title's arguments.
+    allocate_at(at, size, || unsafe {
+        mem::VirtualAlloc(at, size, kind, protect)
+    })
+}
+
+pub extern "system" fn VirtualAllocEx(
+    process: HANDLE,
+    at: *const c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    // SAFETY: the title's arguments.
+    let allocate = || unsafe { mem::VirtualAllocEx(process, at, size, kind, protect) };
+    if this_process(process) {
+        allocate_at(at, size, allocate)
+    } else {
+        allocate()
+    }
+}
+
 pub extern "system" fn UnmapViewOfFile(at: MEMORY_MAPPED_VIEW_ADDRESS) -> BOOL {
     // SAFETY: the title's argument.
     change(at.Value, 0, || unsafe { mem::UnmapViewOfFile(at) })
@@ -165,6 +215,8 @@ pub(crate) fn module() -> HleModule {
         name: "memoryapi",
         dlls: &["api-ms-win-core-memory-*", "kernel32.dll", "kernelbase.dll"],
         exports: vec![
+            hle_export!(VirtualAlloc),
+            hle_export!(VirtualAllocEx),
             hle_export!(VirtualFree),
             hle_export!(VirtualFreeEx),
             hle_export!(VirtualProtect),
@@ -219,6 +271,10 @@ mod tests {
             0
         );
         assert_eq!(old, mem::PAGE_READONLY);
+        // A commit at an address with another protection, nothing held.
+        let again = VirtualAlloc(at as *const c_void, PAGE, mem::MEM_COMMIT, mem::PAGE_READONLY);
+        assert_eq!(again as usize, at);
+        assert!(VirtualAlloc(0x1000 as *const c_void, PAGE, mem::MEM_COMMIT, 0).is_null(), "the host's refusal");
         assert_ne!(VirtualFree(at as *mut c_void, 0, MEM_RELEASE), 0);
         assert_eq!(rest_of_allocation(at), 0, "freed");
     }
@@ -242,6 +298,10 @@ mod tests {
         }
         assert_eq!(
             r.classify("api-ms-win-core-memory-l1-1-0.dll", &name("VirtualAlloc")),
+            Some(victory_loader::Provenance::Hle)
+        );
+        assert_eq!(
+            r.classify("api-ms-win-core-memory-l1-1-0.dll", &name("VirtualQuery")),
             Some(victory_loader::Provenance::Host)
         );
     }
