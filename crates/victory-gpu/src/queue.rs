@@ -230,10 +230,12 @@ fn pump(held: &mut Holding, why: Why) {
         if !predicting() {
             return read_value(address, bytes);
         }
-        // shortcut: tickets are retired inline, so an unknown pending write
-        // is in memory already; an async retire must settle it here first.
-        pending().read(address, bytes, &read_value, &|_: u64| {})
+        pending().read(address, bytes, &read_value)
     };
+    // Another thread may be between submit and retire: a write of its not
+    // known ahead keeps the wait held until it settles (the timer tests
+    // again).
+    let unsettled = |address: u64, bytes: u8| predicting() && pending().unsettled(address, bytes);
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
@@ -265,6 +267,7 @@ fn pump(held: &mut Holding, why: Why) {
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
+        unsettled: &unsettled,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
