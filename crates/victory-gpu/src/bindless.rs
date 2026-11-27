@@ -45,11 +45,12 @@ pub(crate) struct Viewed {
 }
 
 /// A heap's textures worth bringing up as its last full walk found them
-/// (made, read lately): the frame and the count of textures added to the
-/// heap it was made at, and each texture with the host copy it had then.
+/// (made, read lately): what it was made at (the presented frame, the
+/// heap's texture changes, host textures made or read again after a gap),
+/// and each texture with the host copy it had then.
 #[derive(Default)]
 struct Walked {
-    at: Option<(u64, u64)>,
+    at: Option<(u64, u64, u64)>,
     textures: Vec<(usize, std::sync::Weak<crate::resource::HostTexture>)>,
 }
 
@@ -75,8 +76,8 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
-    /// Textures that came into `textures` (a new walk is due).
-    textures_added: u64,
+    /// Textures that came into `textures` or left it (a new walk is due).
+    textures_changed: u64,
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -128,13 +129,14 @@ impl Inner {
                 }
             }
             Seen::Texture(r) => {
-                if add && !self.textures.contains_key(r) {
-                    self.textures_added += 1;
-                }
+                let had = self.textures.contains_key(r);
                 let n = self.textures.entry(*r).or_insert(0);
                 step(n);
                 if *n == 0 {
                     self.textures.remove(r);
+                }
+                if had != self.textures.contains_key(r) {
+                    self.textures_changed += 1;
                 }
             }
             Seen::Left(_) => {}
@@ -252,16 +254,19 @@ pub(crate) fn uploads(
     let mut done = crate::fx::Set::default();
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::UploadsCalls, 1);
-    // A heap's textures are walked once a frame, or when textures came into
-    // it, not at each of the frame's ~30 submissions (17.9 ms a frame for 6
-    // textures uploaded, run gpu280); `VICTORY_UPLOADS_FULL=1` walks at each.
+    // A heap's textures are walked again only when what it found may have
+    // changed: a new frame (what is read lately), textures coming into or
+    // leaving the heap, host textures made or read again after a gap (also
+    // with no presents, as in loading); not at each of the frame's ~30
+    // submissions (17.9 ms a frame for 6 textures uploaded, run gpu280).
+    // `VICTORY_UPLOADS_FULL=1` walks at each.
     static FULL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::switch::on("VICTORY_UPLOADS_FULL"));
     let frame = crate::queue::presented();
     for viewed in heaps {
         let mut walked = viewed.walked.lock().unwrap_or_else(|e| e.into_inner());
         {
             let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let at = Some((frame, inner.textures_added));
+            let at = Some((frame, inner.textures_changed, crate::resource::HostTexture::newly_recent()));
             if *FULL || walked.at != at {
                 walked.at = at;
                 walked.textures.clear();
@@ -280,10 +285,7 @@ pub(crate) fn uploads(
                     // shortcut: a texture read again after a gap is brought up
                     // after the submission that read it, which can see bytes
                     // one refresh old (a slot the title rewrites is made fresh
-                    // anyway); upload on the mark itself if that shows. With
-                    // the walk once a frame, one read again later in the frame
-                    // waits for the next frame's walk (`VICTORY_UPLOADS_FULL=1`
-                    // walks at each submission if that shows).
+                    // anyway); upload on the mark itself if that shows.
                     if texture.used_recently() {
                         walked.textures.push((r, Arc::downgrade(&texture)));
                     }
@@ -490,18 +492,20 @@ mod tests {
     use windows::core::s;
 
     /// A texture coming into a heap's textures counts once, while any slot
-    /// views it; again after it left (a new walk is due either time).
+    /// views it, and once when the last slot leaves it (a new walk is due).
     #[test]
-    fn textures_added_counts_new_textures() {
+    fn heap_texture_changes_count_arrivals_and_departures() {
         let mut inner = Inner::default();
         inner.count(&Seen::Texture(5), true);
         inner.count(&Seen::Texture(5), true);
-        assert_eq!(inner.textures_added, 1);
+        assert_eq!(inner.textures_changed, 1);
         inner.count(&Seen::Texture(5), false);
+        assert_eq!(inner.textures_changed, 1);
         inner.count(&Seen::Texture(5), false);
         assert!(inner.textures.is_empty());
+        assert_eq!(inner.textures_changed, 2);
         inner.count(&Seen::Texture(5), true);
-        assert_eq!(inner.textures_added, 2);
+        assert_eq!(inner.textures_changed, 3);
     }
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
