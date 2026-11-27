@@ -429,9 +429,9 @@ static FLIGHT_HEAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// A heap page was synced for this title submission at all.
 static FLIGHT_HEAP_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// What last wrote each bottom-of-pipe word (0 a value, 1 a query result,
-/// 2 a timestamp) and the frame it did; words not written for two frames
-/// are dropped at each line.
-static LABELS: Mutex<Option<HashMap<u64, (u8, u64)>>> = Mutex::new(None);
+/// 2 a timestamp), the frame it did and the value (0 unless known ahead);
+/// words not written for two frames are dropped at each line.
+static LABELS: Mutex<Option<HashMap<u64, (u8, u64, u64)>>> = Mutex::new(None);
 
 /// Why a title submission would drain the one before (fence, sync
 /// executes, present); `None` for our own executes.
@@ -491,13 +491,19 @@ pub(crate) fn heap_page(at: usize, len: usize) {
 
 /// A bottom-of-pipe write at `at`, for [`wait_source`].
 pub(crate) fn label_written(at: usize, what: &crate::queue::Written) {
-    let kind = match what {
-        crate::queue::Written::Value(_) => 0,
-        crate::queue::Written::HostValue(_) => 1,
-        crate::queue::Written::GpuTimestamp | crate::queue::Written::SystemTimestamp => 2,
+    let (kind, value) = match what {
+        crate::queue::Written::Value(v) => (0, *v),
+        crate::queue::Written::HostValue(_) => (1, 0),
+        crate::queue::Written::GpuTimestamp | crate::queue::Written::SystemTimestamp => (2, 0),
     };
     let frame = crate::queue::presented();
-    LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(at as u64, (kind, frame));
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(at as u64, (kind, frame, value));
+}
+
+/// What last wrote the word at `address` from a list's bottom of pipe:
+/// (kind as in [`LABELS`], frame, value), `None` if no list did lately.
+pub(crate) fn label_source(address: u64) -> Option<(u8, u64, u64)> {
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&address).copied())
 }
 
 /// A queue's memory value wait at its first test, counted by what last

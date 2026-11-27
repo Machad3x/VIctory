@@ -255,6 +255,18 @@ impl<S> Held<S> {
         self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
     }
 
+    /// Queues whose head is a fence Wait older than `limit`: (queue,
+    /// fence, value).
+    pub(crate) fn fence_waits_older_than(&self, limit: Duration) -> Vec<(usize, usize, u64)> {
+        self.queues
+            .iter()
+            .filter_map(|(q, items)| match items.front()? {
+                (Item::FenceWait(fence, value), since, _) if since.elapsed() >= limit => Some((*q, *fence, *value)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Releases work held longer than `limit` at the heads of blocked
     /// queues, as if its waits held: the count of segments forced.
     // shortcut: a safety valve against waits nothing will satisfy (a write
@@ -496,6 +508,26 @@ mod tests {
         fake.borrow_mut().memory.insert(0x100, 1);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: work", "signal 5 3", "q2: after"]);
+    }
+
+    /// A compute list waits for a word the graphics queue writes in work it
+    /// holds behind a fence Wait; another queue's Signal later lets the
+    /// writer run, and the reader right after it, in that order.
+    #[test]
+    fn a_wait_on_another_queues_later_flushed_write() {
+        let fake = RefCell::new(Fake::default());
+        fake.borrow_mut().writes.insert("writer", vec![(0x100, 1674)]);
+        let mut held = Held::default();
+        held.push(2, Item::Segment("reader", vec![ge(0x100, 1674)]));
+        held.push(0, Item::FenceWait(5, 1));
+        held.push(0, Item::Segment("writer", vec![]));
+        pump(&mut held, &fake);
+        assert!(fake.borrow().log.is_empty(), "both held");
+        assert_eq!(held.fence_waits_older_than(Duration::ZERO), [(0, 5, 1)]);
+        held.push(3, Item::Signal(5, 1));
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["signal 5 1", "q0: writer", "q2: reader"]);
+        assert!(held.is_empty());
     }
 
     #[test]

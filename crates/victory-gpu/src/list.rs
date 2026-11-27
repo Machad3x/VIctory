@@ -151,8 +151,9 @@ pub(crate) enum Submission {
         Vec<std::sync::Arc<crate::host::HostList>>,
         std::sync::Arc<crate::descriptor::lease::Lease>,
     ),
-    /// The list lost its dynamic slots after an earlier submission; skip it.
-    Lost,
+    /// The list lost its dynamic slots after an earlier submission: its
+    /// commands must not run, its waits and bottom-of-pipe writes still do.
+    Lost(Vec<std::sync::Arc<crate::host::HostList>>),
     /// Null or without a host list; nothing to submit.
     None,
 }
@@ -181,7 +182,7 @@ pub(crate) fn start(this: This) -> Submission {
     if lease.start() {
         Submission::Run(segments, lease)
     } else {
-        Submission::Lost
+        Submission::Lost(segments)
     }
 }
 
@@ -2924,6 +2925,73 @@ mod tests {
         for object in [depth, title, allocator] {
             release(object);
         }
+    }
+
+    /// A graphics queue, and a list and its allocator, if a host GPU runs
+    /// lists (else nothing is made).
+    #[cfg(windows)]
+    fn queue_and_list() -> Option<[This; 3]> {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // A graphics queue's description: type 0, the rest unused.
+        let desc = [0u32; 4];
+        let mut queue = null;
+        assert_eq!(crate::queue::create(null, desc.as_ptr().cast(), &PAGEABLE_IIDS[0], &mut queue), S_OK);
+        let made = [queue, list, allocator];
+        if host_list(list).is_some() {
+            return Some(made);
+        }
+        release_all(made);
+        None
+    }
+
+    #[cfg(windows)]
+    fn release_all(objects: [This; 3]) {
+        for o in objects {
+            slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        }
+    }
+
+    /// A draw without a pipeline and an indirect execution without a
+    /// signature are dropped; the list's bottom-of-pipe write after them
+    /// still lands once the list has run (a queue may wait for it).
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_draw_keeps_the_label_write_after_it() {
+        let Some([queue, list, allocator]) = queue_and_list() else { return };
+        let null = std::ptr::null();
+        let word = Box::new(std::sync::atomic::AtomicU64::new(0));
+        with_state(list, |l, s| s.draw(l, 3, 1, 0, 0));
+        execute_indirect(list, null, 1, null, 0, null, 0);
+        write64(list, word.as_ptr() as u64, 1674, 0, 0);
+        assert_eq!(close(list), S_OK);
+        crate::queue::execute(queue, 1, &list);
+        assert_eq!(word.load(Ordering::SeqCst), 1674);
+        release_all([queue, list, allocator]);
+    }
+
+    /// Submitted again after its dynamic slots were taken back, a list's
+    /// commands do not run, but its bottom-of-pipe write still lands.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_that_lost_its_slots_still_writes_its_labels() {
+        let Some([queue, list, allocator]) = queue_and_list() else { return };
+        let heap = 0x1000_0107;
+        let word = Box::new(std::sync::atomic::AtomicU64::new(0));
+        with_state(list, |_, s| s.lease().add(heap, 10, 4));
+        write64(list, word.as_ptr() as u64, 7, 0, 0);
+        assert_eq!(close(list), S_OK);
+        crate::queue::execute(queue, 1, &list);
+        assert_eq!(word.load(Ordering::SeqCst), 7);
+        assert!(crate::descriptor::lease::reclaim(heap, |_| {}), "it ran: its slots may be taken back");
+        word.store(0, Ordering::SeqCst);
+        crate::queue::execute(queue, 1, &list);
+        assert_eq!(word.load(Ordering::SeqCst), 7, "written though its commands are not run");
+        assert_eq!(reset(list, allocator, std::ptr::null()), S_OK);
+        release_all([queue, list, allocator]);
     }
 }
 

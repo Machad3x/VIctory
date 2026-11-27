@@ -113,7 +113,7 @@ extern "system" fn release(this: This) -> u32 {
 
 /// Queues the lists' host lists behind what the queue holds, and runs what
 /// may run (`crate::hold`; decision 0007).
-extern "system" fn execute(this: This, count: u32, lists: *const This) {
+pub(crate) extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -134,10 +134,18 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                     for (k, segment) in segments.into_iter().enumerate() {
                         let waits = segment.waits();
                         let lease = (k == last).then(|| lease.clone());
-                        held.push(this as usize, Item::Segment((segment, lease), waits));
+                        held.push(this as usize, Item::Segment((segment, lease, false), waits));
                     }
                 }
-                crate::list::Submission::Lost => skipped += 1,
+                // Its waits and writes keep their place: another queue or
+                // the title may wait for what it writes.
+                crate::list::Submission::Lost(segments) => {
+                    skipped += 1;
+                    for segment in segments {
+                        let waits = segment.waits();
+                        held.push(this as usize, Item::Segment((segment, None, true), waits));
+                    }
+                }
                 crate::list::Submission::None => {}
             }
         }
@@ -146,7 +154,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             if !LOST.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     skipped,
-                    "lists submitted again after their dynamic descriptor slots were taken back are not run"
+                    "lists submitted again after their dynamic descriptor slots were taken back: their commands \
+                     are not run, their waits and bottom-of-pipe writes are"
                 );
             }
         }
@@ -179,12 +188,15 @@ use crate::hold::Item;
 #[cfg(windows)]
 type Holding = crate::hold::Held<Segment>;
 
-/// A title list's host list, and with its last one the lease of the list's
-/// dynamic slots, finished once it ran ([`crate::list::start`]).
+/// A title list's host list, with its last one the lease of the list's
+/// dynamic slots, finished once it ran ([`crate::list::start`]), and
+/// whether only its bottom-of-pipe writes are done (the list lost its
+/// slots).
 #[cfg(windows)]
 type Segment = (
     std::sync::Arc<crate::host::HostList>,
     Option<std::sync::Arc<crate::descriptor::lease::Lease>>,
+    bool,
 );
 
 #[cfg(windows)]
@@ -258,14 +270,41 @@ fn pump(held: &mut Holding, why: Why) {
     };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
-        tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
+        // What the words hold now, and which list wrote them last: a writer
+        // never submitted, one that wrote less, or a word lists never write.
+        let now: Vec<Option<u64>> = waits.iter().map(|w| read_value(w.address, w.bytes)).collect();
+        #[cfg(feature = "diagnostics")]
+        let by: Vec<Option<(u8, u64, u64)>> = waits.iter().map(|w| crate::copystat::label_source(w.address)).collect();
+        #[cfg(not(feature = "diagnostics"))]
+        let by = "with diagnostics";
+        tracing::warn!(
+            queue = kind(queue),
+            frame = presented(),
+            ?waits,
+            ?now,
+            ?by,
+            "held work runs without its waits after {VALVE:?} (safety valve); the words now, and the list write \
+             that last stored each (0 a value, 1 a query result, 2 a timestamp; frame; value)"
+        );
+    }
+    // Fence waits are not released: said once a while, with the fence's value.
+    static FENCES_SAID: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let stuck = held.fence_waits_older_than(VALVE);
+    if !stuck.is_empty() {
+        let mut said = FENCES_SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if said.is_none_or(|at| at.elapsed() >= VALVE) {
+            *said = Some(std::time::Instant::now());
+            let stuck: Vec<(u32, u64, u64)> =
+                stuck.iter().map(|&(q, f, v)| (kind(q), v, crate::fence::value(f as This))).collect();
+            tracing::warn!(frame = presented(), ?stuck, "queues wait on fences for {VALVE:?} or more (queue type, value, fence's value)");
+        }
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<Segment>| {
+    let mut run = |_: usize, mut segments: Vec<Segment>| {
         let finish = move |segments: Vec<Segment>| {
-            for (list, lease) in segments {
+            for (list, lease, _) in segments {
                 if let Some(lease) = lease {
                     lease.finish();
                 }
@@ -273,36 +312,35 @@ fn pump(held: &mut Holding, why: Why) {
             }
         };
         let at = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::TITLE.set(true);
-        if crate::host::pipelining() {
-            let lists = segments.iter().map(|(s, _)| s.clone()).collect();
-            host.execute_later(lists, Box::new(move || finish(segments)));
-        } else {
-            let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
-            host.execute(&lists);
-            drop(lists);
-            after_retired(move || finish(segments));
+        // In order, runs of segments that go to the host and of those that
+        // only write (after what went before them has run).
+        while !segments.is_empty() {
+            let only_writes = segments[0].2;
+            let n = segments.iter().position(|s| s.2 != only_writes).unwrap_or(segments.len());
+            let rest = segments.split_off(n);
+            let group = std::mem::replace(&mut segments, rest);
+            if only_writes {
+                after_retired(move || {
+                    group.iter().for_each(|(list, ..)| list.write_labels());
+                    finish(group);
+                });
+                continue;
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::TITLE.set(true);
+            if crate::host::pipelining() {
+                let lists = group.iter().map(|(s, ..)| s.clone()).collect();
+                host.execute_later(lists, Box::new(move || finish(group)));
+            } else {
+                let lists: Vec<&crate::host::HostList> = group.iter().map(|(s, ..)| &**s).collect();
+                host.execute(&lists);
+                drop(lists);
+                after_retired(move || finish(group));
+            }
         }
         ran += at.elapsed();
     };
-    let mut signal = |f: usize, value: u64| {
-        // The work before it went to the host under this number at most.
-        let ticket = crate::memsys::sent();
-        after_retired(move || {
-            let show = move || {
-                crate::fence::set(f as This, value);
-                crate::fence::let_go(f as This);
-            };
-            // The gate shows it only once that submission's copy-back is
-            // in title memory, whatever is in flight by then.
-            if crate::memsys::gating() {
-                crate::memsys::when_visible(ticket, Box::new(show));
-            } else {
-                show();
-            }
-        });
-    };
+    let mut signal = |f: usize, value: u64| signal_after_sent(f, value);
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
@@ -349,6 +387,28 @@ static WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::n
 pub(crate) fn wake_held() {
     *WAKE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     WAKE.1.notify_all();
+}
+
+/// Moves a fence kept for it ([`crate::fence::keep`]) once the host work
+/// sent so far has settled (its bottom-of-pipe writes are in memory), and
+/// lets it go: a queue's Signal, behind held work or not.
+#[cfg(windows)]
+fn signal_after_sent(f: usize, value: u64) {
+    // The work before it went to the host under this number at most.
+    let ticket = crate::memsys::sent();
+    after_retired(move || {
+        let show = move || {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        };
+        // The gate shows it only once that submission's copy-back is in
+        // title memory, whatever is in flight by then.
+        if crate::memsys::gating() {
+            crate::memsys::when_visible(ticket, Box::new(show));
+        } else {
+            show();
+        }
+    });
 }
 
 /// Runs `then` once every host submission sent so far is retired: the
@@ -557,11 +617,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     #[cfg(windows)]
     {
         let mut held = held();
+        crate::fence::keep(fence);
         if held.holds_work(this as usize) {
-            crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
         } else {
-            crate::fence::set(fence, value);
+            // Not before the queue's sent work has settled (a retire in
+            // flight, the gate): its writes come first.
+            signal_after_sent(fence as usize, value);
         }
         // Another queue may wait for this fence.
         pump(&mut held, Why::Signal);

@@ -3325,6 +3325,16 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// Its bottom-of-pipe writes alone, for a list whose commands do not
+    /// run (`crate::queue`, a list that lost its slots).
+    pub(crate) fn write_labels(&self) {
+        for &(at, what, bytes) in &self.deferred().writes {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::label_written(at, &what);
+            what.write(at as *mut u8, bytes);
+        }
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
