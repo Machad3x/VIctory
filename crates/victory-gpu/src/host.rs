@@ -106,6 +106,8 @@ struct PullList {
     list: ID3D12GraphicsCommandList,
     /// Executed and not yet waited for.
     busy: bool,
+    /// The submission fence value signaled after its last run.
+    value: u64,
 }
 // SAFETY: D3D12 objects are free-threaded; used under its mutex only.
 unsafe impl Send for PullList {}
@@ -1776,6 +1778,7 @@ impl Host {
                 if last && let Some(Some(r)) = &mut riding {
                     self.queue.ExecuteCommandLists(&[Some(r.list.clone())]);
                     r.guard.busy = true;
+                    r.guard.value = *submitted;
                 }
                 let waited = self
                     .queue
@@ -1991,8 +1994,10 @@ impl Host {
             if let Some(Some(r)) = &mut riding {
                 static FELL_BACK: std::sync::Once = std::sync::Once::new();
                 FELL_BACK.call_once(|| tracing::warn!("a riding pull was not waited for: it pulled on its own"));
-                // The pull's own copy waited on this queue after the riding one.
-                r.guard.busy = false;
+                // Done once the submission's fence passed it: the pull's own
+                // copy may not have run or waited (an error, nothing to copy).
+                // SAFETY: a plain query.
+                r.guard.busy &= unsafe { self.fence.GetCompletedValue() } < *submitted;
             }
         }
         struct Kept(Regions);
@@ -4905,13 +4910,18 @@ impl Host {
                     let list: ID3D12GraphicsCommandList =
                         self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                     list.Close()?;
-                    Ok(PullList { allocator, list, busy: false })
+                    Ok(PullList { allocator, list, busy: false, value: 0 })
                 })()
             };
             made.inspect_err(|e| tracing::warn!(error = %e, "no pull list: pulls wait on their own")).ok().map(Mutex::new)
         });
-        let guard = list.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
-        // Its last run was not waited for: the allocator may be in use.
+        let mut guard = list.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        // Its last run was not waited for: the allocator may be in use,
+        // until the fence passes it.
+        // SAFETY: a plain query.
+        if guard.busy && unsafe { self.fence.GetCompletedValue() } >= guard.value {
+            guard.busy = false;
+        }
         if guard.busy {
             return None;
         }
