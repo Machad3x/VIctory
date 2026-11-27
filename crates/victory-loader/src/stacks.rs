@@ -1,9 +1,9 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
 //! [`dump_stacks_on_schedule`], to find what a title waits on. An entry
-//! `crash` prints them once more at the first unhandled exception: a title
-//! watchdog that ends a hung run with a write to address 0 then shows who
-//! waited on what.
+//! `crash` prints them once more at the first unhandled exception (and to
+//! the crash log): a title watchdog that ends a hung run with a write to
+//! address 0 then shows who waited on what.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,13 +13,13 @@ use windows_sys::Wdk::System::Threading::{
 };
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
+    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext, ReadProcessMemory,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetThreadDescription, OpenThread, ResumeThread,
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
@@ -64,10 +64,32 @@ fn asks_crash(list: &str) -> bool {
 /// `VICTORY_STACKS` named `crash` and no crash has printed them yet.
 static ON_CRASH: AtomicBool = AtomicBool::new(false);
 
-/// At an unhandled exception: every other thread's stack, once, if asked.
-pub(crate) fn dump_stacks_on_crash() {
-    if ON_CRASH.swap(false, Ordering::Relaxed) {
-        dump_stacks();
+/// How long the crash filter waits for the stacks.
+const CRASH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// At an unhandled exception: every other thread's stack, once, if asked;
+/// the text, for the crash log. Taken on a thread of its own and waited for
+/// [`CRASH_DEADLINE`] at most: a thread suspended while it holds a lock the
+/// unwinder or the new thread's start needs (the loader's) would hang the
+/// filter, and the run would never end.
+pub(crate) fn dump_stacks_on_crash() -> Option<String> {
+    if !ON_CRASH.swap(false, Ordering::Relaxed) {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("victory stacks".into())
+        .spawn(move || {
+            let _ = tx.send(dump_stacks_text());
+        })
+        .ok()?;
+    match rx.recv_timeout(CRASH_DEADLINE) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            let late = format!("VIctory: the stacks took longer than {CRASH_DEADLINE:?}; left out\n");
+            eprint!("{late}");
+            Some(late)
+        }
     }
 }
 
@@ -90,6 +112,17 @@ struct Aligned(CONTEXT);
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
 pub fn dump_stacks() {
+    dump_stacks_text();
+}
+
+/// [`dump_stacks`], also returning what it printed.
+fn dump_stacks_text() -> String {
+    use std::fmt::Write;
+    let mut text = String::new();
+    let mut line = |s: String| {
+        eprintln!("{s}");
+        let _ = writeln!(text, "{s}");
+    };
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
         (
@@ -99,7 +132,7 @@ pub fn dump_stacks() {
         )
     };
     if snapshot == INVALID_HANDLE_VALUE {
-        return;
+        return text;
     }
     let mut ids = Vec::new();
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
@@ -116,7 +149,7 @@ pub fn dump_stacks() {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
-    eprintln!("VIctory: stacks of {} threads", ids.len());
+    line(format!("VIctory: stacks of {} threads", ids.len()));
     for id in ids {
         // SAFETY: opens a thread of our own process.
         let thread = unsafe {
@@ -129,23 +162,65 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base), rcx) = frames_of(thread);
-        eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base}) rcx {rcx:#x}",
+        let (frames, (priority, base), at) = frames_of(thread);
+        line(format!(
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) rip {} rsp {:#x} handles near rsp {:x?}",
             name_of(thread),
-            locate(start_of(thread))
-        );
+            locate(start_of(thread)),
+            locate(at.rip as usize),
+            at.rsp,
+            at.handles()
+        ));
         for (i, pc) in frames.into_iter().enumerate() {
-            eprintln!("    #{i:<2} {}", locate(pc as usize));
+            line(format!("    #{i:<2} {}", locate(pc as usize)));
         }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
+    text
+}
+
+/// Words read from the top of a stopped thread's stack.
+const STACK_WORDS: usize = 64;
+
+/// Where a thread stopped, and the top of its stack. A thread in a system
+/// call keeps no argument register: `syscall` overwrites `rcx` with the
+/// return address and the kernel does not keep `r10`. The handle a wait
+/// waits on is still among its callers' spills and locals near `rsp`.
+#[derive(Clone, Copy)]
+struct Stopped {
+    rip: u64,
+    rsp: u64,
+    stack: [u64; STACK_WORDS],
+}
+
+impl Default for Stopped {
+    fn default() -> Self {
+        Stopped { rip: 0, rsp: 0, stack: [0; STACK_WORDS] }
+    }
+}
+
+impl Stopped {
+    /// Words near `rsp` that are open handles of this process, each once:
+    /// what a thread waiting in the kernel may wait on.
+    fn handles(&self) -> Vec<u64> {
+        use windows_sys::Win32::Foundation::GetHandleInformation;
+        let mut found: Vec<u64> = Vec::new();
+        for &w in &self.stack {
+            let mut flags = 0;
+            // Handles are small multiples of 4; pseudo handles are not open ones.
+            // SAFETY: a plain query; an invalid value fails.
+            if w != 0 && w < 1 << 32 && w % 4 == 0 && !found.contains(&w) && unsafe { GetHandleInformation(w as HANDLE, &mut flags) } != 0 {
+                found.push(w);
+            }
+        }
+        found
+    }
 }
 
 /// The thread's frames, its current and base scheduling priority (0-31),
-/// and its `rcx`: for a thread waiting in the kernel, the handle it waits on.
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), u64) {
+/// and where it stopped.
+fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), Stopped) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -159,7 +234,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), u64) {
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0), 0);
+        return (frames, (0, 0), Stopped::default());
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
@@ -174,11 +249,12 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), u64) {
     if status != 0 || info.teb.is_null() {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0), 0);
+        return (frames, (0, 0), Stopped::default());
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
     // holds the stack base at +8 and the stack limit at +0x10.
     let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+    let mut stopped = Stopped::default();
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
@@ -188,10 +264,22 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), u64) {
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
             unwind_into(context.0, low, high, &mut frames);
+            stopped.rip = context.0.Rip;
+            stopped.rsp = context.0.Rsp;
+            // Within the stack only; a short read keeps what it got.
+            let len = (high as u64).saturating_sub(stopped.rsp).min(size_of_val(&stopped.stack) as u64) as usize;
+            let mut done = 0;
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                stopped.rsp as *const c_void,
+                stopped.stack.as_mut_ptr().cast(),
+                len,
+                &mut done,
+            );
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority), context.0.Rcx)
+    (frames, (info.priority, info.base_priority), stopped)
 }
 
 fn start_of(thread: HANDLE) -> usize {
@@ -256,12 +344,53 @@ mod tests {
         let (frames, _, _) = frames_of(thread);
         // Waiting in the kernel, several frames down from the thread start.
         assert!(frames.len() >= 3, "{frames:?}");
+        assert!(dump_stacks_text().contains(&format!("thread {id} ")));
         assert!(start_of(thread) != 0);
         // SAFETY: opened above.
         unsafe { CloseHandle(thread) };
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
+    }
+
+    /// A thread waiting on an event in the kernel: the event is among the
+    /// handles near its `rsp`, and `rip` is in ntdll's stub.
+    #[test]
+    fn a_waiting_thread_shows_the_handle_it_waits_on() {
+        use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForSingleObject};
+        // SAFETY: an unnamed manual-reset event, closed below.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        assert!(!event.is_null());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = event as usize;
+        let waiter = std::thread::spawn(move || {
+            // SAFETY: plain query.
+            tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+            // SAFETY: the event lives until this thread is joined.
+            unsafe { WaitForSingleObject(at as HANDLE, INFINITE) };
+        });
+        let id = rx.recv().unwrap();
+        // SAFETY: a thread of this process.
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, id) };
+        assert!(!thread.is_null());
+        // In the wait once its stub is where it stays.
+        let mut stopped = Stopped::default();
+        for _ in 0..200 {
+            stopped = frames_of(thread).2;
+            if stopped.handles().contains(&(at as u64)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(stopped.handles().contains(&(at as u64)), "{:x?} has {at:#x}", stopped.handles());
+        assert!(locate(stopped.rip as usize).starts_with("ntdll"), "{}", locate(stopped.rip as usize));
+        // SAFETY: ours; the waiter returns, then both handles go.
+        unsafe {
+            SetEvent(event);
+            waiter.join().unwrap();
+            CloseHandle(thread);
+            CloseHandle(event);
+        }
     }
 
     /// Times no `Duration` holds are left out instead of panicking the dump

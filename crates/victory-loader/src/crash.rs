@@ -564,6 +564,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
+    // Only here: a handled first-chance one must not spend the one dump.
+    #[cfg(feature = "diagnostics")]
+    if let Some(stacks) = crate::stacks::dump_stacks_on_crash() {
+        append_to_log(&stacks);
+    }
 }
 
 /// The bytes at `at` as hex, as many as the longest x86 instruction (15),
@@ -692,8 +697,6 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         eprint!("{end}");
         text.push_str(&end);
         append_to_log(&text);
-        #[cfg(feature = "diagnostics")]
-        crate::stacks::dump_stacks_on_crash();
     }
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
