@@ -4597,6 +4597,9 @@ fn buffer_uav(
         } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
             4
         } else {
+            if !uav_store_ok(desc.Format.0 as u32, true, typed_store) {
+                return None;
+            }
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         }
     };
@@ -4750,7 +4753,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return uav_store_ok(own, unordered, typed_store);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -4766,7 +4769,53 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         *format = d.Format;
     }
-    true
+    // The format the view ends up with: the host may not store to it even in
+    // the texture's own family (a texture made for render targets only).
+    let stored = if typeless { view } else { own };
+    uav_store_ok(stored, unordered, typed_store)
+}
+
+/// Whether an unordered view may be made in `format`: a typed UAV the host
+/// cannot store is an invalid call, for which D3D12 removes the device.
+fn uav_store_ok(format: u32, unordered: bool, stores: impl Fn(u32) -> bool) -> bool {
+    !unordered || stores(format)
+}
+
+/// Whether the host stores to typed unordered views of `format`. A view in
+/// a format it cannot store is an invalid call, for which D3D12 removes the
+/// device (B5G5R5A1_UNORM on NVIDIA): callers make no such view, and the
+/// slot gets a null one, whose writes are dropped. Each refused format is
+/// logged once.
+fn typed_store(format: u32) -> bool {
+    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    if !ok {
+        tracing::warn!(
+            format,
+            "the host cannot store to unordered views in this format: they are null"
+        );
+    }
+    known.push((format, ok));
+    ok
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
@@ -5945,6 +5994,18 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// A typed unordered view in a format the host cannot store removes the
+    /// device (B5G5R5A1_UNORM, 86, on NVIDIA): the view must be left null.
+    /// Shader views of that format, and a host that does store to it, are
+    /// unaffected. The check is injected so this holds without a host GPU.
+    #[test]
+    fn a_typed_uav_is_refused_in_a_format_the_host_cannot_store() {
+        let stores = |format: u32| format != 86;
+        assert!(uav_store_ok(28, true, stores), "the host's stand-in is storable");
+        assert!(!uav_store_ok(86, true, stores), "86 would remove the device");
+        assert!(uav_store_ok(86, false, stores), "a shader view needs no UAV");
     }
 
     /// A null 3D UAV made on the real device leaves it alive.

@@ -291,6 +291,8 @@ impl Layout {
             && matches!(d.block, 1 | 4)
             && d.samples.is_power_of_two()
             && d.samples <= 8
+            // D3D12 does not support multisampled block-compressed resources.
+            && (d.block == 1 || d.samples == 1)
             && (d.samples == 1
                 || (d.dimension == Dimension::Tex2d && d.mips == 1 && d.swizzle != Swizzle::LINEAR))
             && (d.dimension != Dimension::Tex1d || d.height == 1)
@@ -966,6 +968,25 @@ mod tests {
             .unwrap();
             assert_eq!(tiled.size, single.size * u64::from(samples));
         }
+    }
+
+    /// D3D12 cannot multisample block-compressed resources, so a compressed
+    /// desc with more than one sample is invalid (issue #356).
+    #[test]
+    fn compressed_formats_reject_multiple_samples() {
+        let bc1 = Desc {
+            block: 4,
+            ..desc(4, 4, 1, 8, Swizzle::SW_64KB_R_X)
+        };
+        assert_eq!(Layout::new(&Desc { samples: 4, ..bc1 }), Err(Error::Invalid));
+
+        // Single-sample BC1 and multisampled uncompressed formats still work.
+        assert!(Layout::new(&bc1).is_ok());
+        let rgba8_msaa = Desc {
+            samples: 4,
+            ..desc(4, 4, 1, 4, Swizzle::SW_64KB_R_X)
+        };
+        assert!(Layout::new(&rgba8_msaa).is_ok());
     }
 
     /// Sizes past the hardware's 16384 texels per side are refused instead

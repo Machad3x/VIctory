@@ -135,6 +135,8 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let mut far = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -147,6 +149,18 @@ impl<'a> Lower<'a> {
                 let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
                 let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
+                // A buffer offset is 32 bits: bits 29..31 of the pointer,
+                // or any of its high word, put the node past what it
+                // reaches. Its low bits would wrap to a node the buffer
+                // does hold; the lane reads as a miss instead.
+                let k29 = self.s.m.i32(29);
+                let mut high = self.s.m.bin(c, Bin::LShr, pointer, k29);
+                if let Some(hi) = pointer_high {
+                    high = self.s.m.bin(c, Bin::Or, high, hi);
+                }
+                let over = self.s.m.cmp(c, pred::NE, high, zero);
+                far = Some(over);
+                let byte = self.s.m.select(c, over, zero, byte);
                 NodeAt::Buffer { handle, byte }
             }
             BvhNodes::Memory { .. } => {
@@ -174,7 +188,6 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let zero = self.s.m.i32(0);
         let gate = self.begin_guarded(guard);
         let head = self.cur;
         let (k4, k6, k7) = (self.s.m.i32(4), self.s.m.i32(6), self.s.m.i32(7));
@@ -216,6 +229,17 @@ impl<'a> Lower<'a> {
             );
             results.push((phi, zero));
         }
+        let results = if let Some(far) = far {
+            let c = self.cur;
+            let miss = bvh::MISS.map(|f| self.s.m.i32(f.to_bits()));
+            results
+                .into_iter()
+                .zip(miss)
+                .map(|((r, z), m)| (self.s.m.select(c, far, m, r), z))
+                .collect()
+        } else {
+            results
+        };
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
             self.write(inst, Reg::V(dst + k as u8), r, guard);

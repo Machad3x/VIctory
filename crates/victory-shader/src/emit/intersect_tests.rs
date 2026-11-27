@@ -612,6 +612,67 @@ fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     run(false, Descriptor::Table, u64::from(NODES), true);
 }
 
+/// The buffer path takes only the pointer's low dword as a byte offset. A
+/// node 4 GiB or more into the BVH has no such offset, and its low bits wrap
+/// to a node the buffer does hold: the lane must read as a miss.
+#[test]
+fn nodes_past_4_gib_are_misses_in_the_buffer_path() {
+    let (shader, res) = build(true, Descriptor::Table).expect("the program lowers");
+    assert_eq!(res.bvh[0].1, BvhNodes::Resource);
+    let (scene, _) = scene();
+    // A hit, so a wrapped read of the first node is plainly not a miss.
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0);
+    let case = Some((0usize, 5u32, ray));
+    let hit = expected(&scene, &case, true);
+    assert_ne!(hit, bvh::MISS.map(f32::to_bits));
+    let mut batch: Vec<Case> = vec![None; THREADS as usize];
+    batch[0] = case;
+    batch[1] = case;
+    let mut data = buffer(&scene, &batch, u64::from(NODES));
+    // Thread 0: the low dword's top bits put the node at 4 GiB; truncated
+    // to a buffer offset it names node 0. Thread 1: the high dword alone
+    // puts the node 32 GiB in.
+    data[0] |= 0x2000_0000;
+    data[RECORD as usize / 4 + 1] = 1;
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        for t in 0..2 {
+            let got: [u32; 4] = out[0][4 * t..4 * t + 4].try_into().unwrap();
+            assert_eq!(got, bvh::MISS.map(f32::to_bits), "far thread {t}");
+        }
+        ran += 1;
+        if ran == 1 {
+            break;
+        }
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.
 const BASE: u64 = 0x12_3456_7800;
 
