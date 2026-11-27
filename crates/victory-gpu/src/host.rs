@@ -252,6 +252,9 @@ pub(crate) struct Sent<'h, L: std::ops::Deref<Target = HostList>> {
     unwaited: bool,
     /// The last group sent: its index, when, and its fence wait's setup.
     last: Option<(usize, std::time::Instant, windows::core::Result<()>)>,
+    /// Its shaders' write marks, taken on the GPU behind its lists
+    /// (`crate::memsys::marks`); none: read from the bitmap at the retire.
+    marks: Option<crate::memsys::marks::Snap>,
 }
 
 thread_local! {
@@ -2153,6 +2156,7 @@ impl Host {
             removed_in: None,
             unwaited: false,
             last: None,
+            marks: None,
         };
         for (i, group) in groups.into_iter().enumerate() {
             *submitted += 1;
@@ -2173,6 +2177,15 @@ impl Host {
                 if last && let Some(Some(r)) = &mut t.riding {
                     self.queue.ExecuteCommandLists(&[Some(r.list.clone())]);
                     r.pull().value = t.value;
+                }
+                // Its write marks become its own, and the bitmap clear
+                // for the next, in queue order.
+                if last
+                    && crate::memsys::gating()
+                    && let Some((list, snap)) = crate::memsys::marks::take(self, t.value)
+                {
+                    self.queue.ExecuteCommandLists(&[Some(list)]);
+                    t.marks = Some(snap);
                 }
                 self.queue
                     .Signal(&self.fence, t.value)
@@ -2310,7 +2323,7 @@ impl Host {
         if let Some((i, started, waited)) = t.last.take() {
             self.end_group(&mut t, i, started, waited);
         }
-        let Sent { value, started, heaps, uploads, runs: given, snapshots, batch, prepared, mut riding, pulled, removed_in, unwaited, .. } = t;
+        let Sent { value, started, heaps, uploads, runs: given, snapshots, batch, prepared, mut riding, pulled, removed_in, unwaited, marks, .. } = t;
         let lists = lists_of(&uploads, &given);
         let runs = &lists[..];
         // The riding copies ran, or never will: their pages unlock before
@@ -2431,7 +2444,11 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, ..)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        // Not waited for, its marks may not be in the ring yet: the bitmap.
+        crate::shadow::copy_back_marks_of(&withheld, withholding, marks.as_ref().filter(|_| !unwaited));
+        if let Some(snap) = marks {
+            crate::memsys::marks::done(snap);
+        }
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
@@ -2459,7 +2476,7 @@ impl Host {
                 r.pull().busy &= unsafe { self.fence.GetCompletedValue() } < value;
             }
         }
-        struct Kept(Regions);
+        struct Kept(#[allow(dead_code)] Regions); // held until released, never read
         // SAFETY: D3D12 resources are free-threaded; only released there.
         unsafe impl Send for Kept {}
         // Not waited for: its buffers go with the submission's (`back`).
@@ -4258,6 +4275,13 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// The last host submission the GPU has finished (every one, once the
+    /// device is removed).
+    pub(crate) fn completed(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.fence.GetCompletedValue() }
     }
 
     /// A buffer in video memory shaders may write (unordered access), in
@@ -6742,6 +6766,54 @@ mod copy_order {
         for &p in &pools {
             crate::watch::tests::free(p);
         }
+    }
+
+    /// With the gate on, a submission's write marks are taken on the GPU
+    /// as it ends, its marked page goes back from them, and the bitmap is
+    /// clear for the next submission.
+    #[test]
+    fn marks_taken_by_submission_bring_its_page_back() {
+        use crate::memsys::{GATE_IN_TESTS, N};
+        use crate::watch::PAGE;
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _alone = crate::memory::without_a_miss();
+        struct Gating;
+        impl Drop for Gating {
+            fn drop(&mut self) {
+                GATE_IN_TESTS.store(false, Relaxed);
+            }
+        }
+        GATE_IN_TESTS.store(true, Relaxed);
+        let _gating = Gating;
+        let p = crate::watch::tests::pool(2);
+        // SAFETY: our pool, not guarded yet.
+        unsafe { ((p + PAGE + 16) as *mut u8).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+        let copy = crate::shadow::find(p as u64, (2 * PAGE) as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, p as u64, (2 * PAGE) as u64);
+        copy.gpu_writes(&list, p as u64, (2 * PAGE) as u64, true);
+        let c = copy.clone();
+        list.defer(move || {
+            c.write_host((p + PAGE + 16) as u64, &[0xbb]);
+            c.mark_page_for_test(p + PAGE, false);
+        });
+        list.close();
+        let taken = crate::memsys::count(N::MarksSnaps);
+        host.execute(&[&list]);
+        // SAFETY: a byte of our pool.
+        let title = unsafe { ((p + PAGE + 16) as *const u8).read_volatile() };
+        assert_eq!(title, 0xbb, "the marked page went back");
+        if crate::memsys::marks::ready(host) {
+            assert!(crate::memsys::count(N::MarksSnaps) > taken, "from marks taken on the GPU");
+        }
+        assert!(!copy.mark_set_for_test(p + PAGE, false), "and the bitmap is clear");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     /// The lists read a fill's destination when they run, so it is filled

@@ -59,18 +59,27 @@ pub(crate) struct Gate {
     retired: u64,
     labels: Vec<Label>,
     most: usize,
+    /// A label of this ticket found no room: until it is retired, no wait
+    /// is answered from the labels.
+    lost: u64,
 }
 
 impl Gate {
     /// A gate for at most `labels` label writes in flight.
     pub(crate) fn new(labels: usize) -> Self {
-        Self { submitted: 0, retired: 0, labels: Vec::with_capacity(labels), most: labels }
+        Self { submitted: 0, retired: 0, labels: Vec::with_capacity(labels), most: labels, lost: 0 }
     }
 
     /// A ticket for the next submission (from 1, in order).
     pub(crate) fn submit(&mut self) -> u64 {
         self.submitted += 1;
         self.submitted
+    }
+
+    /// The submission numbered `ticket` by its caller is sent (numbers
+    /// only grow; those skipped count as sent with it).
+    pub(crate) fn submit_as(&mut self, ticket: u64) {
+        self.submitted = self.submitted.max(ticket);
     }
 
     /// Submissions not retired.
@@ -98,6 +107,7 @@ impl Gate {
             return Err(Refused::Ticket);
         }
         if self.labels.len() == self.most {
+            self.lost = self.lost.max(ticket);
             return Err(Refused::Full);
         }
         self.labels.push(Label { address, bytes, value, ticket });
@@ -112,27 +122,36 @@ impl Gate {
         self.labels.retain(|l| l.ticket > retired);
     }
 
-    /// A wait on the word of `bytes` bytes at `address`, which holds
-    /// `current` now and is met by the values `holds` accepts.
-    pub(crate) fn wait(&self, address: u64, bytes: u8, current: u64, holds: impl Fn(u64) -> bool) -> Seen {
+    /// What the word of `bytes` bytes at `address` will hold once every
+    /// label in flight is written: `None` when none touches it (the word
+    /// itself answers), the value and the ticket that writes it, or
+    /// `Err(ticket)` when it is known only once that ticket is retired.
+    pub(crate) fn foreseen(&self, address: u64, bytes: u8) -> Option<Result<(u64, u64), u64>> {
+        // A label was not kept: any word may be the one it writes.
+        if self.lost > self.retired {
+            return Some(Err(self.lost));
+        }
         // The last write in flight that touches any byte of the word
         // decides: the word's value now is about to be replaced.
         let end = address.saturating_add(u64::from(bytes));
-        let last = self
+        let l = self
             .labels
             .iter()
             .filter(|l| l.address < end && address < l.address.saturating_add(u64::from(l.bytes)))
             .fold(None, |last: Option<&Label>, l| match last {
                 Some(found) if found.ticket > l.ticket => Some(found),
                 _ => Some(l),
-            });
-        match last {
-            // The same word: its value is the write's.
-            Some(l) if l.address == address && l.bytes == bytes => match l.value {
-                Some(value) if holds(value) => Seen::After(l.ticket),
-                _ => Seen::Unknown,
-            },
-            // Part of the word, or more than it: not worked out here.
+            })?;
+        // The same word: its value is the write's. Part of the word, or
+        // more than it: not worked out here.
+        Some(l.value.filter(|_| l.address == address && l.bytes == bytes).map(|v| (v, l.ticket)).ok_or(l.ticket))
+    }
+
+    /// A wait on the word of `bytes` bytes at `address`, which holds
+    /// `current` now and is met by the values `holds` accepts.
+    pub(crate) fn wait(&self, address: u64, bytes: u8, current: u64, holds: impl Fn(u64) -> bool) -> Seen {
+        match self.foreseen(address, bytes) {
+            Some(Ok((value, ticket))) if holds(value) => Seen::After(ticket),
             Some(_) => Seen::Unknown,
             None if holds(current) => Seen::Now,
             None => Seen::Unknown,
@@ -241,5 +260,25 @@ mod tests {
         assert_eq!(gate.wait(0x3000, 8, 5, |v| v == 5), Seen::Now);
         let b = gate.submit();
         assert_eq!(gate.label(0x3010, 8, Some(1), b), Ok(()), "room again");
+    }
+
+    /// A label that found no room may write any word: nothing is answered
+    /// from the labels until its ticket is retired.
+    #[test]
+    fn a_label_not_kept_leaves_every_wait_unknown() {
+        let mut gate = Gate::new(1);
+        gate.submit_as(7);
+        assert_eq!(gate.in_flight(), 7, "numbers skipped count as sent");
+        assert_eq!(gate.label(0x1000, 4, Some(1), 7), Ok(()));
+        assert_eq!(gate.wait(0x2000, 4, 3, |v| v == 3), Seen::Now);
+        assert_eq!(gate.label(0x2000, 4, Some(4), 7), Err(Refused::Full));
+        assert_eq!(gate.wait(0x2000, 4, 3, |v| v == 3), Seen::Unknown, "it may be about to change");
+        assert_eq!(gate.wait(0x1000, 4, 0, |v| v == 1), Seen::Unknown);
+        assert_eq!(gate.foreseen(0x9000, 8), Some(Err(7)));
+        gate.retire(6);
+        assert_eq!(gate.wait(0x2000, 4, 3, |v| v == 3), Seen::Unknown, "not its ticket yet");
+        gate.retire(7);
+        assert_eq!(gate.wait(0x2000, 4, 4, |v| v == 4), Seen::Now);
+        assert_eq!(gate.foreseen(0x1000, 4), None);
     }
 }

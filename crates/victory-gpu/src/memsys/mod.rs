@@ -9,9 +9,10 @@
 //!
 //! `VICTORY_MEMSYS=1` turns the new paths on ([`on`]); the counters are
 //! kept either way, so that a run without it gives the numbers to compare
-//! with ([`frame`]).
-// The ring, queue, dirty set and gate are wired with the submissions'
-// tickets; until then only their tests use them.
+//! with ([`frame`]). Three more behaviours have a switch each that stands
+//! alone, off unless set: [`gating`], `alias::on` and `budget::on`.
+// The copy queue and the dirty set are wired with the gather; until then
+// only their tests use them, and parts of the ring and the gate.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,8 @@ pub(crate) mod dirty;
 pub(crate) mod gate;
 #[cfg(windows)]
 pub(crate) mod heaps;
+#[cfg(windows)]
+pub(crate) mod marks;
 pub(crate) mod pages;
 pub(crate) mod queue;
 pub(crate) mod ring;
@@ -54,6 +57,129 @@ fn part(name: &str, cell: &OnceLock<bool>) -> bool {
 pub(crate) fn pooling() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     part("VICTORY_MEMSYS_POOL", &ON)
+}
+
+/// Whether a behaviour with a switch of its own is on: `name` set, with
+/// or without `VICTORY_MEMSYS`. Asked once.
+fn alone(name: &str, cell: &OnceLock<bool>) -> bool {
+    *cell.get_or_init(|| {
+        let on = crate::switch::on(name);
+        tracing::info!(on, "memory system: {name}");
+        on
+    })
+}
+
+/// Tests: [`gating`] whatever the environment says.
+#[cfg(test)]
+pub(crate) static GATE_IN_TESTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether what the title may see of a submission is kept by the gate
+/// (`gate`), and its write marks are its own (`marks`):
+/// `VICTORY_MEMSYS_GATE=1`. The title's fence values wait for the ticket
+/// of the work before them; waits on labels are answered from the labels
+/// of tickets in flight; each submission's marks are taken on the GPU as
+/// it ends.
+pub(crate) fn gating() -> bool {
+    #[cfg(test)]
+    if GATE_IN_TESTS.load(Ordering::Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    alone("VICTORY_MEMSYS_GATE", &ON)
+}
+
+/// Work that shows the title something is done.
+type Shown = Box<dyn FnOnce() + Send>;
+
+/// The gate, and work held until its ticket is retired.
+struct Gated {
+    gate: gate::Gate,
+    held: Vec<(u64, Shown)>,
+}
+
+/// Labels of tickets in flight at once: a world frame writes some 70
+/// (queries, timestamps, the queues' own), in 29 submissions.
+const LABELS: usize = 4096;
+
+impl Gated {
+    fn new(labels: usize) -> Self {
+        Self { gate: gate::Gate::new(labels), held: Vec::new() }
+    }
+
+    fn sent(&mut self, ticket: u64, labels: impl Iterator<Item = (u64, Option<u64>, u8)>) {
+        self.gate.submit_as(ticket);
+        for (address, value, bytes) in labels {
+            match self.gate.label(address, bytes, value, ticket) {
+                Ok(()) => add(N::GateLabels, 1),
+                // Kept as lost by the gate: waits are not answered ahead.
+                Err(_) => add(N::GateFull, 1),
+            }
+        }
+    }
+
+    /// The work now due, in the order it came (run it without the lock).
+    fn retired(&mut self, ticket: u64) -> Vec<Shown> {
+        self.gate.retire(ticket);
+        let gate = &self.gate;
+        let (due, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held).into_iter().partition(|(t, _)| gate.visible(*t));
+        self.held = kept;
+        due.into_iter().map(|(_, work)| work).collect()
+    }
+
+    /// `then` back when it is due at once.
+    fn when_visible(&mut self, ticket: u64, then: Shown) -> Option<Shown> {
+        if self.gate.visible(ticket) {
+            return Some(then);
+        }
+        add(N::GateHeld, 1);
+        self.held.push((ticket, then));
+        None
+    }
+
+    fn foreseen(&self, address: u64, bytes: u8) -> Option<Result<u64, u64>> {
+        let seen = self.gate.foreseen(address, bytes)?;
+        add(if seen.is_ok() { N::GateAhead } else { N::GateUnknown }, 1);
+        Some(seen.map(|(value, _)| value))
+    }
+}
+
+fn gated() -> std::sync::MutexGuard<'static, Gated> {
+    static GATED: OnceLock<Mutex<Gated>> = OnceLock::new();
+    GATED.get_or_init(|| Mutex::new(Gated::new(LABELS))).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The host submission numbered `ticket` went to the GPU; it writes
+/// `labels` at the bottom of the pipe (address, the value if known ahead,
+/// 4 or 8 bytes).
+pub(crate) fn ticket_sent(ticket: u64, labels: impl Iterator<Item = (u64, Option<u64>, u8)>) {
+    gated().sent(ticket, labels);
+}
+
+/// The copy-back of every submission up to `ticket` is in title memory
+/// and its labels are written: what waited for that runs, in the order
+/// it came.
+pub(crate) fn ticket_retired(ticket: u64) {
+    let due = gated().retired(ticket);
+    for work in due {
+        work();
+    }
+}
+
+/// Runs `then`, which shows the title that the work up to the submission
+/// numbered `ticket` is done (a fence value), once that submission is
+/// retired: at once when it is.
+pub(crate) fn when_visible(ticket: u64, then: Shown) {
+    let now = gated().when_visible(ticket, then);
+    if let Some(then) = now {
+        then();
+    }
+}
+
+/// What a wait on the word at `address` reads once the labels in flight
+/// are written (`gate::Gate::foreseen`): `None` when the word itself
+/// answers, `Err` when only a retire will tell.
+pub(crate) fn foreseen(address: u64, bytes: u8) -> Option<Result<u64, u64>> {
+    gated().foreseen(address, bytes)
 }
 
 /// The last host submission sent to the GPU, and the last that has run.
@@ -188,9 +314,22 @@ pub(crate) enum N {
     DiffLost,
     /// Microseconds in the compare's list, its wait included.
     DiffUs,
+    /// The gate: labels kept for tickets in flight, labels it had no room
+    /// for, waits answered from a label in flight, waits left for a
+    /// retire to answer, fence values held until their ticket retired.
+    GateLabels,
+    GateFull,
+    GateAhead,
+    GateUnknown,
+    GateHeld,
+    /// Submissions whose write marks were taken on the GPU, the bytes
+    /// taken, and those with no room in the ring (read as before).
+    MarksSnaps,
+    MarksBytes,
+    MarksNoRoom,
 }
 
-const NS: usize = 13;
+const NS: usize = N::MarksNoRoom as usize + 1;
 /// Per class a count and bytes, then the [`N`]s.
 const TOTAL: usize = 2 * Class::COUNT + NS;
 
@@ -198,6 +337,12 @@ static COUNTS: [AtomicU64; TOTAL] = [const { AtomicU64::new(0) }; TOTAL];
 
 pub(crate) fn add(n: N, by: u64) {
     COUNTS[2 * Class::COUNT + n as usize].fetch_add(by, Ordering::Relaxed);
+}
+
+/// What was counted of `n` so far (tests).
+#[cfg(test)]
+pub(crate) fn count(n: N) -> u64 {
+    COUNTS[2 * Class::COUNT + n as usize].load(Ordering::Relaxed)
 }
 
 /// A committed buffer of `bytes` was made in `class`.
@@ -239,7 +384,8 @@ pub(crate) fn frame(frame: u64) {
          {:.2?}, BAR {:.2?}, upload {:.2?}, read-back {:.2?}, shared {:.2?}; list uploads {:.2} {:.2}, list \
          read-backs {:.2} {:.2}; pooled {:.2} {:.2}, no room in a pool {:.2}; marked pages {:.1}, compared with a twin {:.1}, \
          equal to it {:.1}, of them written to title memory all the same {:.2}, blocks of 256 bytes that differed \
-         {:.1}, in the compare {:.2} ms",
+         {:.1}, in the compare {:.2} ms; gate: labels {:.1}, not kept {:.2}, waits answered ahead {:.1}, left to a \
+         retire {:.1}, fence values held {:.2}; write marks taken for {:.1} submissions, {:.2} MiB, no room {:.2}",
         class(Class::Vram),
         class(Class::Bar),
         class(Class::Upload),
@@ -258,6 +404,14 @@ pub(crate) fn frame(frame: u64) {
         n(N::DiffLost),
         n(N::DiffBlocks),
         n(N::DiffUs) / 1e3,
+        n(N::GateLabels),
+        n(N::GateFull),
+        n(N::GateAhead),
+        n(N::GateUnknown),
+        n(N::GateHeld),
+        n(N::MarksSnaps),
+        n(N::MarksBytes) / MIB,
+        n(N::MarksNoRoom),
     );
 }
 
@@ -313,6 +467,33 @@ mod tests {
         assert_eq!(after[2 * Class::InPlace as usize + 1] - before[2 * Class::InPlace as usize + 1], 7);
         let full = 2 * Class::COUNT + N::PoolFull as usize;
         assert!(after[full] - before[full] >= 5);
-        assert_eq!(N::DiffUs as usize, NS - 1, "NS counts every N");
+        assert_eq!(N::MarksNoRoom as usize, NS - 1, "NS counts every N");
+    }
+
+    /// What shows the title that work is done runs once the work's ticket
+    /// is retired, never before, and in the order it came.
+    #[test]
+    fn work_waits_for_its_ticket_to_retire() {
+        use std::sync::mpsc::channel;
+        let mut g = Gated::new(8);
+        g.sent(2, [(0x1000, Some(5), 4), (0x2000, None, 8)].into_iter());
+        assert_eq!(g.foreseen(0x1000, 4), Some(Ok(5)));
+        assert_eq!(g.foreseen(0x2000, 8), Some(Err(2)));
+        assert_eq!(g.foreseen(0x3000, 4), None);
+        let (tx, rx) = channel();
+        let say = |name: &'static str| -> Shown {
+            let tx = tx.clone();
+            Box::new(move || tx.send(name).unwrap())
+        };
+        for (ticket, name) in [(2, "second"), (1, "first"), (2, "third")] {
+            assert!(g.when_visible(ticket, say(name)).is_none(), "held: not retired");
+        }
+        g.retired(1).into_iter().for_each(|work| work());
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), ["first"]);
+        g.retired(2).into_iter().for_each(|work| work());
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), ["second", "third"]);
+        assert_eq!(g.foreseen(0x1000, 4), None, "written: the word answers");
+        assert!(g.when_visible(2, say("late")).is_some(), "retired: at once");
+        assert!(g.retired(2).is_empty());
     }
 }

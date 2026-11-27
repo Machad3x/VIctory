@@ -645,6 +645,16 @@ impl Shadow {
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
     }
 
+    /// Whether the 64 KiB title page at `page` is marked in the
+    /// written-pages bitmap (tests).
+    #[cfg(test)]
+    pub(crate) fn mark_set_for_test(&self, page: usize, memory: bool) -> bool {
+        let (bit, _) = self.mark_entry(page as u64).expect("tracked copy with mark bits");
+        let b = bitmap(memory).expect("written-pages bitmap");
+        // SAFETY: `bit` is a valid mark bit inside the mapped bitmap.
+        unsafe { *(b.data as *const u32).add((bit / 32) as usize) & (1 << (bit % 32)) != 0 }
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     /// The offset in the copy's buffer in video memory of the title page
     /// at `page`, for a mirrored copy that holds all of the page (at a
@@ -1421,7 +1431,7 @@ impl Marks {
 /// The buffer views' written-pages bitmap: the buffer, its mapping (bits
 /// as dwords) and host GPU address.
 struct Bitmap {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -1435,8 +1445,21 @@ unsafe impl Sync for Bitmap {}
 /// The bitmap of other shaders, or (`memory`) of shaders that use title
 /// memory, whose marks go back only while it is not withheld
 /// (`crate::memory::withholding`).
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
+
+/// The written-pages bitmaps made so far (other shaders', then that of
+/// shaders using title memory): each one's buffer and the dwords of it
+/// that hold bits handed out to copies (those past them are clear).
+pub(crate) fn mark_bitmaps() -> [Option<(ID3D12Resource, usize)>; 2] {
+    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let used = (marks().end as usize).div_ceil(32).min(words);
+    [false, true].map(|memory| {
+        let made = BITMAPS[usize::from(memory)].get()?.as_ref()?;
+        Some((made.buffer.clone(), used))
+    })
+}
+
 fn bitmap(memory: bool) -> Option<&'static Bitmap> {
-    static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index.
@@ -1449,7 +1472,7 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
             Some(Bitmap {
-                _buffer: buffer,
+                buffer,
                 data: data as usize,
                 gpu,
             })
@@ -1625,9 +1648,33 @@ fn for_each_by_page(mut pages: Vec<(Arc<Shadow>, usize)>, f: impl Fn(&Arc<Shadow
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+#[cfg(test)]
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    copy_back_marks_of(withheld, memory_withheld, None);
+}
+
+/// [`copy_back_marks`] of the marks in `taken`: those the submission's
+/// shaders left, taken on the GPU when it ended (`crate::memsys::marks`),
+/// which cleared the bitmaps there. None: read from the bitmaps and
+/// cleared here.
+pub(crate) fn copy_back_marks_of(
+    withheld: &[(Arc<Shadow>, usize, usize)],
+    memory_withheld: bool,
+    taken: Option<&crate::memsys::marks::Snap>,
+) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
+        if let Some(taken) = taken {
+            let into = if memory && memory_withheld { &mut held } else { &mut marked };
+            for (w, &word) in taken.words(memory).iter().enumerate().filter(|(_, word)| **word != 0) {
+                let mut x = word;
+                while x != 0 {
+                    into.push((w * 32) as u32 + x.trailing_zeros());
+                    x &= x - 1;
+                }
+            }
+            continue;
+        }
         let Some(b) = bitmap(memory) else {
             continue;
         };
@@ -3857,7 +3904,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         unsafe { data.cast::<u32>().write_unaligned(1u32 << (slot % 32)) };
         let offset = u64::from(victory_shader::emit::VIEW_READS / 8) + u64::from(slot / 32) * 4;
         // SAFETY: an open list, live buffers, 4 bytes inside both.
-        unsafe { list.list.CopyBufferRegion(&b._buffer, offset, &src, 0, 4) };
+        unsafe { list.list.CopyBufferRegion(&b.buffer, offset, &src, 0, 4) };
         list.keep(&src);
     }
 

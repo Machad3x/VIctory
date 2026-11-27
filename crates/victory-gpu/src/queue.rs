@@ -235,6 +235,13 @@ fn pump(held: &mut Holding, why: Why) {
     }
     let _pumping = Pumping(PUMPING.replace(true));
     let read = |address: u64, bytes: u8| {
+        // The gate's labels of tickets in flight (`VICTORY_MEMSYS_GATE`).
+        if crate::memsys::gating() {
+            return match crate::memsys::foreseen(address, bytes) {
+                Some(Ok(value)) => Some(value),
+                _ => read_value(address, bytes),
+            };
+        }
         if !predicting() {
             return read_value(address, bytes);
         }
@@ -243,7 +250,12 @@ fn pump(held: &mut Holding, why: Why) {
     // Another thread may be between submit and retire: a write of its not
     // known ahead keeps the wait held until it settles (the timer tests
     // again).
-    let unsettled = |address: u64, bytes: u8| predicting() && pending().unsettled(address, bytes);
+    let unsettled = |address: u64, bytes: u8| {
+        if crate::memsys::gating() {
+            return matches!(crate::memsys::foreseen(address, bytes), Some(Err(_)));
+        }
+        predicting() && pending().unsettled(address, bytes)
+    };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
@@ -275,9 +287,20 @@ fn pump(held: &mut Holding, why: Why) {
         ran += at.elapsed();
     };
     let mut signal = |f: usize, value: u64| {
+        // The work before it went to the host under this number at most.
+        let ticket = crate::memsys::sent();
         after_retired(move || {
-            crate::fence::set(f as This, value);
-            crate::fence::let_go(f as This);
+            let show = move || {
+                crate::fence::set(f as This, value);
+                crate::fence::let_go(f as This);
+            };
+            // The gate shows it only once that submission's copy-back is
+            // in title memory, whatever is in flight by then.
+            if crate::memsys::gating() {
+                crate::memsys::when_visible(ticket, Box::new(show));
+            } else {
+                show();
+            }
         });
     };
     let pumped = held.pump(&mut crate::hold::World {
@@ -366,24 +389,35 @@ fn pending() -> std::sync::MutexGuard<'static, crate::hold::Pending> {
 /// writes (address, what, bytes) are pending until it is retired.
 #[cfg(windows)]
 pub(crate) fn labels_sent(ticket: u64, writes: impl Iterator<Item = (usize, Written, usize)>) {
-    if !predicting() {
-        return;
-    }
-    let mut pending = pending();
-    for (at, what, bytes) in writes {
+    // Address, the value if known ahead, bytes: `Written::write` stores 4
+    // bytes or 8.
+    let label = |(at, what, bytes): (usize, Written, usize)| {
         let value = match what {
             Written::Value(v) => Some(v),
             _ => None,
         };
-        // `Written::write` stores 4 bytes or 8.
-        pending.sent(ticket, at as u64, value, if bytes == 4 { 4 } else { 8 });
+        (at as u64, value, if bytes == 4 { 4 } else { 8 })
+    };
+    if crate::memsys::gating() {
+        crate::memsys::ticket_sent(ticket, writes.map(label));
+        return;
+    }
+    if !predicting() {
+        return;
+    }
+    let mut pending = pending();
+    for (at, value, bytes) in writes.map(label) {
+        pending.sent(ticket, at, value, bytes);
     }
 }
 
 /// A host submission settled: its writes are in memory.
 #[cfg(windows)]
 pub(crate) fn labels_retired(ticket: u64) {
-    if predicting() {
+    if crate::memsys::gating() {
+        // Fence values held for it are shown here, after its writes.
+        crate::memsys::ticket_retired(ticket);
+    } else if predicting() {
         pending().retired(ticket);
     }
 }
