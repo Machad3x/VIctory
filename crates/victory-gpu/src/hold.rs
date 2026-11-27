@@ -120,6 +120,8 @@ pub(crate) struct World<'a, S> {
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// A fence Wait is over: its fence is no longer read.
+    pub(crate) waited: &'a mut dyn FnMut(usize),
 }
 
 impl<S> Held<S> {
@@ -213,7 +215,8 @@ impl<S> Held<S> {
                             done.segments += 1;
                         }
                         Some(Item::Signal(fence, value)) => (w.signal)(fence, value),
-                        Some(Item::FenceWait(..)) | None => {}
+                        Some(Item::FenceWait(fence, _)) => (w.waited)(fence),
+                        None => {}
                     }
                 }
                 if !piece.is_empty() {
@@ -368,7 +371,7 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, unsettled: &|_, _| false })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, waited: &mut |_| {}, unsettled: &|_, _| false })
     }
 
     #[test]
@@ -620,7 +623,7 @@ mod tests {
             let fence = |_: usize| 0u64;
             let mut run = |_: usize, s: Vec<&'static str>| ran.borrow_mut().extend(s);
             let mut signal = |_: usize, _: u64| {};
-            held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, unsettled: &unsettled })
+            held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, waited: &mut |_| {}, unsettled: &unsettled })
         };
         pending.borrow_mut().sent(1, 0x100, Some(7), 8);
         go(&mut held);

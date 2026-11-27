@@ -319,22 +319,36 @@ fn pump(held: &mut Holding, why: Why) {
             let n = segments.iter().position(|s| s.2 != only_writes).unwrap_or(segments.len());
             let rest = segments.split_off(n);
             let group = std::mem::replace(&mut segments, rest);
-            if only_writes {
-                after_retired(move || {
-                    group.iter().for_each(|(list, ..)| list.write_labels());
-                    finish(group);
-                });
-                continue;
-            }
+            let lists: Vec<std::sync::Arc<crate::host::HostList>> = if only_writes {
+                // The writes ride an empty host list of ours: settled,
+                // gated and predicted as any submission's.
+                let labels = group.iter().flat_map(|(list, ..)| list.labels());
+                match host.new_list() {
+                    Ok(carrier) => {
+                        labels.for_each(|(at, what, bytes)| carrier.defer_write(at as *mut u8, what, bytes));
+                        carrier.close();
+                        vec![std::sync::Arc::new(carrier)]
+                    }
+                    Err(_) => {
+                        let labels: Vec<_> = labels.collect();
+                        after_retired(move || {
+                            labels.into_iter().for_each(|(at, what, bytes)| what.write(at as *mut u8, bytes));
+                            finish(group);
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                group.iter().map(|(s, ..)| s.clone()).collect()
+            };
             #[cfg(feature = "diagnostics")]
             crate::copystat::TITLE.set(true);
             if crate::host::pipelining() {
-                let lists = group.iter().map(|(s, ..)| s.clone()).collect();
                 host.execute_later(lists, Box::new(move || finish(group)));
             } else {
-                let lists: Vec<&crate::host::HostList> = group.iter().map(|(s, ..)| &**s).collect();
-                host.execute(&lists);
-                drop(lists);
+                let runs: Vec<&crate::host::HostList> = lists.iter().map(|s| &**s).collect();
+                host.execute(&runs);
+                drop(runs);
                 after_retired(move || finish(group));
             }
         }
@@ -346,6 +360,7 @@ fn pump(held: &mut Holding, why: Why) {
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
+        waited: &mut |f| crate::fence::let_go(f as This),
         unsettled: &unsettled,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
@@ -635,10 +650,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     S_OK
 }
-/// The queue's later work waits until the fence reaches `value`.
-///
-/// shortcut: the fence is not kept alive while the queue waits for it;
-/// The title makes no queue wait for a fence.
+/// The queue's later work waits until the fence reaches `value`; the fence
+/// is kept alive while it does (its value is read until then).
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
@@ -646,6 +659,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
         let mut held = held();
+        crate::fence::keep(fence);
         held.push(this as usize, Item::FenceWait(fence as usize, value));
         pump(&mut held, Why::Wait);
     }
@@ -1116,6 +1130,30 @@ mod tests {
             7
         );
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A queue waiting on a fence keeps it: the title may release it
+    /// first, and the wait still reads its value until it is over.
+    #[cfg(windows)]
+    #[test]
+    fn a_fence_a_queue_waits_on_lives_until_the_wait_is_over() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 2, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(wait(q, fence, 5), S_OK);
+        assert!(held().holds_work(q as usize));
+        assert_eq!(release(fence), 1, "the queue's reference is left");
+        crate::fence::set(fence, 5);
+        pump_held(Why::Fence);
+        assert!(!held().holds_work(q as usize), "the wait is over: the fence is let go");
+        assert_eq!(release(q), 0);
     }
 
     /// The title's compute queue: `{COMPUTE, 0, pipe 1, queue 0}`.

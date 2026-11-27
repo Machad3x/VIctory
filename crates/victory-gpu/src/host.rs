@@ -3326,13 +3326,14 @@ impl HostList {
     }
 
     /// Its bottom-of-pipe writes alone, for a list whose commands do not
-    /// run (`crate::queue`, a list that lost its slots).
-    pub(crate) fn write_labels(&self) {
-        for &(at, what, bytes) in &self.deferred().writes {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::label_written(at, &what);
-            what.write(at as *mut u8, bytes);
-        }
+    /// run (`crate::queue`, a list that lost its slots): a query result
+    /// is not resolved, so it is the visible one, as when not waited for.
+    pub(crate) fn labels(&self) -> Vec<(usize, crate::queue::Written, usize)> {
+        let unresolved = |what| match what {
+            crate::queue::Written::HostValue(_) => crate::queue::Written::Value(1 << 20),
+            what => what,
+        };
+        self.deferred().writes.iter().map(|&(at, what, bytes)| (at, unresolved(what), bytes)).collect()
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
