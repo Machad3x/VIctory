@@ -1885,6 +1885,8 @@ impl Host {
         batch.flush();
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
+        crate::copystat::flight_prepared();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics, timing off: a timestamp before and after the lists.
         #[cfg(feature = "diagnostics")]

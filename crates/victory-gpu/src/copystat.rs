@@ -299,13 +299,16 @@ static FLIGHT_PRESENTED: AtomicU64 = AtomicU64::new(0);
 /// and merged, and the host copies it wrote (sorted); only set under the
 /// host's submission lock.
 static FLIGHT_WRITES: Mutex<(Vec<(usize, usize)>, Vec<usize>)> = Mutex::new((Vec::new(), Vec::new()));
-/// Whether the submission being prepared is the title's.
+/// Whether a title submission is being prepared: set at its start, unset
+/// once its lists are made ([`flight_prepared`]), so heap syncs elsewhere
+/// (tests, our own submissions) are not counted.
 static FLIGHT_TITLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A heap page synced for this submission was written by the one before.
 static FLIGHT_HEAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// What last wrote each bottom-of-pipe word: 0 a value, 1 a query result,
-/// 2 a timestamp.
-static LABELS: Mutex<Option<HashMap<u64, u8>>> = Mutex::new(None);
+/// What last wrote each bottom-of-pipe word (0 a value, 1 a query result,
+/// 2 a timestamp) and the frame it did; words not written for two frames
+/// are dropped at each line.
+static LABELS: Mutex<Option<HashMap<u64, (u8, u64)>>> = Mutex::new(None);
 
 /// Why a title submission would drain the one before (fence, sync
 /// executes, present); `None` for our own executes.
@@ -345,6 +348,11 @@ pub(crate) fn flight_writes(flight: &Option<Flight>) -> (Vec<(usize, usize)>, Ve
     FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// A submission's lists are made: heap syncs after are not its own.
+pub(crate) fn flight_prepared() {
+    FLIGHT_TITLE.store(false, Relaxed);
+}
+
 /// A heap page a title submission's sync takes: counted if the submission
 /// before declared it written.
 pub(crate) fn heap_page(at: usize, len: usize) {
@@ -361,13 +369,14 @@ pub(crate) fn label_written(at: usize, what: &crate::queue::Written) {
         crate::queue::Written::HostValue(_) => 1,
         crate::queue::Written::GpuTimestamp | crate::queue::Written::SystemTimestamp => 2,
     };
-    LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(at as u64, kind);
+    let frame = crate::queue::presented();
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(at as u64, (kind, frame));
 }
 
 /// A queue's memory value wait at its first test, counted by what last
 /// wrote its word.
 pub(crate) fn wait_source(address: u64) {
-    let kind = LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&address).copied());
+    let kind = LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&address).map(|w| w.0));
     add(
         match kind {
             Some(0) => C::WaitsValue,
@@ -549,6 +558,10 @@ pub(crate) fn page_faults() -> u64 {
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
+    let now = crate::queue::presented();
+    if let Some(labels) = LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        labels.retain(|_, w| w.1 + 2 >= now);
+    }
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
