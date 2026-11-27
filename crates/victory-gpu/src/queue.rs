@@ -226,7 +226,14 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    let read = |address: u64, bytes: u8| {
+        if !predicting() {
+            return read_value(address, bytes);
+        }
+        // shortcut: tickets are retired inline, so an unknown pending write
+        // is in memory already; an async retire must settle it here first.
+        pending().read(address, bytes, &read_value, &|_: u64| {})
+    };
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
@@ -281,6 +288,46 @@ fn pump(held: &mut Holding, why: Why) {
             pump_held_if_free(Why::Timer);
         });
     });
+}
+
+/// Whether queue waits read what sent, unsettled submissions will write
+/// (`VICTORY_PREDICT_LABELS`, off by default).
+#[cfg(windows)]
+fn predicting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PREDICT_LABELS"))
+}
+
+#[cfg(windows)]
+fn pending() -> std::sync::MutexGuard<'static, crate::hold::Pending> {
+    static PENDING: std::sync::Mutex<crate::hold::Pending> = std::sync::Mutex::new(crate::hold::Pending::new());
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A host submission sent (`ticket`, its fence value): its bottom-of-pipe
+/// writes (address, what, bytes) are pending until it is retired.
+#[cfg(windows)]
+pub(crate) fn labels_sent(ticket: u64, writes: impl Iterator<Item = (usize, Written, usize)>) {
+    if !predicting() {
+        return;
+    }
+    let mut pending = pending();
+    for (at, what, bytes) in writes {
+        let value = match what {
+            Written::Value(v) => Some(v),
+            _ => None,
+        };
+        // `Written::write` stores 4 bytes or 8.
+        pending.sent(ticket, at as u64, value, if bytes == 4 { 4 } else { 8 });
+    }
+}
+
+/// A host submission settled: its writes are in memory.
+#[cfg(windows)]
+pub(crate) fn labels_retired(ticket: u64) {
+    if predicting() {
+        pending().retired(ticket);
+    }
 }
 
 /// The value a wait tests (4 or 8 bytes), if the memory can be read.

@@ -1891,6 +1891,8 @@ impl Host {
                 break;
             }
         }
+        // Pending until retired, for queue waits to read ahead.
+        crate::queue::labels_sent(*t.submitted, t.runs.iter().flat_map(|l| l.deferred().writes.clone()));
         t
     }
 
@@ -2195,6 +2197,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        crate::queue::labels_retired(*submitted);
         #[cfg(feature = "diagnostics")]
         if let Some(f) = t.flight {
             let sent = t.sent.unwrap_or(waited_at);
