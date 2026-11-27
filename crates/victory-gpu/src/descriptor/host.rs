@@ -69,6 +69,24 @@ pub(crate) struct HostHeap {
     /// View heaps: the title slots by the record they hold ([`Canon`]),
     /// where something reads it; taken inside `made`, never the other way.
     canon: Option<Mutex<Canon>>,
+    /// `VICTORY_DESC_CACHE`: a CPU-only heap of the same slots, where title
+    /// slots are made and copied from (the source of a descriptor copy
+    /// cannot be a shader-visible heap), and its first slot's address.
+    twins: Option<(ID3D12DescriptorHeap, usize)>,
+}
+
+/// Whether view heaps copy a slot's descriptor from another slot made from
+/// the same record instead of making it again (`VICTORY_DESC_CACHE=1`;
+/// off by default).
+pub(crate) fn desc_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_DESC_CACHE");
+        if on {
+            tracing::info!("view slots of one record copy its descriptor (VICTORY_DESC_CACHE)");
+        }
+        on
+    })
 }
 
 /// Title slots of a view heap by the record (view entry and generation)
@@ -204,6 +222,12 @@ fn view_layout(title: u32, views: u32) -> (u32, u32) {
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        Self::with(sampler, count, desc_cache())
+    }
+
+    /// [`HostHeap::new`], copying descriptors between slots of one record
+    /// if `cache` ([`desc_cache`]).
+    fn with(sampler: bool, count: u32, cache: bool) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -270,6 +294,23 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        let twins = (cache && !sampler)
+            .then(|| {
+                // SAFETY: plain heap creation.
+                let twins: ID3D12DescriptorHeap = unsafe {
+                    host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: total,
+                        ..Default::default()
+                    })
+                }
+                .inspect_err(|e| tracing::warn!(error = %e, "no CPU-only twin of the view heap: descriptors are made, not copied"))
+                .ok()?;
+                // SAFETY: a live heap.
+                let base = unsafe { twins.GetCPUDescriptorHandleForHeapStart() }.ptr;
+                Some((twins, base))
+            })
+            .flatten();
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -297,7 +338,8 @@ impl HostHeap {
             viewed: Default::default(),
             #[cfg(feature = "diagnostics")]
             stale_seen: Default::default(),
-            canon: (!sampler && cfg!(feature = "diagnostics")).then(Default::default),
+            canon: (!sampler && (cfg!(feature = "diagnostics") || twins.is_some())).then(Default::default),
+            twins,
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -803,6 +845,51 @@ impl HostHeap {
         }
     }
 
+    /// [`make_marked`] of `view` at title slot `index`, which holds record
+    /// `key` (`made`: every slot's). With twins ([`desc_cache`]), a copy of
+    /// the descriptor of another slot made from the record, where that slot
+    /// views what this one would now (the copy a buffer view shows, or a
+    /// texture not given up; not a placed texture, which a later view may
+    /// upgrade); else made in the twin and copied from there, for the next
+    /// slot of the record to copy.
+    fn make_slot(&self, made: &[u64], canon: Option<&Canon>, index: u32, key: u64, view: &View) -> (Option<Kept>, Option<(u32, u32)>, u32) {
+        let (Some((_, base)), Some(host)) = (&self.twins, host()) else {
+            return make_marked(view, self.cpu(index));
+        };
+        let twin = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: base + i as usize * self.step as usize,
+        };
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        let from = canon
+            .and_then(|canon| Some((canon.other(made, index, key)?, *canon.keys.get(&key)?)))
+            .filter(|_| !is_placed_texture(view));
+        if let Some((c, entry)) = from {
+            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[c as usize].clone();
+            let buffer = buffer_range(view).is_some() || matches!(view, View::Constant(..));
+            if let Some((res, copy)) = held
+                && (!buffer
+                    || shown_copy(view).is_some_and(|s| {
+                        windows::core::Interface::as_raw(&s.buffer) == windows::core::Interface::as_raw(&res)
+                    }))
+            {
+                // SAFETY: slots of our heaps, copied from the CPU-only one.
+                unsafe {
+                    host.device.CopyDescriptorsSimple(1, twin(index), twin(c), kind);
+                    host.device.CopyDescriptorsSimple(1, self.cpu(index), twin(c), kind);
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::DescCopied, 1);
+                return (Some(Some((res, copy))), entry.mark, entry.skip);
+            }
+        }
+        let made = make_marked(view, twin(index));
+        if made.0.is_some() {
+            // SAFETY: as above.
+            unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(index), twin(index), kind) };
+        }
+        made
+    }
+
     /// A heap sync of slots `first..last`, whose records are at `start` +
     /// index × `step`: [`HostHeap::mirror`] of each slot whose record
     /// differs from what the slot holds, the rest passed by as `mirror`
@@ -1107,7 +1194,7 @@ impl HostHeap {
             let (kept, mark, skip) = if later {
                 (None, None, 0)
             } else {
-                make_marked(&view, self.cpu(index))
+                self.make_slot(&made, canon.as_deref(), index, key, &view)
             };
             #[cfg(feature = "diagnostics")]
             {
@@ -3214,6 +3301,72 @@ mod tests {
         assert!(host.made(0) && !host.made(1));
         // SAFETY: the range reserved above.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A buffer view of `start` (a title buffer of 512 bytes registered as
+    /// `id`) written at `handle`, and the record copied to the next `n - 1`
+    /// slots after it as bytes, as the title copies descriptors.
+    fn records_of_one_view(id: usize, start: u64, handle: u64, n: u64) {
+        let mut resource = [0; 14];
+        (resource[0], resource[4]) = (1, 64); // a 64-byte buffer
+        let mut desc = [0; 16];
+        // R32_UINT, a buffer, the default component mapping, 16 elements.
+        (desc[0], desc[1], desc[2]) = (DXGI_FORMAT_R32_UINT.0 as u32, 1, 0x1688);
+        desc[6] = 16;
+        (desc[10], desc[11]) = (start as u32, (start >> 32) as u32);
+        crate::shadow::register(id, start, 512);
+        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &desc, handle);
+        for k in 1..n {
+            // SAFETY: slots of the caller's records, 32 bytes each.
+            unsafe { std::ptr::copy_nonoverlapping(handle as *const u8, (handle + 32 * k) as *mut u8, 32) };
+        }
+    }
+
+    /// The host resource slot `slot` of `heap` holds, if any.
+    fn held(heap: &HostHeap, slot: u32) -> Option<*mut std::ffi::c_void> {
+        heap.kept.lock().unwrap()[slot as usize]
+            .as_ref()
+            .map(|(r, _)| windows::core::Interface::as_raw(r))
+    }
+
+    /// With twins (`VICTORY_DESC_CACHE`), a slot holding a record another
+    /// slot was made from takes that slot's descriptor and resource; once
+    /// that slot holds another record, the next slot of the record is made.
+    #[test]
+    fn slots_of_one_record_copy_its_descriptor() {
+        let Some(_) = host() else { return };
+        #[repr(align(256))]
+        struct Aligned([u8; 512]);
+        static DATA: Aligned = Aligned([0; 512]);
+        let start = DATA.0.as_ptr() as u64;
+        let Some(heap) = HostHeap::with(false, 4, true) else { return };
+        assert!(heap.twins.is_some());
+        let mut records = [0u64; 16];
+        let handle = records.as_mut_ptr() as u64;
+        records_of_one_view(0xD1, start, handle, 3);
+        heap.mirror(0, handle, true).unwrap();
+        heap.mirror(1, handle + 32, true).unwrap();
+        assert!(held(&heap, 0).is_some());
+        assert_eq!(held(&heap, 0), held(&heap, 1), "the copy views the same buffer");
+        {
+            let canon = heap.canon.as_ref().unwrap().lock().unwrap();
+            assert_eq!(canon.keys.len(), 1);
+            let entry = canon.keys.values().next().unwrap();
+            assert_eq!((entry.slot, entry.holders), (0, 2));
+        }
+        // Slot 0 rewritten with no view: slot 1 keeps its own.
+        records[..4].fill(0);
+        assert!(heap.mirror(0, handle, false).is_none());
+        assert!(held(&heap, 0).is_none() && held(&heap, 1).is_some());
+        {
+            let canon = heap.canon.as_ref().unwrap().lock().unwrap();
+            let entry = canon.keys.values().next().unwrap();
+            assert_eq!((entry.slot, entry.holders), (NONE, 1), "no slot to copy from");
+        }
+        heap.mirror(2, handle + 64, true).unwrap();
+        assert_eq!(held(&heap, 2), held(&heap, 1));
+        assert_eq!(heap.canon.as_ref().unwrap().lock().unwrap().keys.values().next().unwrap().slot, 2);
+        crate::shadow::unregister(0xD1, start);
     }
 
     /// The world's 16-byte view of 0 elements removed the device.
