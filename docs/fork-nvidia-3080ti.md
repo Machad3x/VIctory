@@ -1431,7 +1431,16 @@ private memory has an opening thread of its own, and only a private run
 going asks private memory again. A frame line says where the opening
 threads' time goes (checking, opening, cutting asks, per kind). Expected:
 the 500 ms a frame waited goes to about what new private memory takes to
-open (none in a steady scene). Not run yet.
+open (none in a steady scene). `gpu320` (ab05b2f5): alive 252 s, 500 to
+660 ms a frame (from 1,000 to 1,460), the opening wait 0 ms.
+
+Review of 477dbdc1 and ab05b2f5: a wait for a retire not waited for that
+runs out now changes nothing (no table rewritten, no run dropped; the
+title's change is refused at its deadline) and is remembered, so later
+calls do not wait again; it runs before the tables' locks; one deadline
+covers all of a change's holders; the budget is reserved with its check
+across the two opening threads, and an open refused for it is asked again
+when a run of either kind goes.
 Still open: a list's first miss of memory no table knew of stores in place;
 a retire whose fence wait could not be set leaves the next table writable.
 

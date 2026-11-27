@@ -322,21 +322,46 @@ pub(crate) fn unwaited_running() -> bool {
 /// Before page tables, their view pairs or what they name in place change
 /// (`crate::memory`: a rewrite, a load-only flip, a drop of runs): a
 /// submission retired without waiting for its fence (its wait could not be
-/// set) may still read them, so the GPU is waited for to pass it, polled.
-/// A GPU that never does is said after 10 s and passed by (it faulted or
-/// hung: nothing it still reads is used again).
-pub(crate) fn wait_unwaited() {
-    if !unwaited_running() {
-        return;
+/// set) may still read them, so the GPU is waited for to pass it, polled,
+/// for `limit` at most. False if it has not: the caller changes nothing (a
+/// GPU still reading memory must not lose it). A wait that ran out is
+/// remembered for that submission: later calls answer false at once, until
+/// the GPU passes it.
+pub(crate) fn wait_unwaited(limit: std::time::Duration) -> bool {
+    wait_unwaited_by(limit, unwaited_running, &GAVE_UP, || UNWAITED.load(Ordering::Relaxed))
+}
+
+/// The fence value a [`wait_unwaited`] ran out on.
+static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`wait_unwaited`] with `running` (whether the GPU has not passed it yet),
+/// `gave_up`, and `upto` (the submission's fence value).
+fn wait_unwaited_by(
+    limit: std::time::Duration,
+    running: impl Fn() -> bool,
+    gave_up: &std::sync::atomic::AtomicU64,
+    upto: impl Fn() -> u64,
+) -> bool {
+    if !running() {
+        return true;
+    }
+    let value = upto();
+    if gave_up.load(Ordering::Relaxed) == value {
+        return false;
     }
     let started = std::time::Instant::now();
-    while unwaited_running() {
-        if started.elapsed() > std::time::Duration::from_secs(10) {
-            tracing::error!("a submission retired without waiting is still on the GPU after 10 s: page tables change all the same");
-            return;
+    while running() {
+        if started.elapsed() >= limit {
+            gave_up.store(value, Ordering::Relaxed);
+            tracing::error!(
+                value,
+                "a submission retired without waiting is still on the GPU: page tables and the memory they name in place are kept as they are"
+            );
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    true
 }
 
 thread_local! {
@@ -347,6 +372,29 @@ thread_local! {
 /// wait for a submission (the drops it does are ones submissions hand it).
 pub(crate) fn on_release_thread() -> bool {
     RELEASE_THREAD.get()
+}
+
+#[cfg(test)]
+mod unwaited_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    /// A GPU that does not pass a submission retired without waiting: the
+    /// wait runs out once and is said false; later calls answer false at
+    /// once, until the GPU passes it.
+    #[test]
+    fn a_wait_that_ran_out_is_remembered() {
+        let gave_up = AtomicU64::new(0);
+        let started = std::time::Instant::now();
+        assert!(!super::wait_unwaited_by(Duration::from_millis(20), || true, &gave_up, || 7));
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(gave_up.load(Ordering::Relaxed), 7);
+        let again = std::time::Instant::now();
+        assert!(!super::wait_unwaited_by(Duration::from_secs(5), || true, &gave_up, || 7), "at once");
+        assert!(again.elapsed() < Duration::from_millis(5));
+        assert!(super::wait_unwaited_by(Duration::from_secs(5), || false, &gave_up, || 7), "passed");
+        assert!(!super::wait_unwaited_by(Duration::ZERO, || true, &gave_up, || 8), "another one waits");
+    }
 }
 
 /// Whether this is the retire thread: work it waits for runs after it.

@@ -940,10 +940,14 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     let Some(host) = crate::host::host() else {
         return true;
     };
+    // One deadline for this change, all its holders' releases together
+    // ([`drop_deadline`]), the waits for a retire not waited for included.
+    let until = DEADLINE.get().unwrap_or_else(|| std::time::Instant::now() + DROP_MOST);
+    let left = || until.saturating_duration_since(std::time::Instant::now());
     let started = std::time::Instant::now();
     // What lists ran with is dropped on this thread, the title's: the runs'
     // heaps go before its change is tried.
-    if !named() || host.between_submissions(|| drop(drop_runs_taking(dead))).is_some() {
+    if !named() || host.between_submissions(|| drop_runs_taking(dead, left()).map(drop)).flatten().is_some() {
         return true;
     }
     // A submission, or the retire thread (its later work runs after it, the
@@ -964,7 +968,7 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
             return true;
         }
         // No submission came to serve it: nothing runs now, maybe.
-        if host.between_submissions(serve_drops).is_some()
+        if host.between_submissions(|| serve_drops_within(left())).is_some()
             && let Ok(ran) = rx.try_recv()
         {
             drop(ran);
@@ -974,7 +978,7 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
             said = true;
             tracing::warn!(?dead, "a title change waits for the page tables to drop runs over its memory for more than 2 s");
         }
-        if started.elapsed() > DROP_MOST {
+        if left().is_zero() {
             tracing::error!(?dead, "page tables did not drop runs over title memory in 20 s: the title's change is refused");
             return false;
         }
@@ -989,6 +993,26 @@ const SLOW_DROP: std::time::Duration = std::time::Duration::from_secs(2);
 /// watchdog with room for the rest of its frame.
 const DROP_MOST: std::time::Duration = std::time::Duration::from_secs(20);
 
+thread_local! {
+    /// The deadline of the title change this thread is making, for all its
+    /// holders' releases ([`drop_deadline`]).
+    static DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `release` (`crate::pinned`'s releases of a change's holders) with
+/// one deadline of [`DROP_MOST`] for all the drops they wait for: one each
+/// made the waits add up (k holders, k times 20 s).
+pub(crate) fn drop_deadline<R>(release: impl FnOnce() -> R) -> R {
+    let outer = DEADLINE.replace(Some(std::time::Instant::now() + DROP_MOST));
+    let r = release();
+    DEADLINE.set(outer);
+    r
+}
+
+/// How long the waits for a retire not waited for may take when nothing
+/// else bounds them (a retire's or a submission's serving).
+const UNWAITED_MOST: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What lists last ran with, as taken from [`RAN`].
 type Ran = fx::Map<usize, Arc<Layout>>;
 
@@ -1001,12 +1025,23 @@ static DROPS: Mutex<Asked> = Mutex::new(Vec::new());
 /// it what the lists ran with to drop on its own thread (the runs' heaps go
 /// with it, not on this one).
 pub(crate) fn serve_drops() {
-    let asked = std::mem::take(&mut *DROPS.lock().unwrap_or_else(|e| e.into_inner()));
-    if asked.is_empty() {
+    serve_drops_within(UNWAITED_MOST);
+}
+
+/// [`serve_drops`], waiting `limit` at most for a retire not waited for:
+/// past it nothing is dropped, and what was asked stays asked.
+fn serve_drops_within(limit: std::time::Duration) {
+    let mut drops = DROPS.lock().unwrap_or_else(|e| e.into_inner());
+    if drops.is_empty() {
         return;
     }
-    let dead: Vec<u64> = asked.iter().flat_map(|(d, _)| d.iter().copied()).collect();
-    let mut ran = Some(drop_runs_taking(&dead));
+    let dead: Vec<u64> = drops.iter().flat_map(|(d, _)| d.iter().copied()).collect();
+    let Some(taken) = drop_runs_taking(&dead, limit) else {
+        return;
+    };
+    let asked = std::mem::take(&mut *drops);
+    drop(drops);
+    let mut ran = Some(taken);
     for (_, waiting) in asked {
         if let Err(left) = waiting.send(ran.take().unwrap_or_default()) {
             // Gone (past its wait): released off this thread.
@@ -1055,25 +1090,30 @@ pub(crate) fn drop_dead_runs_put_off() {
 /// [`Shared::drop_runs`] for every table; with no submission running.
 fn drop_runs_now(dead: &[u64]) {
     // Released off this thread: a layout may hold copies' last references.
-    let ran = drop_runs_taking(dead);
-    if !ran.is_empty() {
-        crate::host::release_later(Box::new(ran));
+    match drop_runs_taking(dead, UNWAITED_MOST) {
+        Some(ran) if !ran.is_empty() => crate::host::release_later(Box::new(ran)),
+        Some(_) => {}
+        // Kept: the next submission tries again.
+        None => DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed),
     }
 }
 
-/// [`drop_runs_now`], what lists ran with given back to be dropped.
-fn drop_runs_taking(dead: &[u64]) -> Ran {
+/// [`drop_runs_now`], what lists ran with given back to be dropped; None,
+/// nothing dropped, if a retire not waited for may still read what the runs
+/// hold after `limit` (the memory is not given back under the GPU).
+fn drop_runs_taking(dead: &[u64], limit: std::time::Duration) -> Option<Ran> {
     if dead.is_empty() {
-        return Ran::default();
+        return Some(Ran::default());
     }
-    // A retire not waited for may still read what the runs hold: the
-    // memory is not given back under it.
-    crate::host::wait_unwaited();
+    if !crate::host::wait_unwaited(limit) {
+        DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
     for (_, s) in shared().iter_mut() {
         s.drop_runs(dead);
     }
     // What lists ran with: all of them ran.
-    with_ran(std::mem::take)
+    Some(with_ran(std::mem::take))
 }
 
 /// The layout each view heap's lists last ran with ([`prepare`]): what
@@ -1413,6 +1453,10 @@ fn layout(key: usize) -> Arc<Layout> {
 /// brought up to date (`add` takes a copy's range, once per submission
 /// until a step writes title memory).
 pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    // What the GPU still reads of a retire not waited for is not changed
+    // under it: waited for here, before the heaps' and tables' locks, which
+    // title threads wait for; checked again under them.
+    crate::host::wait_unwaited(UNWAITED_MOST);
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
@@ -1424,10 +1468,10 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         // Load-only while memory is opened or a miss withholds, and
         // writable again once neither holds: the runs' pairs alone.
         let flip = crate::inplace::backstop() && s.load_only != crate::inplace::table_load_only();
-        if stale || flip {
-            // What the GPU still reads of a retire not waited for is not
-            // changed under it.
-            crate::host::wait_unwaited();
+        if (stale || flip) && crate::host::unwaited_running() {
+            // Kept as it is: the GPU may still read it (the wait above ran
+            // out). Changed by a later submission's prepare.
+            return Some(s.layout.clone());
         }
         if stale {
             s.rewrite(heap, now);

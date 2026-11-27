@@ -337,7 +337,9 @@ fn release(at: usize, len: usize) -> usize {
     };
     let n = released.len();
     let ids: Vec<u64> = released.iter().map(|(id, _)| *id).collect();
-    let failed = released.into_iter().map(|(_, release)| !release()).filter(|&f| f).count();
+    // One deadline for all of them (each would wait its own 20 s for the
+    // tables otherwise): past it, those left refuse at once.
+    let failed = crate::memory::drop_deadline(|| released.into_iter().map(|(_, release)| !release()).filter(|&f| f).count());
     FAILED.set(FAILED.get() + failed);
     if failed > 0 {
         static SAID: AtomicU64 = AtomicU64::new(0);

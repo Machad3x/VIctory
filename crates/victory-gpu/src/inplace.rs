@@ -180,7 +180,7 @@ pub(crate) struct Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        FRUITLESS_STALE[usize::from(self.private)].store(true, Ordering::Relaxed);
+        run_went(self.private);
         if self.private {
             // The heap goes right after: the system unlocks the pages.
             locked_ranges().remove(&(self.at, self.id));
@@ -245,6 +245,42 @@ struct Runs {
 /// (gpu318, gpu319).
 static FRUITLESS_STALE: [std::sync::atomic::AtomicBool; 2] =
     [const { std::sync::atomic::AtomicBool::new(false) }; 2];
+
+/// An open was refused for the budget, shared by both kinds: a run of
+/// either kind going makes room for both ([`run_went`]).
+static BUDGET_SHORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A run of `private`'s kind went: that kind's fruitless asks may open now,
+/// and both kinds' if one was refused for the budget.
+fn run_went(private: bool) {
+    FRUITLESS_STALE[usize::from(private)].store(true, Ordering::Relaxed);
+    if BUDGET_SHORT.swap(false, Ordering::Relaxed) {
+        FRUITLESS_STALE.iter().for_each(|f| f.store(true, Ordering::Relaxed));
+    }
+}
+
+/// Bytes opens being made have reserved ([`reserve`]), not in [`OPEN`] yet.
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Reserves `bytes` (replacing `replaced` open) in `reserved` if they fit the
+/// `budget` beside `open`; given back when dropped.
+fn reserve(reserved: &'static AtomicUsize, open: usize, bytes: usize, replaced: usize, budget: usize) -> Option<Reserved> {
+    if open + reserved.load(Ordering::Relaxed) + bytes > budget + replaced {
+        return None;
+    }
+    reserved.fetch_add(bytes, Ordering::Relaxed);
+    Some(Reserved(reserved, bytes))
+}
+
+/// Bytes reserved for an open, given back when it ends (opened: they are in
+/// [`OPEN`] then; refused: they were never used).
+struct Reserved(&'static AtomicUsize, usize);
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::Relaxed);
+    }
+}
 
 /// What the worker found nothing to open in over `[start, end)` may be
 /// asked again.
@@ -880,16 +916,22 @@ fn open_run(at: usize, len: usize, private: bool, counted: bool) {
         with_runs(|r| finish(r, private, at, len, None));
         return;
     }
-    let ((start, bytes), over, replaced) = with_runs(|r| {
+    // The bytes it adds are reserved with the check, under the runs' lock:
+    // the two opening threads would pass the check together otherwise.
+    let ((start, bytes), over, reserved) = with_runs(|r| {
         let (range, over) = joined(&r.open, at, len);
         let replaced: usize = over.iter().filter_map(|s| r.open.get(s)).map(|run| run.len).sum();
-        (range, over, replaced)
+        let reserved = reserve(&RESERVED, OPEN.load(Ordering::Relaxed), range.1, replaced, budget());
+        (range, over, reserved)
     });
-    if OPEN.load(Ordering::Relaxed) + bytes > budget() + replaced {
+    let Some(_reserved) = reserved else {
         STATS[0].fetch_add(1, Ordering::Relaxed);
+        // What was refused for the budget is asked again once any run goes,
+        // of either kind (the budget is theirs together).
+        BUDGET_SHORT.store(true, Ordering::Relaxed);
         with_runs(|r| finish(r, private, at, len, None));
         return;
-    }
+    };
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     if private {
         // Locked and registered before the heap is opened: a guard is not
@@ -1936,6 +1978,35 @@ mod tests {
         assert!(locked_ranges().keys().all(|&(s, _)| s != at), "unregistered");
         // The free's own answer says it was freed: a query here could find
         // the addresses taken again by another test's allocation.
+    }
+
+    /// The budget is checked and reserved together: a second open that
+    /// would pass it beside the first is refused; the bytes go back with the
+    /// reservation.
+    #[test]
+    fn opens_reserve_their_bytes_in_the_budget() {
+        static RESERVED_TEST: AtomicUsize = AtomicUsize::new(0);
+        let first = reserve(&RESERVED_TEST, 100, 50, 0, 200).expect("fits");
+        assert!(reserve(&RESERVED_TEST, 100, 60, 0, 200).is_none(), "100 open, 50 reserved: 60 more does not fit");
+        assert!(reserve(&RESERVED_TEST, 100, 60, 20, 200).is_some(), "with 20 it replaces");
+        drop(first);
+        assert!(reserve(&RESERVED_TEST, 100, 100, 0, 200).is_some(), "given back");
+        assert_eq!(RESERVED_TEST.load(Ordering::Relaxed), 0);
+    }
+
+    /// A refusal for the budget is asked again once a run of either kind
+    /// goes: the budget is theirs together.
+    #[test]
+    fn a_budget_refusal_is_asked_again_when_any_run_goes() {
+        let _one = worker_tests();
+        FRUITLESS_STALE.iter().for_each(|f| f.store(false, Ordering::Relaxed));
+        BUDGET_SHORT.store(true, Ordering::Relaxed);
+        run_went(false);
+        assert!(FRUITLESS_STALE.iter().all(|f| f.load(Ordering::Relaxed)), "both kinds");
+        FRUITLESS_STALE.iter().for_each(|f| f.store(false, Ordering::Relaxed));
+        run_went(false);
+        assert!(FRUITLESS_STALE[0].load(Ordering::Relaxed) && !FRUITLESS_STALE[1].load(Ordering::Relaxed), "its own kind alone");
+        FRUITLESS_STALE[0].store(false, Ordering::Relaxed);
     }
 
     /// Our views' runs going (replaced all the time) let only our views'

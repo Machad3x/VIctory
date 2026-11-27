@@ -785,10 +785,11 @@ impl Drop for Memory {
         // free (`XMemFree`, which may wait for a submission's drop of runs
         // in place) would wait for itself.
         #[cfg(windows)]
-        debug_assert!(
-            !crate::host::on_retire_thread() && !crate::host::on_release_thread(),
-            "title GPU memory freed on the retire or release thread"
-        );
+        if crate::host::on_retire_thread() || crate::host::on_release_thread() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::error!("title GPU memory freed on the retire or release thread: its free may wait for itself"));
+            debug_assert!(false, "title GPU memory freed on the retire or release thread");
+        }
         // Copies of buffers in it may still have a submission's bytes to put
         // back (a heap outlives its placed resources' objects).
         #[cfg(windows)]
