@@ -69,7 +69,8 @@ pub(crate) struct Host {
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
-// free-threaded; the event handle is only waited on under `submitted`.
+// free-threaded; the event handle is only waited on under `submitted`,
+// or by the retire thread while no submission may start (`lock_idle`).
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
@@ -255,6 +256,70 @@ pub(crate) struct Sent<'h, L: std::ops::Deref<Target = HostList>> {
 
 thread_local! {
     static SUBMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RETIRE_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the title's submissions retire on a thread of their own
+/// (`VICTORY_PIPELINE=1`, off by default, [`Host::execute_later`]).
+pub(crate) fn pipelining() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PIPELINE");
+        tracing::info!(on, "title submissions retire on their own thread (VICTORY_PIPELINE)");
+        on
+    })
+}
+
+/// Work to run after the retire in flight: `Some` while one is.
+type Later = Option<Vec<Box<dyn FnOnce() + Send>>>;
+static FLIGHT: Mutex<Later> = Mutex::new(None);
+/// Signalled when no retire is in flight any more.
+static IDLE: std::sync::Condvar = std::sync::Condvar::new();
+
+fn flight() -> std::sync::MutexGuard<'static, Later> {
+    FLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `then` once every host submission sent so far is retired: at once
+/// when none is in flight, else on the retire thread after it.
+pub(crate) fn after_retired(then: Box<dyn FnOnce() + Send>) {
+    let mut f = flight();
+    match f.as_mut() {
+        Some(later) => later.push(then),
+        None => {
+            drop(f);
+            then();
+        }
+    }
+}
+
+/// The retire thread's queue.
+fn retirer() -> &'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>> {
+    static TX: OnceLock<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+        let _ = std::thread::Builder::new().name("victory retire".into()).spawn(move || {
+            RETIRE_THREAD.set(true);
+            for job in rx {
+                job();
+            }
+        });
+        tx
+    })
+}
+
+/// A ticket on its way to the retire thread.
+struct Retiring(Ticket<'static, std::sync::Arc<HostList>>);
+// SAFETY: D3D12 objects are free-threaded, and a ticket holds no guard
+// bound to its thread (stale pages are pins, the pull list is marked
+// busy, the upload list is owned); only the retire thread uses it after.
+unsafe impl Send for Retiring {}
+
+impl Retiring {
+    /// Taken whole, so that a closure moves the wrapper, not its field.
+    fn into_ticket(self) -> Ticket<'static, std::sync::Arc<HostList>> {
+        self.0
+    }
 }
 
 /// This thread holds the submission lock in [`Host::execute`].
@@ -713,6 +778,28 @@ pub(crate) mod tests {
         assert_eq!(word.get(), 7);
         // SAFETY: a plain query.
         assert!(unsafe { host.fence.GetCompletedValue() } >= value);
+    }
+
+    /// A submission retired on the retire thread is settled, and what ran
+    /// after it, before the next host submission starts.
+    #[test]
+    fn a_retire_on_its_thread_settles_before_the_next_submission() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let word = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let list = host.new_list().unwrap();
+        list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
+        list.close();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let after = tx.clone();
+        host.execute_later(vec![std::sync::Arc::new(list)], Box::new(move || tx.send("retired").unwrap()));
+        super::after_retired(Box::new(move || after.send("after").unwrap()));
+        let next = host.new_list().unwrap();
+        next.close();
+        host.execute(&[&next]);
+        assert_eq!(word.load(std::sync::atomic::Ordering::SeqCst), 7);
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), ["retired", "after"]);
     }
 
     /// A ticket dropped unretired gives its pending labels up (and says so
@@ -1725,7 +1812,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = self.lock_idle();
         let _here = Submitting::enter();
         let ticket = self.submit(&mut submitted, runs.to_vec());
         #[cfg(feature = "diagnostics")]
@@ -1748,6 +1835,64 @@ impl Host {
                 }
             }
             crate::capture::dump_submission(sub, &targets);
+        }
+    }
+
+    /// The submission lock, once no retire is in flight ([`Host::execute_later`]).
+    fn lock_idle(&self) -> std::sync::MutexGuard<'_, u64> {
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The retire thread's own submissions (none today) follow its settle.
+        if !RETIRE_THREAD.get() {
+            drop(IDLE.wait_while(flight(), |f| f.is_some()).unwrap_or_else(|e| e.into_inner()));
+        }
+        submitted
+    }
+
+    /// Sends title lists to the host GPU and retires them on the retire
+    /// thread ([`pipelining`]), then runs `then`; returns once they are on
+    /// the GPU. The next host submission waits for the retire: only the
+    /// title's own work overlaps the GPU and the settle.
+    pub(crate) fn execute_later(&'static self, runs: Vec<std::sync::Arc<HostList>>, then: Box<dyn FnOnce() + Send>) {
+        // A listed frame dumps its lists after the settle: at once.
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::listed(crate::queue::presented() + 1) {
+            let lists: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+            self.execute(&lists);
+            drop(lists);
+            after_retired(then);
+            return;
+        }
+        let mut submitted = self.lock_idle();
+        let here = Submitting::enter();
+        let ticket = self.submit(&mut submitted, runs);
+        *flight() = Some(Vec::new());
+        drop(here);
+        drop(submitted);
+        let retiring = Retiring(ticket);
+        let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+            self.retire(retiring.into_ticket());
+            then();
+            // Work queued behind it, then idle.
+            loop {
+                let later = {
+                    let mut f = flight();
+                    match f.as_mut().map(std::mem::take) {
+                        Some(later) if !later.is_empty() => later,
+                        _ => {
+                            *f = None;
+                            IDLE.notify_all();
+                            break;
+                        }
+                    }
+                };
+                for work in later {
+                    work();
+                }
+            }
+        });
+        if let Err(e) = retirer().send(job) {
+            // No retire thread: here.
+            (e.0)();
         }
     }
 

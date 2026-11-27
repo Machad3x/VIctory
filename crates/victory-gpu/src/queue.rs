@@ -1,5 +1,6 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once; with `VICTORY_PIPELINE=1` they are
+//! waited for on the retire thread, which signals them after the settle.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -251,21 +252,27 @@ fn pump(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<Segment>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
-        let at = std::time::Instant::now();
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::TITLE.set(true);
-        host.execute(&lists);
-        ran += at.elapsed();
-        drop(lists);
-        after_retired(move || {
+        let finish = move |segments: Vec<Segment>| {
             for (list, lease) in segments {
                 if let Some(lease) = lease {
                     lease.finish();
                 }
                 crate::list::recycle(list);
             }
-        });
+        };
+        let at = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::TITLE.set(true);
+        if crate::host::pipelining() {
+            let lists = segments.iter().map(|(s, _)| s.clone()).collect();
+            host.execute_later(lists, Box::new(move || finish(segments)));
+        } else {
+            let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
+            host.execute(&lists);
+            drop(lists);
+            after_retired(move || finish(segments));
+        }
+        ran += at.elapsed();
     };
     let mut signal = |f: usize, value: u64| {
         after_retired(move || {
@@ -306,11 +313,10 @@ fn pump(held: &mut Holding, why: Why) {
 
 /// Runs `then` once every host submission sent so far is retired: the
 /// lists' leases and recycling, and title fence Signals queued behind
-/// them, which tell the title the work is done. Submissions retire
-/// inline, so that is now.
+/// them, which tell the title the work is done ([`crate::host::after_retired`]).
 #[cfg(windows)]
-fn after_retired(then: impl FnOnce()) {
-    then();
+fn after_retired(then: impl FnOnce() + Send + 'static) {
+    crate::host::after_retired(Box::new(then));
 }
 
 #[cfg(windows)]
