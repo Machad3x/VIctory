@@ -112,15 +112,21 @@ struct PullList {
 // SAFETY: D3D12 objects are free-threaded; used under its mutex only.
 unsafe impl Send for PullList {}
 
-/// A pull recorded to run after a submission's lists: the list (locked
-/// until the wait), the buffers it copies between, and the locks of the
+/// A pull recorded to run after a submission's lists: its list (busy
+/// until the wait), the buffers it copies between, and the pins of the
 /// stale pages it brings back (held until the wait, as `copy_now` holds
 /// them: a reader meanwhile would take the mirror for current).
-struct Riding<'a> {
-    guard: std::sync::MutexGuard<'static, PullList>,
+struct Riding {
+    pull: &'static Mutex<PullList>,
     list: ID3D12CommandList,
     _regions: Regions,
-    stale: crate::shadow::Held<'a>,
+    stale: crate::shadow::Held,
+}
+
+impl Riding {
+    fn pull(&self) -> std::sync::MutexGuard<'static, PullList> {
+        self.pull.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Whether a submission's pull runs right after its lists, under their
@@ -235,7 +241,7 @@ pub(crate) struct Sent<'a> {
     snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
     batch: Batch,
     prepared: std::time::Instant,
-    riding: Option<Option<Riding<'a>>>,
+    riding: Option<Option<Riding>>,
     /// The pull ran and was waited for with the last group.
     pulled: bool,
     removed_in: Option<usize>,
@@ -1972,8 +1978,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&t.lists[group]);
                 if last && let Some(Some(r)) = &mut t.riding {
                     self.queue.ExecuteCommandLists(&[Some(r.list.clone())]);
-                    r.guard.busy = true;
-                    r.guard.value = t.value;
+                    r.pull().value = t.value;
                 }
                 self.queue
                     .Signal(&self.fence, t.value)
@@ -2048,7 +2053,7 @@ impl Host {
             && matches!(ended, Waited::Done)
             && let Some(Some(r)) = &mut t.riding
         {
-            r.guard.busy = false;
+            r.pull().busy = false;
             t.pulled = true;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::PullsRiding, 1);
@@ -2238,7 +2243,7 @@ impl Host {
                 // Done once the submission's fence passed it: the pull's own
                 // copy may not have run or waited (an error, nothing to copy).
                 // SAFETY: a plain query.
-                r.guard.busy &= unsafe { self.fence.GetCompletedValue() } < value;
+                r.pull().busy &= unsafe { self.fence.GetCompletedValue() } < value;
             }
         }
         struct Kept(Regions);
@@ -5158,10 +5163,7 @@ impl Host {
     /// the pull is still due after the wait (no list, or the last one's run
     /// was not waited for); the stale bits it cleared stay cleared, and it
     /// copies its ranges whole again.
-    fn pull_riding<'a>(
-        &self,
-        snapshots: &'a [(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
-    ) -> Option<Option<Riding<'a>>> {
+    fn pull_riding(&self, snapshots: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> Option<Option<Riding>> {
         static LIST: OnceLock<Option<Mutex<PullList>>> = OnceLock::new();
         let list = LIST.get_or_init(|| {
             // SAFETY: plain creation; the list is closed until used.
@@ -5177,7 +5179,8 @@ impl Host {
             };
             made.inspect_err(|e| tracing::warn!(error = %e, "no pull list: pulls wait on their own")).ok().map(Mutex::new)
         });
-        let mut guard = list.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
+        let pull = list.as_ref()?;
+        let mut guard = pull.lock().unwrap_or_else(|e| e.into_inner());
         // Its last run was not waited for: the allocator may be in use,
         // until the fence passes it.
         // SAFETY: a plain query.
@@ -5215,7 +5218,12 @@ impl Host {
             })
         };
         match recorded {
-            Ok(list) => Some(Some(Riding { guard, list, _regions: regions, stale })),
+            Ok(list) => {
+                // Busy from now: its value is set once the submission signals.
+                guard.busy = true;
+                guard.value = u64::MAX;
+                Some(Some(Riding { pull, list, _regions: regions, stale }))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "pull list not recorded: the pull waits on its own");
                 stale.restale();

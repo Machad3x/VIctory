@@ -77,7 +77,7 @@ struct Vram {
     /// A bit per [`PAGE`] of the copy (by offset) whose mirror is behind
     /// video memory: refreshes write video memory only, and the mirror
     /// catches up when the CPU reads it ([`Shadow::freshen`]).
-    stale: Mutex<Vec<u64>>,
+    stale: Stale,
     /// Offsets (whole pages, sorted, apart) a submission takes snapshots of
     /// ([`snapshots_ahead`]): refreshes there write the mirror too, so that
     /// the snapshots need no copy back from video memory.
@@ -1661,7 +1661,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
 // the bytes from before until a later range brings them.
 /// Recording a riding pull, it returns the stale pages' locks, for the
 /// submission to hold until its wait ([`bring_back`]).
-pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) -> Held<'_> {
+pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) -> Held {
     // Whole pages, so that the pages pulled are current in the mirror.
     let mut runs: Vec<(&Shadow, usize, usize)> = Vec::new();
     for (copy, address, len) in ranges {
@@ -1678,7 +1678,7 @@ pub(crate) fn pull(ranges: &[(Arc<Shadow>, usize, usize)]) -> Held<'_> {
         );
         runs.push((copy, from, to - from));
     }
-    bring_back(&mut runs)
+    bring_back(&mut runs).own(ranges)
 }
 
 /// Before a submission whose lists declared that shaders write title
@@ -1736,9 +1736,9 @@ pub(crate) fn snapshots_done(ranges: &[(Arc<Shadow>, usize, usize)]) {
 /// pull (`crate::host::riding_active`): that needs a single submitting
 /// thread, the one whose submission runs the recorded list. The locks are
 /// then returned, to be held until the submission's wait.
-fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
+fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Pinned<'a> {
     if runs.is_empty() {
-        return Held(Vec::new());
+        return Pinned(Vec::new());
     }
     runs.sort_unstable_by_key(|r| (std::ptr::from_ref(r.0) as usize, r.1));
     // Overlapping or adjacent runs of a copy as one region.
@@ -1753,21 +1753,28 @@ fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
         }
         merged.push((copy, at, n));
     }
-    // Locked in address order (the runs are sorted by copy).
-    let mut locked: Vec<(&Shadow, std::sync::MutexGuard<'_, Vec<u64>>, Vec<(usize, usize)>)> = Vec::new();
+    // Pinned in address order (the runs are sorted by copy), each copy once.
+    let mut pinned = Pinned(Vec::new());
     let mut regions = Vec::with_capacity(merged.len());
-    for &(copy, at, n) in &merged {
-        let Some(v) = &copy.vram else { continue };
-        if !locked.last().is_some_and(|(c, ..)| std::ptr::eq(*c, copy)) {
-            locked.push((copy, lock_stale(&v.stale), Vec::new()));
+    let mut i = 0;
+    while i < merged.len() {
+        let copy = merged[i].0;
+        let end = i + merged[i..].iter().take_while(|r| std::ptr::eq(r.0, copy)).count();
+        if let Some(v) = &copy.vram {
+            let mut bits = lock_stale(&v.stale);
+            let mut pages = Vec::new();
+            for &(_, at, n) in &merged[i..end] {
+                let (from, to) = (at / PAGE, (at + n).div_ceil(PAGE));
+                for k in from..to {
+                    bits[k / 64] &= !(1 << (k % 64));
+                }
+                pages.push((from, to));
+                regions.push((&v.mirror, at as u64, &copy.buffer, at as u64, n as u64));
+            }
+            bits.pin();
+            pinned.0.push((copy, pages));
         }
-        let (_, bits, pages) = locked.last_mut().expect("just pushed");
-        let (from, to) = (at / PAGE, (at + n).div_ceil(PAGE));
-        for k in from..to {
-            bits[k / 64] &= !(1 << (k % 64));
-        }
-        pages.push((from, to));
-        regions.push((&v.mirror, at as u64, &copy.buffer, at as u64, n as u64));
+        i = end;
     }
     #[cfg(test)]
     if !regions.is_empty() {
@@ -1777,48 +1784,153 @@ fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
         host.copy_now(&regions);
     }
     if crate::host::riding_active() {
-        // Copies with no page brought back are not held over the wait.
-        return Held(
-            locked.into_iter().filter(|(.., pages)| !pages.is_empty()).map(|(_, bits, pages)| (bits, pages)).collect(),
-        );
+        return pinned;
     }
-    Held(Vec::new())
+    // Run: unpinned here.
+    drop(pinned);
+    Pinned(Vec::new())
 }
 
-/// Stale page locks a riding pull holds until its copies ran, with the
-/// pages (index ranges) it marked current under each.
-pub(crate) struct Held<'a>(Vec<(std::sync::MutexGuard<'a, Vec<u64>>, Vec<(usize, usize)>)>);
+/// A copy's stale bits, and whether a [`bring_back`] holds pages of them
+/// until its copies ran (a pin, not a guard: any thread may release it).
+struct Stale {
+    state: Mutex<(Vec<u64>, bool)>,
+    unpinned: std::sync::Condvar,
+}
 
-impl Held<'_> {
+impl Stale {
+    fn new(words: usize) -> Self {
+        Stale { state: Mutex::new((vec![0; words], false)), unpinned: std::sync::Condvar::new() }
+    }
+
+    /// The bits, pinned or not (their pin's holder only).
+    fn bits(&self) -> std::sync::MutexGuard<'_, (Vec<u64>, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn unpin(&self) {
+        self.bits().1 = false;
+        self.unpinned.notify_all();
+    }
+}
+
+/// [`lock_stale`]'s bits, unpinned.
+struct StaleBits<'a>(std::sync::MutexGuard<'a, (Vec<u64>, bool)>);
+
+impl StaleBits<'_> {
+    /// Held past this guard: others wait until [`Stale::unpin`].
+    fn pin(&mut self) {
+        self.0.1 = true;
+    }
+}
+
+impl std::ops::Deref for StaleBits<'_> {
+    type Target = Vec<u64>;
+    fn deref(&self) -> &Vec<u64> {
+        &self.0.0
+    }
+}
+
+impl std::ops::DerefMut for StaleBits<'_> {
+    fn deref_mut(&mut self) -> &mut Vec<u64> {
+        &mut self.0.0
+    }
+}
+
+/// Copies [`bring_back`] pinned, with the pages (index ranges) it marked
+/// current in each: unpinned when dropped.
+struct Pinned<'a>(Vec<(&'a Shadow, Vec<(usize, usize)>)>);
+
+impl Pinned<'_> {
+    /// The same pins, owned: the copies by their `ranges` entries.
+    fn own(mut self, ranges: &[(Arc<Shadow>, usize, usize)]) -> Held {
+        let mut held = Held(Vec::new());
+        for (copy, pages) in std::mem::take(&mut self.0) {
+            match ranges.iter().find(|r| std::ptr::eq(&*r.0, copy)) {
+                Some(r) => held.0.push((r.0.clone(), pages)),
+                None => unpin(copy),
+            }
+        }
+        held
+    }
+}
+
+impl Drop for Pinned<'_> {
+    fn drop(&mut self) {
+        for (copy, _) in self.0.drain(..) {
+            unpin(copy);
+        }
+    }
+}
+
+fn unpin(copy: &Shadow) {
+    if let Some(v) = &copy.vram {
+        v.stale.unpin();
+    }
+}
+
+/// Stale page pins a riding pull holds until its copies ran, with the
+/// pages (index ranges) it marked current in each copy; released when
+/// dropped, by whichever thread drops it.
+pub(crate) struct Held(Vec<(Arc<Shadow>, Vec<(usize, usize)>)>);
+
+impl Held {
     /// The copies may not have run: their pages are stale again.
     pub(crate) fn restale(&mut self) {
-        for (bits, pages) in &mut self.0 {
+        for (copy, pages) in &self.0 {
+            let Some(v) = &copy.vram else { continue };
+            let mut bits = v.stale.bits();
             for k in pages.iter().flat_map(|&(a, b)| a..b) {
-                bits[k / 64] |= 1 << (k % 64);
+                bits.0[k / 64] |= 1 << (k % 64);
             }
         }
     }
 
-    /// Unlocks them.
+    /// Unpins them.
     pub(crate) fn release(&mut self) {
-        self.0.clear();
+        for (copy, _) in self.0.drain(..) {
+            unpin(&copy);
+        }
     }
 }
 
-/// A copy's stale bits, locked; with diagnostics, time spent waiting for
-/// another holder (a riding pull holds them over its submission) counted.
-fn lock_stale(stale: &Mutex<Vec<u64>>) -> std::sync::MutexGuard<'_, Vec<u64>> {
-    #[cfg(feature = "diagnostics")]
-    match stale.try_lock() {
-        Ok(bits) => return bits,
-        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::StaleLockWaitNs);
-            return stale.lock().unwrap_or_else(|e| e.into_inner());
-        }
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.release();
     }
+}
+
+/// A copy's stale bits, locked and not pinned by another; with
+/// diagnostics, time spent waiting for another holder (a riding pull pins
+/// them over its submission) counted.
+fn lock_stale(stale: &Stale) -> StaleBits<'_> {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let mut waited = false;
+    #[cfg(feature = "diagnostics")]
+    let mut bits = match stale.state.try_lock() {
+        Ok(bits) => bits,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            waited = true;
+            stale.bits()
+        }
+    };
     #[cfg(not(feature = "diagnostics"))]
-    stale.lock().unwrap_or_else(|e| e.into_inner())
+    let mut bits = stale.bits();
+    while bits.1 {
+        #[cfg(feature = "diagnostics")]
+        {
+            waited = true;
+        }
+        bits = stale.unpinned.wait(bits).unwrap_or_else(|e| e.into_inner());
+    }
+    #[cfg(feature = "diagnostics")]
+    if waited {
+        crate::copystat::add(crate::copystat::C::StaleLockWaitNs, started.elapsed().as_nanos() as u64);
+    }
+    StaleBits(bits)
 }
 
 /// GPU copies [`bring_back`] made (tests).
@@ -2158,7 +2270,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
                         vram = Some(Vram {
                             mirror: mirror.0,
                             data: video_data,
-                            stale: Mutex::new(vec![0; (size as usize).div_ceil(PAGE).div_ceil(64)]),
+                            stale: Stale::new((size as usize).div_ceil(PAGE).div_ceil(64)),
                             ahead: Mutex::new(Vec::new()),
                         });
                         (video, mirror.1)
@@ -2624,6 +2736,29 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Stale bits pinned on one thread are released by another: a lock
+    /// waits for that, and sees the bits as the pin's holder left them.
+    #[test]
+    fn a_stale_pin_is_released_by_another_thread() {
+        let stale = Arc::new(Stale::new(1));
+        let mut bits = lock_stale(&stale);
+        bits[0] = 0b10;
+        bits.pin();
+        drop(bits);
+        let other = stale.clone();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            other.bits().0[0] |= 1;
+            other.unpin();
+        });
+        let started = std::time::Instant::now();
+        let bits = lock_stale(&stale);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(20));
+        assert_eq!(bits[0], 0b11);
+        drop(bits);
+        releaser.join().unwrap();
+    }
 
     /// Pages a riding pull marked current are stale again on `restale`,
     /// and unlocked on `release`.
