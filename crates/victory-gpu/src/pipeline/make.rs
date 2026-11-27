@@ -474,6 +474,21 @@ pub(crate) fn wait_all(ps: &[Arc<Pending>]) -> Duration {
     spent().done(frame, Class::Builder, left);
     waited
 }
+/// A wait for title memory to be named in place begins (page tables waiting
+/// for the opening thread, `crate::inplace::wait_private`): it shares the
+/// frame's allowance with the pipeline waits, as the builder's (its lists
+/// read that memory: run whole, or wait). The frame and what it may wait;
+/// [`memory_wait_done`] after.
+pub(crate) fn memory_wait(most: Duration) -> (u64, Duration) {
+    let frame = frame();
+    (frame, spent().take(frame, Class::Builder, most))
+}
+
+/// The wait [`memory_wait`] gave `took` in `frame` ended.
+pub(crate) fn memory_wait_done(frame: u64, took: Duration) {
+    spent().done(frame, Class::Builder, took);
+}
+
 /// Whether `p` has shaders (one with none is never made).
 pub(crate) fn has_shaders(p: &Pending) -> bool {
     !p.shaders.is_empty()
@@ -828,6 +843,18 @@ mod tests {
         assert!(s.take(3, Class::Other, ALLOWANCE) <= BUDGET, "what is left of it");
         s.done(3, Class::Other, took);
         assert!(s.left(3, Class::Other) > BUDGET - Duration::from_millis(50), "what it did not use goes back");
+    }
+
+    /// Page tables waiting for memory to be named take from the same
+    /// allowance as the builder, at most what they ask.
+    #[test]
+    fn memory_waits_share_the_allowance() {
+        let mut s = Spent::new();
+        let took = s.take(9, Class::Builder, Duration::from_secs(2));
+        assert_eq!(took, Duration::from_secs(2));
+        s.done(9, Class::Builder, took);
+        s.spend(9, Class::Urgent, ALLOWANCE);
+        assert_eq!(s.take(9, Class::Builder, Duration::from_secs(2)), Duration::ZERO, "none left");
     }
 
     /// The builder's pipelines go to the front of the screen passes' queue

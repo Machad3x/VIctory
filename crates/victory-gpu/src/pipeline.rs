@@ -332,6 +332,8 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) use make::take_compute_waits;
+#[cfg(windows)]
+pub(crate) use make::{memory_wait, memory_wait_done};
 
 /// Before a dispatch with the title pipeline: if it is the acceleration-
 /// structure builder's, waits for every pipeline of the builder's

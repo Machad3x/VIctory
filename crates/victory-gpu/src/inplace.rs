@@ -155,10 +155,12 @@ const LONGEST: usize = 2 * MOST;
 /// takes ~2 ms.
 pub(crate) const CHUNK: usize = 128;
 /// The longest page tables wait in one frame for the worker to open
-/// private runs ([`wait_private`]), in microseconds: opening 256 MiB took
-/// 70 ms where measured, and runs are opened when their memory is
-/// reported, so a table mostly waits for nothing.
-const PRIVATE_WAIT_US: u64 = 100_000;
+/// private runs ([`wait_private`]), in microseconds, within the frame's
+/// pipeline allowance (`crate::pipeline::memory_wait`): opening 256 MiB
+/// took 70 ms where measured, but the world's streaming asks hundreds of
+/// runs a frame (gpu316: 342 opened in 3.5 s), and 100 ms left lists
+/// missing memory that wrote into the title's (its heap check failed).
+const PRIVATE_WAIT_US: u64 = 2_000_000;
 /// Microseconds page tables waited for the worker since the last frame
 /// line.
 static WAITED_US: AtomicU64 = AtomicU64::new(0);
@@ -632,8 +634,14 @@ pub(crate) fn wait_private() -> bool {
         return true;
     }
     let started = std::time::Instant::now();
-    let left = PRIVATE_WAIT_US.saturating_sub(WAITED_US.load(Ordering::Relaxed));
-    let done = wait_pending(std::time::Duration::from_micros(left));
+    // Within the frame's one allowance, shared with the pipeline waits:
+    // 100 ms of its own ran out in the world's streaming (gpu316: 100.1 ms
+    // waited in the frame its lists missed 97 private pages, wrote 268 in
+    // place, and the title's heap check failed).
+    let left = std::time::Duration::from_micros(PRIVATE_WAIT_US.saturating_sub(WAITED_US.load(Ordering::Relaxed)));
+    let (frame, took) = crate::pipeline::memory_wait(left);
+    let done = wait_pending(took);
+    crate::pipeline::memory_wait_done(frame, took);
     let waited = started.elapsed().as_micros() as u64;
     WAITED_US.fetch_add(waited, Ordering::Relaxed);
     RT[5].fetch_add(1, Ordering::Relaxed);

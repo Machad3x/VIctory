@@ -295,12 +295,16 @@ pub(crate) fn withholding() -> bool {
     withheld_in(FRAMES.load(Relaxed), MISSED_IN.load(Relaxed))
 }
 
-/// Whether a list that missed memory has its results withheld at all: not
-/// with `VICTORY_RT_MEMORY` (`crate::inplace`), where what its shaders
-/// wrote in place is in title memory already and the rest must follow, or
-/// the title's ray-tracing structures would be built in part.
+/// Whether a list that missed memory has its results withheld: always.
+/// With `VICTORY_RT_MEMORY` they went back so that the title's ray-tracing
+/// structures were not built in part, but a list that read zeros computes
+/// from them, and its copies went back over the title's own data (gpu316:
+/// the title's heap check failed in the frame its lists missed 97 private
+/// pages; drops1 before: an AABB's infinities in a pointer the title
+/// followed). What such a list writes in place lands still: misses are
+/// kept rare instead (`crate::inplace::wait_private`).
 pub(crate) fn withholds() -> bool {
-    !crate::inplace::rt_memory()
+    true
 }
 
 /// 256 MiB regions (level-1 indices) get blocks in the page tables from
