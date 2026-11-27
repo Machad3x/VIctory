@@ -2107,10 +2107,10 @@ impl Host {
                 .map(|(&a, &b)| a..b)
                 .collect()
         } else {
-            vec![0..lists.len()]
+            std::iter::once(0..lists.len()).collect()
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [0..lists.len()];
+        let groups = std::iter::once(0..lists.len());
         // Clear read marks of slots forgotten before this submission (placed
         // textures written or evicted) so reads in it are not wiped after it.
         crate::shadow::clear_forgotten_reads();

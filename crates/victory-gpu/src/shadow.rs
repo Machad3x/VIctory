@@ -2079,6 +2079,7 @@ fn unpin(copy: &Shadow) {
 /// Stale page pins a riding pull holds until its copies ran, with the
 /// pages (index ranges) it marked current in each copy; released when
 /// dropped, by whichever thread drops it.
+#[allow(clippy::type_complexity)]
 pub(crate) struct Held(Vec<(Arc<Shadow>, Vec<(usize, usize)>)>);
 
 impl Held {

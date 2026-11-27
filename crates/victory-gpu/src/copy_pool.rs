@@ -326,10 +326,11 @@ mod tests {
         let delta = (s as usize).wrapping_sub(d as usize);
         let ((), pieces) = queued(|| {
             // One big copy (cut into pieces) and two small ones.
-            // SAFETY: (all) inside the two buffers.
+            // SAFETY: inside the two buffers.
+            let (d1, s1, d9, s9) = unsafe { (d.add(8 << 20), s.add(8 << 20), d.add(9 << 20), s.add(9 << 20)) };
             copy_then(d, s, 8 << 20, Some((landed, delta)));
-            copy_then(unsafe { d.add(8 << 20) }, unsafe { s.add(8 << 20) }, 1 << 20, Some((landed, delta)));
-            copy(unsafe { d.add(9 << 20) }, unsafe { s.add(9 << 20) }, 3 << 20);
+            copy_then(d1, s1, 1 << 20, Some((landed, delta)));
+            copy(d9, s9, 3 << 20);
         });
         assert_eq!(LANDED.load(Ordering::Relaxed), 0, "not before the run");
         // Not with a test switching the pool's threads meanwhile.

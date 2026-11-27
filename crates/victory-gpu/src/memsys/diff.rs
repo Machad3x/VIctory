@@ -318,7 +318,7 @@ fn state() -> Option<&'static Mutex<State>> {
             match Gpu::new(host, slots) {
                 Ok(gpu) => {
                     tracing::info!(slots, mb, "twins of marked pages in video memory");
-                    Some(Mutex::new(State { gpu, twins: Twins::new(slots), owners: vec![Weak::new(); slots] }))
+                    Some(Mutex::new(State { gpu, twins: Twins::new(slots), owners: (0..slots).map(|_| Weak::new()).collect() }))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "no page compare on this host: every marked page comes back");
@@ -450,6 +450,7 @@ mod tests {
         assert_eq!(gpu.run(host, &[item(0, 2, true), item(1, 0, true)]), Some(vec![0, 0]), "as the twins");
         // A byte in the second page's block 0x12, and two blocks apart in
         // the first page, one of them its last.
+        // SAFETY: inside the buffer, as above.
         unsafe {
             *data.add(PAGE as usize + 0x1234) ^= 1;
             *data.add(0x00ff) ^= 0x80;
@@ -463,6 +464,7 @@ mod tests {
         // The twins followed: equal again, and one page's change is not
         // the other's.
         assert_eq!(gpu.run(host, &[item(0, 2, true), item(1, 0, true)]), Some(vec![0, 0]));
+        // SAFETY: inside the buffer, as above.
         unsafe { *data.add(5) ^= 1 };
         assert_eq!(gpu.run(host, &[item(1, 0, true), item(0, 2, true)]), Some(vec![0, 1]));
         // A page only given a twin is not compared, whatever the slot held.

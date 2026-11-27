@@ -383,9 +383,9 @@ impl Drop for TimedNs {
     }
 }
 
-/// Set around the title's submissions (`crate::queue`): other executes are
-/// ours, synchronous.
 thread_local! {
+    /// Set around the title's submissions (`crate::queue`): other executes are
+    /// ours, synchronous.
     pub(crate) static TITLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 /// A title fence poll or wait, or a queue's memory value or fence wait,

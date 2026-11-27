@@ -201,10 +201,10 @@ impl Saved {
     }
 }
 
-/// Set while this thread runs the guard handler (diagnostics): its saves,
-/// tracker lock waits and opens are timed.
 #[cfg(feature = "diagnostics")]
 thread_local! {
+    /// Set while this thread runs the guard handler (diagnostics): its saves,
+    /// tracker lock waits and opens are timed.
     static IN_HANDLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1829,10 +1829,9 @@ pub(crate) mod tests {
     #[test]
     fn a_pooled_save_buffer_holds_only_the_saved_page() {
         let p = pool(1);
-        // SAFETY: (every write below) bytes of our pool; a guarded page
-        // faults into the handler, which saves it first.
         let fill = |i: usize| ((i * 7 + 3) % 251) as u8;
         for i in 0..PAGE {
+            // SAFETY: bytes of our pool.
             unsafe { ((p + i) as *mut u8).write_volatile(fill(i)) };
         }
         let t = track(p, PAGE, true).expect("pool memory is tracked");
@@ -1842,6 +1841,8 @@ pub(crate) mod tests {
             recycle(vec![0xAA; PAGE].into_boxed_slice());
         }
         LAST_BUFFER_POOLED.set(false);
+        // SAFETY: a byte of our pool; the guarded page faults into the
+        // handler, which saves it first.
         unsafe { ((p + 8) as *mut u8).write_volatile(0xEE) };
         assert!(LAST_BUFFER_POOLED.get(), "the save took a pooled buffer");
         let saved = t.saved(p / PAGE).expect("armed page is saved");
