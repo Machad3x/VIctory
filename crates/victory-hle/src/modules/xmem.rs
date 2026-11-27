@@ -355,7 +355,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
             // The GPU side lets go of what it holds in place there first.
-            super::memoryapi::change(address, 0, || VirtualFree(address, 0, MEM_RELEASE));
+            let a = address as usize;
+            super::memoryapi::change(address, 0, move || VirtualFree(a as *mut c_void, 0, MEM_RELEASE));
             return;
         }
         let user = address.cast::<u8>();
@@ -1042,7 +1043,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         // own view of the section, which this unmap leaves alone, so today
         // nothing is held here: one atomic load.)
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        victory_gpu::title_memory_change(at, size, || unsafe {
+        victory_gpu::title_memory_change(at, size, move || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {

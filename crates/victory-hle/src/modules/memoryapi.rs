@@ -66,7 +66,10 @@ fn this_process(process: HANDLE) -> bool {
 /// place there (`victory_gpu::title_memory_change`); `len` 0 means to the
 /// end of the allocation (`VirtualFree`'s whole release or decommit, a
 /// view's unmapping).
-pub(crate) fn change(at: *const c_void, len: usize, change: impl FnMut() -> BOOL) -> BOOL {
+/// A change over memory a page table still names may be queued and done
+/// later (`victory_gpu::title_memory_deferred`): `change` holds what it needs
+/// by value.
+pub(crate) fn change(at: *const c_void, len: usize, change: impl FnMut() -> BOOL + Send + 'static) -> BOOL {
     let mut change = change;
     if at.is_null() {
         return change();
@@ -86,10 +89,9 @@ fn freed(size: usize, kind: u32) -> usize {
 }
 
 pub extern "system" fn VirtualFree(at: *mut c_void, size: usize, kind: u32) -> BOOL {
+    let a = at as usize;
     // SAFETY: the title's arguments.
-    change(at, freed(size, kind), || unsafe {
-        mem::VirtualFree(at, size, kind)
-    })
+    change(at, freed(size, kind), move || unsafe { mem::VirtualFree(a as *mut c_void, size, kind) })
 }
 
 pub extern "system" fn VirtualFreeEx(
@@ -98,12 +100,13 @@ pub extern "system" fn VirtualFreeEx(
     size: usize,
     kind: u32,
 ) -> BOOL {
-    // SAFETY: the title's arguments.
-    let free = || unsafe { mem::VirtualFreeEx(process, at, size, kind) };
     if this_process(process) {
-        change(at, freed(size, kind), free)
+        let a = at as usize;
+        // SAFETY: the title's arguments, in this process.
+        change(at, freed(size, kind), move || unsafe { mem::VirtualFree(a as *mut c_void, size, kind) })
     } else {
-        free()
+        // SAFETY: the title's arguments.
+        unsafe { mem::VirtualFreeEx(process, at, size, kind) }
     }
 }
 
@@ -113,13 +116,42 @@ pub extern "system" fn VirtualProtect(
     protect: u32,
     old: *mut u32,
 ) -> BOOL {
-    // SAFETY: the title's arguments.
-    let set = || unsafe { mem::VirtualProtect(at, size, protect, old) };
     if size != 0 {
-        change(at, size, set)
+        protect_title(at, size, protect, old)
     } else {
-        set()
+        // SAFETY: the title's arguments.
+        unsafe { mem::VirtualProtect(at, size, protect, old) }
     }
+}
+
+/// `VirtualProtect` of title memory through [`change`]. The old protection
+/// goes to `old` now, also when the change is queued (it is then the one
+/// the memory has, which the queued change finds as well).
+fn protect_title(at: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let was = std::sync::Arc::new(AtomicU32::new(0));
+    let (a, seen) = (at as usize, was.clone());
+    let done = change(at, size, move || {
+        let mut o = 0;
+        // SAFETY: the title's arguments; the old protection kept here.
+        let worked = unsafe { mem::VirtualProtect(a as *const c_void, size, protect, &mut o) };
+        seen.store(o, Ordering::Relaxed);
+        worked
+    });
+    let was = if victory_gpu::title_memory_deferred() {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { mem::VirtualQuery(at, &mut info, size_of_val(&info)) };
+        info.Protect
+    } else {
+        was.load(Ordering::Relaxed)
+    };
+    if done != 0 && !old.is_null() {
+        // SAFETY: the title's out pointer.
+        unsafe { old.write(was) };
+    }
+    done
 }
 
 pub extern "system" fn VirtualProtectEx(
@@ -129,12 +161,11 @@ pub extern "system" fn VirtualProtectEx(
     protect: u32,
     old: *mut u32,
 ) -> BOOL {
-    // SAFETY: the title's arguments.
-    let set = || unsafe { mem::VirtualProtectEx(process, at, size, protect, old) };
     if this_process(process) && size != 0 {
-        change(at, size, set)
+        protect_title(at, size, protect, old)
     } else {
-        set()
+        // SAFETY: the title's arguments.
+        unsafe { mem::VirtualProtectEx(process, at, size, protect, old) }
     }
 }
 
@@ -200,13 +231,15 @@ pub extern "system" fn VirtualAllocEx(
 }
 
 pub extern "system" fn UnmapViewOfFile(at: MEMORY_MAPPED_VIEW_ADDRESS) -> BOOL {
+    let a = at.Value as usize;
     // SAFETY: the title's argument.
-    change(at.Value, 0, || unsafe { mem::UnmapViewOfFile(at) })
+    change(at.Value, 0, move || unsafe { mem::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }) })
 }
 
 pub extern "system" fn UnmapViewOfFileEx(at: MEMORY_MAPPED_VIEW_ADDRESS, flags: u32) -> BOOL {
+    let a = at.Value as usize;
     // SAFETY: the title's arguments.
-    change(at.Value, 0, || unsafe { mem::UnmapViewOfFileEx(at, flags) })
+    change(at.Value, 0, move || unsafe { mem::UnmapViewOfFileEx(MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, flags) })
 }
 
 pub extern "system" fn UnmapViewOfFile2(
@@ -214,12 +247,15 @@ pub extern "system" fn UnmapViewOfFile2(
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     flags: u32,
 ) -> BOOL {
-    // SAFETY: the title's arguments.
-    let unmap = || unsafe { mem::UnmapViewOfFile2(process, at, flags) };
     if this_process(process) {
-        change(at.Value, 0, unmap)
+        let a = at.Value as usize;
+        // SAFETY: the title's arguments, in this process.
+        change(at.Value, 0, move || unsafe {
+            mem::UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: a as *mut c_void }, flags)
+        })
     } else {
-        unmap()
+        // SAFETY: the title's arguments.
+        unsafe { mem::UnmapViewOfFile2(process, at, flags) }
     }
 }
 
@@ -299,9 +335,12 @@ mod tests {
     #[test]
     fn the_entry_keeps_the_host_s_answer_with_nothing_held() {
         use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
-        let calls = std::cell::Cell::new(0);
-        let refused = || {
-            calls.set(calls.get() + 1);
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        // Held by changes that may be queued: 'static.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let calls = &CALLS;
+        let refused = move || {
+            calls.fetch_add(1, Relaxed);
             // SAFETY: plain write of this thread's last error.
             unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
             0
@@ -311,10 +350,10 @@ mod tests {
         assert_eq!(change(at, 0x1000, refused), 0);
         // SAFETY: a plain read of this thread's last error.
         assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_PARAMETER);
-        assert!((1..=2).contains(&calls.get()), "tried {} times", calls.get());
-        calls.set(0);
-        assert_eq!(change(at, 0, || { calls.set(calls.get() + 1); 1 }), 1);
-        assert_eq!(calls.get(), 1);
+        assert!((1..=2).contains(&calls.load(Relaxed)), "tried {} times", calls.load(Relaxed));
+        calls.store(0, Relaxed);
+        assert_eq!(change(at, 0, move || { calls.fetch_add(1, Relaxed); 1 }), 1);
+        assert_eq!(calls.load(Relaxed), 1);
     }
 
     #[test]
