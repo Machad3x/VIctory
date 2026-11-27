@@ -533,6 +533,30 @@ mod tests {
         assert!(held.is_empty());
     }
 
+    /// gpu313's shape: compute work waits on two queues' frame-progress
+    /// words, one written already, the other by a list not submitted yet
+    /// (its title thread was held behind our submission). It stays held
+    /// with no valve, and runs as soon as the writer is submitted, after it.
+    #[test]
+    fn a_wait_on_a_word_whose_writer_comes_later() {
+        let fake = RefCell::new(Fake::default());
+        {
+            let mut f = fake.borrow_mut();
+            f.memory.insert(0xE68, 2237);
+            f.writes.insert("writer", vec![(0xEE8, 2237)]);
+        }
+        let mut held = Held::default();
+        held.push(2, Item::Segment("reader", vec![ge(0xE68, 2237), ge(0xEE8, 2237)]));
+        pump(&mut held, &fake);
+        assert!(fake.borrow().log.is_empty(), "held: the second word is not written");
+        assert!(held.force_older_than(Duration::from_secs(60)).is_empty(), "no valve");
+        held.push(0, Item::Segment("writer", vec![]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q0: writer", "q2: reader"]);
+        assert_eq!(p.waited.len(), 1);
+        assert!(held.is_empty());
+    }
+
     #[test]
     fn a_fence_wait_holds_its_queue() {
         let fake = RefCell::new(Fake::default());

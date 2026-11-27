@@ -9,19 +9,20 @@
 //! stages that run then work on what the dropped ones never wrote.
 //!
 //! So a builder dispatch first waits for every pipeline the builder has
-//! created, queued ahead of all others, up to [`WAIT`] a frame (below the
-//! title's 30 s watchdog): its frames run whole. Nothing is held back: a
-//! frame that would skip the builder's dispatches leaves what comes after
+//! created, queued at the front, within the frame's one pipeline allowance
+//! (`make::ALLOWANCE`, shared with every other pipeline wait, well below
+//! the title's 30 s watchdog): its frames run whole. Nothing is held back:
+//! a frame that would skip the builder's dispatches leaves what comes after
 //! them in its submission (labels, cross-queue waits) waiting on work that
 //! never ran, and the title's watchdog ends the run (gpu307). A pipeline
-//! refused for good, or one not made within [`WAIT`], still drops its own
-//! dispatches only, said once.
+//! refused for good, or one not made within the allowance, still drops its
+//! own dispatches only, said once.
 //!
 //! Its pipelines are known by where they come from: created by its code (a
 //! return address in its image on the stack) or from bytecode in its image.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
 
 use super::make::{self, Pending};
 
@@ -85,10 +86,6 @@ fn callers() -> Vec<usize> {
 /// The builder's pipelines (alive while the title holds them).
 static PIPELINES: Mutex<Vec<Weak<Pending>>> = Mutex::new(Vec::new());
 
-/// The longest the builder's dispatches of one frame wait for its
-/// pipelines, below the title's 30 s watchdog.
-pub(crate) const WAIT: Duration = Duration::from_secs(20);
-
 /// The builder created pipeline `p`: its dispatches wait for it
 /// ([`wait_for_pipelines`]), and it is made at once.
 pub(crate) fn note(p: &Arc<Pending>) {
@@ -106,53 +103,35 @@ pub(crate) fn dropped(_p: &Arc<Pending>, why: &str) {
 }
 
 /// Before a dispatch of the builder's: waits until every pipeline it has
-/// created is made or refused, queued ahead of the others, for what is
-/// left of [`WAIT`] in this frame. One lock and a scan once all are made.
+/// created is made or refused, queued at the front, within the frame's
+/// allowance (`make::wait_all`). One lock and a scan once all are made. A
+/// pipeline with no shaders is never made, and never waited for.
 pub(crate) fn wait_for_pipelines() {
     let unmade: Vec<Arc<Pending>> = {
         let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
         pipelines.retain(|p| p.strong_count() > 0);
-        pipelines.iter().filter_map(Weak::upgrade).filter(|p| make::state(p).is_none()).collect()
+        pipelines.iter().filter_map(Weak::upgrade).filter(|p| make::state(p).is_none() && make::has_shaders(p)).collect()
     };
     if unmade.is_empty() {
         return;
     }
-    let left = left_in_frame(crate::frame::current(), Duration::ZERO);
-    if left.is_zero() {
+    let waited = make::wait_all(&unmade);
+    // Said when it waited, else once a presented frame: not per dispatch.
+    static SAID: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if waited.is_zero() && SAID.swap(frame, Ordering::Relaxed) == frame {
         return;
     }
-    let started = Instant::now();
-    let until = started + left;
-    for p in &unmade {
-        make::wait_made(p, until);
-    }
-    let waited = started.elapsed();
-    left_in_frame(crate::frame::current(), waited);
     let still = unmade.iter().filter(|p| make::state(p).is_none()).count();
     let refused = unmade.iter().filter(|p| make::state(p) == Some(false)).count();
     tracing::info!(
-        frame = crate::frame::current(),
+        frame,
         waited_for = unmade.len(),
         still_being_made = still,
         refused,
         ms = waited.as_millis() as u64,
         "BVH builder waited for its pipelines"
     );
-}
-
-/// What is left of [`WAIT`] in `frame`, after counting `waited` in it.
-fn left_in_frame(frame: u64, waited: Duration) -> Duration {
-    static WAITED: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
-    left_of(&mut WAITED.lock().unwrap_or_else(|e| e.into_inner()), frame, waited)
-}
-
-/// [`left_in_frame`] with `w` (the frame, and what was waited in it).
-fn left_of(w: &mut (u64, Duration), frame: u64, waited: Duration) -> Duration {
-    if w.0 != frame {
-        *w = (frame, Duration::ZERO);
-    }
-    w.1 += waited;
-    WAIT.saturating_sub(w.1)
 }
 
 /// Tests that set the builder's image, one at a time.
@@ -166,14 +145,21 @@ pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::*;
 
-    /// A frame's waits share [`WAIT`]; a new frame starts it anew.
+    /// A builder pipeline with no shaders is never made: its dispatches do
+    /// not wait for it, nor count it as being made.
     #[test]
-    fn a_frame_s_waits_share_the_allowance() {
-        let mut w = (u64::MAX, Duration::ZERO);
-        assert_eq!(left_of(&mut w, 7, Duration::ZERO), WAIT);
-        assert_eq!(left_of(&mut w, 7, Duration::from_secs(15)), Duration::from_secs(5));
-        assert_eq!(left_of(&mut w, 7, Duration::from_secs(15)), Duration::ZERO);
-        assert_eq!(left_of(&mut w, 8, Duration::ZERO), WAIT, "another frame");
+    fn a_builder_pipeline_with_no_shaders_is_not_waited_for() {
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        PIPELINES.lock().unwrap().push(Arc::downgrade(&p));
+        let started = std::time::Instant::now();
+        wait_for_pipelines();
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert!(!make::has_shaders(&p) && make::state(&p).is_none());
     }
 
     /// Pipelines are the builder's by their bytecode in its image, or by

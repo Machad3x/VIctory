@@ -27,7 +27,18 @@
 //! frames then took 15 to 26 s against about 1 s. `VICTORY_COMPUTE_WAIT=0`
 //! turns it off. (Idea from Biskwit/VIctory-reloaded 0b6c0e46.)
 //!
-//! shortcut: both budgets are guesses; any other draw the title runs only
+//! All these waits of one presented frame share one [`ALLOWANCE`], well
+//! under the title's 30 s watchdog: screen passes 20 s, compute 20 s and
+//! the builder's 20 s, each a frame (a frame as counted by the title's
+//! frame waits, which go on while a submission waits), added up to more
+//! than 30 s with no present. A pipeline being waited for goes to the front
+//! of its queue (one a draw gave up on stays behind it), and one pipeline is
+//! waited for at most [`ONE_MOST`] over all frames: one that never comes is
+//! not waited for again every frame. Passes over the screen have two
+//! workers of their own and a share of the allowance compute cannot take
+//! (idea from tn1 6563de95, after Belobug 18e57db8).
+//!
+//! shortcut: the budgets are guesses; any other draw the title runs only
 //! once and whose pipeline takes longer than half a second is lost.
 
 use std::collections::VecDeque;
@@ -57,6 +68,8 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// Its place in the early list, if started early.
     place: AtomicUsize,
+    /// Microseconds title threads waited for it, over all frames.
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -97,6 +110,16 @@ impl Pending {
             skipped_shader,
             used: AtomicBool::new(false),
             place: AtomicUsize::new(usize::MAX),
+            waited_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Which share of the allowance its waits take.
+    fn class(&self) -> Class {
+        match (self.screen(), self.urgent()) {
+            (true, _) => Class::Screen,
+            (false, true) => Class::Urgent,
+            (false, false) => Class::Other,
         }
     }
 
@@ -205,15 +228,81 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// All waiting for pipelines allowed per presented frame, over all threads
+/// and classes, well under the title's 30 s watchdog: what else a frame
+/// waits for (page tables, copies) keeps room.
+pub(crate) const ALLOWANCE: Duration = Duration::from_secs(10);
+
+/// Of it, the most for pipelines that are not urgent.
 const BUDGET: Duration = Duration::from_millis(500);
 
-/// The same for urgent pipelines (passes over the screen, compute), below the
-/// title's 30 s GPU watchdog.
-// shortcut: screen passes and compute share this budget, so slow compute
-// pipelines can use it up and a later screen pass of that frame is dropped;
-// split it if a run loses one.
-const SCREEN_BUDGET: Duration = Duration::from_secs(20);
+/// Of it, what is kept for passes over the screen: compute pipelines and
+/// the builder's leave it.
+const SCREEN_RESERVE: Duration = Duration::from_secs(3);
+
+/// The most one pipeline is waited for, over all frames: past it, only
+/// checked (it may still come, and is drawn with then).
+const ONE_MOST: Duration = ALLOWANCE;
+
+/// Which share of the allowance a wait takes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Class {
+    Screen,
+    /// Compute pipelines and the builder's.
+    Urgent,
+    Other,
+}
+
+/// What was waited in a presented frame: in all, and by pipelines that are
+/// not urgent.
+#[derive(Clone, Copy, Debug)]
+struct Spent {
+    frame: u64,
+    all: Duration,
+    other: Duration,
+}
+
+impl Spent {
+    const fn new() -> Spent {
+        Spent { frame: u64::MAX, all: Duration::ZERO, other: Duration::ZERO }
+    }
+
+    /// What `class` may still wait in `frame` (a new frame starts anew).
+    fn left(&mut self, frame: u64, class: Class) -> Duration {
+        if self.frame != frame {
+            *self = Spent { frame, ..Spent::new() };
+        }
+        let all = |cap: Duration| cap.saturating_sub(self.all);
+        match class {
+            Class::Screen => all(ALLOWANCE),
+            Class::Urgent => all(ALLOWANCE - SCREEN_RESERVE),
+            Class::Other => all(ALLOWANCE - SCREEN_RESERVE).min(BUDGET.saturating_sub(self.other)),
+        }
+    }
+
+    /// `class` waited `waited` in `frame` (counted in that frame only).
+    fn spend(&mut self, frame: u64, class: Class, waited: Duration) {
+        if self.frame == frame {
+            self.all += waited;
+            if class == Class::Other {
+                self.other += waited;
+            }
+        }
+    }
+}
+
+static SPENT: Mutex<Spent> = Mutex::new(Spent::new());
+
+fn spent() -> std::sync::MutexGuard<'static, Spent> {
+    SPENT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The frame the allowance belongs to: frames presented. The title's own
+/// frame count goes on while a submission waits, so a budget kept by it
+/// started anew while no frame was shown.
+fn frame() -> u64 {
+    crate::queue::presented()
+}
 
 /// Whether compute pipelines are waited for like screen passes (unless
 /// `VICTORY_COMPUTE_WAIT` is 0).
@@ -221,15 +310,20 @@ fn waits_compute(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_none_or(|v| v != "0")
 }
 
-/// The queue a pipeline goes into, the first served first: urgent pipelines
-/// a draw or dispatch waits for, other draws' pipelines, early starts.
-fn lane(urgent: bool, now: bool) -> usize {
-    match (now, urgent) {
-        (true, true) => 0,
-        (true, false) => 1,
-        (false, _) => 2,
+/// The queue a pipeline goes into, the first served first: passes over the
+/// screen a draw waits for (the only queue [`SCREEN_WORKERS`] take), other
+/// urgent pipelines, other draws' pipelines, early starts.
+fn lane(class: Class, now: bool) -> usize {
+    match (now, class) {
+        (true, Class::Screen) => 0,
+        (true, Class::Urgent) => 1,
+        (true, Class::Other) => 2,
+        (false, _) => 3,
     }
 }
+
+/// Workers that make passes over the screen alone, besides the others.
+const SCREEN_WORKERS: usize = 2;
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -251,7 +345,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, true);
-        wait(p, crate::frame::current());
+        wait(p);
     }
     p.made.get()?.as_ref()
 }
@@ -263,27 +357,50 @@ pub(crate) fn begin(p: &Arc<Pending>) {
     }
 }
 
-/// Queues `p` ahead of the others (as a dispatch waiting for it) and waits
-/// until it is made or refused, or `until`; no frame's budget counts it.
-/// [`state`] then.
-pub(crate) fn wait_made(p: &Arc<Pending>, until: Instant) -> Option<bool> {
-    if p.made.get().is_none() && !p.shaders.is_empty() {
-        start(p, true);
-        WAITERS.fetch_add(1, Ordering::Relaxed);
-        let (lock, done) = &DONE;
-        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while p.made.get().is_none() {
-            let rest = until.saturating_duration_since(Instant::now());
-            if rest.is_zero() {
-                break;
-            }
-            held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-        }
-        drop(held);
-        WAITERS.fetch_sub(1, Ordering::Relaxed);
+/// Queues each of `ps` at the front of the queue (as a dispatch waiting
+/// for it) and waits until all are made or refused, within what is left of
+/// the frame's allowance for urgent pipelines and of each one's
+/// [`ONE_MOST`] (the builder's frames run whole: `super::builder`). What
+/// was waited, counted in the allowance.
+pub(crate) fn wait_all(ps: &[Arc<Pending>]) -> Duration {
+    let frame = frame();
+    let waited_for = |p: &Pending| Duration::from_micros(p.waited_us.load(Ordering::Relaxed));
+    let ps: Vec<&Arc<Pending>> = ps
+        .iter()
+        .filter(|p| p.made.get().is_none() && !p.shaders.is_empty() && waited_for(p) < ONE_MOST)
+        .collect();
+    let left = spent().left(frame, Class::Urgent);
+    if ps.is_empty() || left.is_zero() {
+        return Duration::ZERO;
     }
-    state(p)
+    for p in &ps {
+        start(p, true);
+        to_front(p);
+    }
+    let started = Instant::now();
+    let until = |p: &Pending| left.min(ONE_MOST.saturating_sub(waited_for(p)));
+    WAITERS.fetch_add(1, Ordering::Relaxed);
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let rest = ps.iter().filter(|p| p.made.get().is_none()).map(|p| until(p).saturating_sub(started.elapsed())).max();
+        let Some(rest) = rest.filter(|r| !r.is_zero()) else { break };
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    WAITERS.fetch_sub(1, Ordering::Relaxed);
+    let waited = started.elapsed();
+    for p in &ps {
+        p.waited_us.fetch_add(waited.min(until(p)).as_micros() as u64, Ordering::Relaxed);
+    }
+    spent().spend(frame, Class::Urgent, waited);
+    waited
 }
+/// Whether `p` has shaders (one with none is never made).
+pub(crate) fn has_shaders(p: &Pending) -> bool {
+    !p.shaders.is_empty()
+}
+
 /// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
 /// translated (`Some(false)`), or not yet (`None`); never waits.
 pub(crate) fn state(p: &Pending) -> Option<bool> {
@@ -322,18 +439,16 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
-    // The frame and what was waited of it: other pipelines, urgent ones.
-    static FRAME: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
-    static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-    let urgent = p.urgent();
-    let (of_frame, waited) = (&FRAME[usize::from(urgent)], &WAITED_US[usize::from(urgent)]);
-    if of_frame.swap(frame, Ordering::Relaxed) != frame {
-        waited.store(0, Ordering::Relaxed);
+/// Waits for `p` while the frame has allowance left for its class, and `p`
+/// has some of [`ONE_MOST`] left; at the front of its queue meanwhile.
+fn wait(p: &Arc<Pending>) {
+    let (frame, class) = (frame(), p.class());
+    let own = ONE_MOST.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+    let left = spent().left(frame, class).min(own);
+    if left.is_zero() {
+        return;
     }
-    let budget = if urgent { SCREEN_BUDGET } else { BUDGET };
-    let left = budget.saturating_sub(Duration::from_micros(waited.load(Ordering::Relaxed)));
+    to_front(p);
     let started = Instant::now();
     WAITERS.fetch_add(1, Ordering::Relaxed);
     let (lock, done) = &DONE;
@@ -347,10 +462,12 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     WAITERS.fetch_sub(1, Ordering::Relaxed);
-    let us = started.elapsed().as_micros() as u64;
-    waited.fetch_add(us, Ordering::Relaxed);
+    let waited = started.elapsed();
+    let us = waited.as_micros() as u64;
+    p.waited_us.fetch_add(us, Ordering::Relaxed);
+    spent().spend(frame, class, waited);
     #[cfg(feature = "diagnostics")]
-    if urgent && !p.screen() {
+    if class == Class::Urgent {
         let dropped = p.made.get().is_none();
         COMPUTE_WAITS[0].fetch_add(1, Ordering::Relaxed);
         COMPUTE_WAITS[1].fetch_add(us, Ordering::Relaxed);
@@ -389,20 +506,43 @@ fn save(why: Save) {
 }
 
 /// Pipelines for the workers, by [`lane`].
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 3]>, Condvar) =
-    (Mutex::new([const { VecDeque::new() }; 3]), Condvar::new());
+static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 4]>, Condvar) =
+    (Mutex::new([const { VecDeque::new() }; 4]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// A title thread waits for `p` now: it goes to the front of its draws'
+/// queue, ahead of pipelines draws gave up on (a worker takes the first
+/// entry it finds; the others are passed by).
+fn to_front(p: &Arc<Pending>) {
+    if p.taken.load(Ordering::Relaxed) || p.made.get().is_some() {
+        return;
+    }
+    let (lock, work) = &QUEUES;
+    let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+    front(&mut queues, p);
+    drop(queues);
+    work.notify_all();
+}
+
+/// [`to_front`] on `queues`: once, if not first already.
+fn front(queues: &mut [VecDeque<Arc<Pending>>; 4], p: &Arc<Pending>) {
+    let lane = &mut queues[lane(p.class(), true)];
+    if !lane.front().is_some_and(|q| Arc::ptr_eq(q, p)) {
+        lane.push_front(p.clone());
+    }
+}
+
+/// Hands `p` to the workers (half the logical processors, 2 to 8, and
+/// [`SCREEN_WORKERS`]), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        (0..n)
-            .filter(|i| {
+        (0..n + SCREEN_WORKERS)
+            .filter(|&i| {
+                let screens_only = i >= n;
                 let spawned = std::thread::Builder::new()
                     .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
+                    .spawn(move || work(screens_only));
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
@@ -419,9 +559,10 @@ fn queue(p: Arc<Pending>, now: bool) {
         return;
     }
     let (lock, work) = &QUEUES;
-    let lane = lane(p.urgent(), now);
-    push(&mut lock.lock().unwrap_or_else(|e| e.into_inner())[lane], p, lane == 2);
-    work.notify_one();
+    let lane = lane(p.class(), now);
+    push(&mut lock.lock().unwrap_or_else(|e| e.into_inner())[lane], p, lane == 3);
+    // All: a worker for screen passes alone may be the one woken.
+    work.notify_all();
 }
 
 /// Adds `p`; in the early starts' queue (`by_place`) after its equals by
@@ -437,20 +578,24 @@ fn push(queue: &mut VecDeque<Arc<Pending>>, p: Arc<Pending>, by_place: bool) {
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
-/// the cache when idle (first uses of pipelines made before).
-fn work() {
-    // Below the title's own threads (loading, recording).
+/// the cache when idle (first uses of pipelines made before);
+/// `screens_only`: passes over the screen alone.
+fn work(screens_only: bool) {
+    // Below the title's own threads (loading, recording), but for the
+    // screen passes' workers.
     // SAFETY: a plain call on our own thread.
     unsafe {
         use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        let priority = if screens_only { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_BELOW_NORMAL };
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
     }
     let (lock, work) = &QUEUES;
+    let lanes = if screens_only { 1 } else { 4 };
     loop {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                if let Some(p) = queues[..lanes].iter_mut().find_map(VecDeque::pop_front) {
                     break p;
                 }
                 let (held, waited) = work
@@ -537,9 +682,11 @@ mod tests {
     /// before early starts.
     #[test]
     fn screen_passes_go_first() {
-        assert!(lane(true, true) < lane(false, true));
-        assert!(lane(false, true) < lane(true, false));
-        assert_eq!(lane(true, false), lane(false, false));
+        assert!(lane(Class::Screen, true) < lane(Class::Urgent, true));
+        assert!(lane(Class::Urgent, true) < lane(Class::Other, true));
+        assert!(lane(Class::Other, true) < lane(Class::Screen, false));
+        assert_eq!(lane(Class::Screen, false), lane(Class::Other, false));
+        assert_eq!(lane(Class::Screen, true), 0, "the screen workers' only queue");
         let p = Pending::new(
             Vec::new(),
             None,
@@ -547,6 +694,88 @@ mod tests {
             &[],
         );
         assert!(!p.screen());
+    }
+
+    /// One allowance a presented frame for every wait: urgent ones (compute,
+    /// the builder) and others leave the screen passes' reserve, others take
+    /// half a second at most, and a new presented frame starts anew. The
+    /// waits gpu313 added up (20 s compute, 20 s builder) stay below it.
+    #[test]
+    fn a_frame_s_waits_share_one_allowance() {
+        let mut s = Spent::new();
+        assert_eq!(s.left(7, Class::Screen), ALLOWANCE);
+        assert_eq!(s.left(7, Class::Urgent), ALLOWANCE - SCREEN_RESERVE);
+        assert_eq!(s.left(7, Class::Other), BUDGET);
+        s.spend(7, Class::Other, BUDGET);
+        assert_eq!(s.left(7, Class::Other), Duration::ZERO);
+        assert_eq!(s.left(7, Class::Urgent), ALLOWANCE - SCREEN_RESERVE - BUDGET);
+        s.spend(7, Class::Urgent, Duration::from_secs(20));
+        assert_eq!(s.left(7, Class::Urgent), Duration::ZERO, "the builder after compute");
+        assert_eq!(s.left(7, Class::Screen), Duration::ZERO, "nothing past the allowance");
+        assert!(ALLOWANCE < Duration::from_secs(30) / 2, "well under the watchdog");
+        // A wait that ends after the next present counts in no frame.
+        s.spend(6, Class::Screen, Duration::from_secs(5));
+        assert_eq!(s.left(8, Class::Screen), ALLOWANCE, "a new presented frame");
+        let mut s = Spent::new();
+        s.spend(u64::MAX, Class::Urgent, ALLOWANCE - SCREEN_RESERVE);
+        assert_eq!(s.left(u64::MAX, Class::Screen), SCREEN_RESERVE, "kept for screen passes");
+    }
+
+    /// A pipeline waited for goes to the front of its queue, once, ahead of
+    /// those queued before that no one waits for now.
+    #[test]
+    fn a_pipeline_waited_for_goes_first() {
+        let new = || {
+            Arc::new(Pending::new(
+                Vec::new(),
+                None,
+                #[cfg(feature = "diagnostics")]
+                &[],
+            ))
+        };
+        let mut queues = [const { VecDeque::new() }; 4];
+        let (given_up, waited) = (new(), new());
+        let lane = lane(given_up.class(), true);
+        push(&mut queues[lane], given_up.clone(), false);
+        push(&mut queues[lane], waited.clone(), false);
+        front(&mut queues, &waited);
+        front(&mut queues, &waited);
+        let order: Vec<bool> = queues[lane].iter().map(|p| Arc::ptr_eq(p, &waited)).collect();
+        assert_eq!(order, [true, false, true], "first, once; its later entry is passed by");
+    }
+
+    /// A pipeline that never comes is waited for [`ONE_MOST`] in all, not
+    /// again every frame; one refused is not waited for.
+    #[test]
+    fn a_pipeline_that_never_comes_is_not_waited_for_again() {
+        let shader = Arc::new(Shader {
+            stage: "compute",
+            hash: "never made".into(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+            partial: OnceLock::new(),
+        });
+        let p = Arc::new(Pending::new(
+            vec![shader],
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        // Never handed to a worker: taken, so no worker makes it here.
+        p.taken.store(true, Ordering::Relaxed);
+        p.waited_us.store(ONE_MOST.as_micros() as u64, Ordering::Relaxed);
+        let started = Instant::now();
+        assert_eq!(wait_all(std::slice::from_ref(&p)), Duration::ZERO);
+        wait(&p);
+        assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+        let refused = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        assert_eq!(wait_all(&[refused]), Duration::ZERO, "nothing to make");
+        WAITING.fetch_sub(u64::from(p.queued.load(Ordering::Relaxed)), Ordering::Relaxed);
     }
 
     /// Compute pipelines wait like screen passes unless told not to.
