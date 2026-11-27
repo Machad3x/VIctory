@@ -1151,10 +1151,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         if !landed.is_empty() {
             crate::inplace::written(landed.len() as u64);
-            // Trackers of other kinds over them (texture stagings) take
+            // Every tracker over them (texture stagings among them) takes
             // title memory again.
             for at in landed {
-                crate::watch::retake(at, crate::watch::PAGE);
+                crate::watch::landed(at, crate::watch::PAGE);
             }
         }
         #[cfg(feature = "diagnostics")]

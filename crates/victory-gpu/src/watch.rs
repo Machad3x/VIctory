@@ -1251,8 +1251,6 @@ fn own_views() -> bool {
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    // Page tables naming it in place name it anew.
-    crate::inplace::views_changed();
     let mut g = guards();
     // What it showed is gone already: nothing to keep. The other mappings
     // of it did not change: marked, their copies lost shaders' writes.
@@ -1265,6 +1263,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for page in gone {
         g.own.remove(&page);
     }
+    // Page tables naming it in place name it anew: after its views of our
+    // own are forgotten, so that a rewrite meanwhile sees them gone.
+    crate::inplace::views_changed();
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     let mut others = Vec::new();
@@ -1302,6 +1303,20 @@ pub(crate) fn retake(at: usize, len: usize) {
     mark_copies(&g, first, last);
     for page in others {
         mark_copies(&g, page, page + 1);
+    }
+}
+
+/// Shaders wrote `[at, at + len)` of title memory itself (in place,
+/// `crate::inplace`): every tracker holding it, of every kind (host copies,
+/// textures' staging, heaps), aliases too, counts it changed, as after a
+/// write of the title's. Guards stay: the title did not write.
+pub(crate) fn landed(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark(&mut g, first, last, false, None);
+    for page in others {
+        mark(&mut g, page, page + 1, false, None);
     }
 }
 
