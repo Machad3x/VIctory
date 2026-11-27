@@ -136,6 +136,33 @@ static NAMES: Names = Names::new();
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
+/// The library file's length and hash, written after it: a library that
+/// does not match (half written when the PC went down) is not loaded.
+const SUM_FILE: &str = "host-pipelines.sum";
+
+/// What [`SUM_FILE`] holds for `blob`.
+fn sum(blob: &[u8]) -> String {
+    format!("{} {}", blob.len(), blake3::hash(blob).to_hex())
+}
+
+/// Whether `blob` may be loaded: its sum matches, or there is none (a
+/// library saved before sums were kept).
+fn whole(blob: &[u8], saved: Option<&[u8]>) -> bool {
+    saved.is_none_or(|s| s.trim_ascii() == sum(blob).as_bytes())
+}
+
+/// Removes staging files earlier processes left in `dir` (a crash or the
+/// title's watchdog during a save: about 2 GB each).
+fn remove_stale_staging(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let ours = format!(".tmp-{}-", std::process::id());
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.contains(".tmp-") && !name.contains(&ours) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
 
@@ -145,7 +172,14 @@ fn library() -> Option<&'static Shared> {
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let read = |file| DIR.get().and_then(|d| std::fs::read(d.join(file)).ok());
-            let blob = read(LIBRARY_FILE).unwrap_or_default();
+            if let Some(d) = DIR.get() {
+                remove_stale_staging(d);
+            }
+            let mut blob = read(LIBRARY_FILE).unwrap_or_default();
+            if !blob.is_empty() && !whole(&blob, read(SUM_FILE).as_deref()) {
+                tracing::warn!(bytes = blob.len(), "host pipeline library does not match its sum (cut short?); starting an empty one");
+                blob = Vec::new();
+            }
             let tag = tag(&blob);
             let mut library = open(&device, blob);
             // The pre-build's list, if it was saved with these bytes.
@@ -419,6 +453,8 @@ pub(crate) fn save(why: Save) {
         UNSAVED.store(0, Ordering::Relaxed);
     }
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    // A save that fails leaves the early list to the next.
+    let unsaved_list = || USED_CHANGED.fetch_or(used_changed, Ordering::Relaxed);
     let staged = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         library.store(&mut l, None);
@@ -433,7 +469,10 @@ pub(crate) fn save(why: Save) {
                     .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
                 match written {
                     Ok(()) => tracing::debug!(early = used.len(), "early pipeline list saved"),
-                    Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
+                    Err(e) => {
+                        unsaved_list();
+                        tracing::warn!(error = %e, "early pipeline list not saved");
+                    }
                 }
             }
             return;
@@ -445,6 +484,7 @@ pub(crate) fn save(why: Save) {
             Ok(s) => s,
             Err(e) => {
                 // Left for a later save: the pipelines stay counted as added.
+                unsaved_list();
                 tracing::warn!(bytes = size, error = %e, "no file to serialise the host pipeline library into; saved later");
                 return;
             }
@@ -452,25 +492,33 @@ pub(crate) fn save(why: Save) {
         // SAFETY: a mapped view of the size the library asks for.
         match unsafe { l.library.Serialize(staged.bytes_mut()) } {
             Ok(()) => {
-                l.added = 0;
+                let added = std::mem::take(&mut l.added);
                 l.prebuilt_changed = false;
-                (staged, (!l.prebuilt.is_empty()).then(|| l.prebuilt.clone()))
+                (staged, added, (!l.prebuilt.is_empty()).then(|| l.prebuilt.clone()))
             }
             Err(e) => {
+                unsaved_list();
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 return;
             }
         }
     };
-    let (staged, prebuilt) = staged;
+    let (staged, added, prebuilt) = staged;
     let bytes = staged.bytes().len();
     // Hashed outside the lock: the blob is the whole library (1.7 GB on
     // NVIDIA). Kept beside the bytes it holds for (also when a run adds
-    // pipelines).
+    // pipelines), and its sum beside it, checked when it is loaded.
     let prebuilt = prebuilt.map(|keys| list(&tag(staged.bytes()), &keys));
+    let sum = sum(staged.bytes());
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = staged
-        .finish()
+    let written = staged.finish();
+    if written.is_err() {
+        // Not on disk: stored again by the next save.
+        library.state.lock().unwrap_or_else(|e| e.into_inner()).added += added.max(1);
+        unsaved_list();
+    }
+    let written = written
+        .and_then(|()| write_atomically(&dir.join(SUM_FILE), sum.as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -581,8 +629,22 @@ impl Staged {
         unsafe { std::slice::from_raw_parts_mut(self.at, self.len) }
     }
 
-    /// Unmaps and closes the file, then renames it over the target.
+    /// Writes the bytes out (the view, then the file: a rename is journaled
+    /// at once, mapped pages are written lazily), unmaps and closes the
+    /// file, then renames it over the target.
     fn finish(mut self) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Memory::FlushViewOfFile;
+        // SAFETY: our live view of `len` bytes.
+        if unsafe { FlushViewOfFile(self.at.cast(), self.len) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: our open file's handle.
+        if let Some(file) = &self.file
+            && unsafe { windows_sys::Win32::Storage::FileSystem::FlushFileBuffers(file.as_raw_handle()) } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
         self.close();
         let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
         std::fs::rename(&self.tmp, &self.path)
@@ -736,6 +798,30 @@ mod tests {
         assert!(Staged::new(&target, 0).is_err());
         assert!(Staged::new(&target, usize::MAX / 4).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// A library is loaded only if it matches its sum (or has none, saved
+    /// before sums were kept); staging files of other processes are removed.
+    #[test]
+    fn a_library_cut_short_is_not_loaded_and_stale_staging_goes() {
+        let blob = b"a library's bytes".repeat(100);
+        let saved = sum(&blob);
+        assert!(whole(&blob, Some(saved.as_bytes())));
+        assert!(whole(&blob, Some(format!("{saved}\n").as_bytes())));
+        assert!(whole(&blob, None), "saved before sums");
+        assert!(!whole(&blob[..blob.len() - 1], Some(saved.as_bytes())), "cut short");
+        let mut zeroed = blob.clone();
+        zeroed[500..600].fill(0);
+        assert!(!whole(&zeroed, Some(saved.as_bytes())), "pages never written");
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join(format!("{LIBRARY_FILE}.tmp-1-0"));
+        let ours = staging(&dir.path().join(LIBRARY_FILE));
+        let kept = dir.path().join(LIBRARY_FILE);
+        for f in [&stale, &ours, &kept] {
+            std::fs::write(f, b"x").unwrap();
+        }
+        remove_stale_staging(dir.path());
+        assert!(!stale.exists() && ours.exists() && kept.exists());
     }
 
     /// Saves come after `SAVE_AFTER` pipelines, when the workers run out
