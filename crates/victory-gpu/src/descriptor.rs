@@ -871,6 +871,20 @@ pub(crate) mod tests {
     /// The work [`WHILE_MAKING`] runs.
     pub(crate) type Work = Box<dyn FnOnce() + Send>;
 
+    /// Work to run when a host heap's mirror of the slot at a title address
+    /// (the address) is about to take the slot lock.
+    pub(crate) static BEFORE_SLOT_LOCK: std::sync::Mutex<Option<(u64, Work)>> = std::sync::Mutex::new(None);
+
+    pub(crate) fn before_slot_lock(handle: u64) {
+        let mut hook = BEFORE_SLOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if hook.as_ref().is_some_and(|&(at, _)| at == handle)
+            && let Some((_, work)) = hook.take()
+        {
+            drop(hook);
+            work();
+        }
+    }
+
     pub(crate) fn while_making(slots: &[u32]) {
         let mut hook = WHILE_MAKING.lock().unwrap_or_else(|e| e.into_inner());
         if hook.as_ref().is_some_and(|(slot, _)| slots.contains(slot))

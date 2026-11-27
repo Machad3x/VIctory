@@ -864,6 +864,8 @@ impl HostHeap {
         // (title threads writing views, heap syncs, draws) may run side by
         // side, and the record each writer wrote is in memory before its
         // mirror starts, so the last to take the lock makes the newest.
+        #[cfg(test)]
+        super::tests::before_slot_lock(handle);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2940,6 +2942,35 @@ mod tests {
         crate::descriptor::make_read(&[read]);
         assert!(crate::descriptor::tests::WHILE_MAKING.lock().unwrap().is_none(), "the make ran");
         assert!(host.kept(read), "made for the read");
+    }
+
+    /// A mirror held up before the slot lock while the title writes a newer
+    /// view there (and mirrors it) makes what the slot holds by then: it
+    /// leaves the newer view, not the record it would have read before.
+    #[test]
+    fn a_late_mirror_leaves_the_newer_view() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        let host = title_heap.host().expect("a host view heap");
+        assert!(!host.made(0), "slot 0 holds no view yet");
+        // While a draw's mirror of slot 0 waits for the slot lock, the title
+        // writes a view there (a view of no memory, as in the heap sync test)
+        // and mirrors it itself.
+        *crate::descriptor::tests::BEFORE_SLOT_LOCK.lock().unwrap() = Some((
+            start,
+            Box::new(move || crate::descriptor::create_cbv(std::ptr::null(), &[0, 0, 256, 0], start)),
+        ));
+        let _ = host.mirror(0, start, true);
+        assert!(crate::descriptor::tests::BEFORE_SLOT_LOCK.lock().unwrap().is_none(), "the write ran");
+        assert!(host.made(0), "the late mirror leaves the view written meanwhile");
     }
 
     /// A heap sync mirrors the slots whose records the title changed as bytes
