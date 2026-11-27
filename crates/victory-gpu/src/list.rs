@@ -1175,8 +1175,7 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (data, title) = (data as usize, title as usize);
     // Host bytes per title byte: 2 for 16-bit packed texels, 1 for R9G9B9E5.
     let scale = packed.and_then(crate::resource::element).map_or(1, |e| 4 / e.0 as usize);
-    // What shaders rendered: withheld with the list's copies if it missed.
-    list.defer_after_results(move || {
+    list.defer_after(move || {
         let mut row = Vec::new();
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
