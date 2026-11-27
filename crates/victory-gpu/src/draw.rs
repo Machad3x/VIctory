@@ -845,6 +845,8 @@ impl State {
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::DrawPrepareNs);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -1651,6 +1653,8 @@ impl State {
     /// Within a list, the same table holding the same descriptors is made
     /// once.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::DrawTablesNs);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the

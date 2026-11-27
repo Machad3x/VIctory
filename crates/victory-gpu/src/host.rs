@@ -1583,7 +1583,14 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        #[cfg(feature = "diagnostics")]
+        let locking = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepLockNs);
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        {
+            drop(locking);
+            crate::copystat::execute_start();
+        }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -1595,7 +1602,11 @@ impl Host {
         let mut flight = crate::copystat::flight_begin();
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
-        crate::resource::evict_unused();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepEvictNs);
+            crate::resource::evict_unused();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -1691,7 +1702,11 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
-        crate::shadow::snapshots_ahead(&snapshots);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepSnapshotsNs);
+            crate::shadow::snapshots_ahead(&snapshots);
+        }
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         {
@@ -1701,6 +1716,8 @@ impl Host {
                 batch.touch(at, len);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let listing = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepListsNs);
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -1712,7 +1729,13 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(listing);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepFlushNs);
+            batch.flush();
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -1741,7 +1764,11 @@ impl Host {
         let groups = [&lists[..]];
         // Clear read marks of slots forgotten before this submission (placed
         // textures written or evicted) so reads in it are not wiped after it.
-        crate::shadow::clear_forgotten_reads();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepForgottenNs);
+            crate::shadow::clear_forgotten_reads();
+        }
         // What shaders write into copies in video memory comes back into
         // their mirrors (`crate::shadow::pull`, for the copy-backs) in an
         // ExecuteCommandLists of its own right after the lists': its end
@@ -1989,18 +2016,28 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, ..)| (s.clone(), *a, *n))
             .collect();
-        crate::shadow::copy_back_marks(&withheld, withholding);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleMarksNs);
+            crate::shadow::copy_back_marks(&withheld, withholding);
+        }
         // Texture views left null that shaders read: made for what follows.
+        #[cfg(feature = "diagnostics")]
+        let reading = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleReadsNs);
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
             crate::descriptor::make_read(&read);
         }
+        #[cfg(feature = "diagnostics")]
+        drop(reading);
         // What shaders wrote into copies in video memory, for the copy-backs
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
         // Done with the lists when it rode them (`riding`): what ran on the
         // CPU since keeps video memory and the mirrors alike, or marks the
         // pages stale.
+        #[cfg(feature = "diagnostics")]
+        let pulling = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettlePullNs);
         if !pulled {
             crate::shadow::pull(&snapshots);
             if let Some(Some(r)) = &mut riding {
@@ -2012,6 +2049,8 @@ impl Host {
                 r.guard.busy &= unsafe { self.fence.GetCompletedValue() } < *submitted;
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(pulling);
         struct Kept(Regions);
         // SAFETY: D3D12 resources are free-threaded; only released there.
         unsafe impl Send for Kept {}
@@ -2022,6 +2061,8 @@ impl Host {
         };
         static RETAKE_ALL: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RETAKE_ALL").is_some_and(|v| v != "0"));
+        #[cfg(feature = "diagnostics")]
+        let backing = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleBackNs);
         for (shadow, address, len, goes_back, marked) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -2038,7 +2079,11 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(backing);
         crate::shadow::snapshots_done(&snapshots);
+        #[cfg(feature = "diagnostics")]
+        let after = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleAfterNs);
         // Copies kept past the lists' run: what the shaders wrote reached
         // title memory in the copy-backs above, so a deferred copy's source
         // is new now (and its destination is not overwritten by them).
@@ -2051,6 +2096,8 @@ impl Host {
                 work();
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(after);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -2090,6 +2137,8 @@ impl Host {
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps, kept)));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::execute_end();
         self.log_messages();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).

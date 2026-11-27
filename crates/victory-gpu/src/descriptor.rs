@@ -135,7 +135,11 @@ fn mirror(handle: u64) {
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
-    drop(waited);
+    {
+        let ns = waited.0.elapsed().as_nanos() as u64;
+        crate::copystat::MIRROR_WAIT_MAX.fetch_max(ns, std::sync::atomic::Ordering::Relaxed);
+        drop(waited);
+    }
     let Some(&(_, _, at)) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))

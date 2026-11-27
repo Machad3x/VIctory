@@ -218,6 +218,42 @@ pub(crate) enum C {
     /// changed, or unmade holding a view record), of the `SyncSlots`
     /// looked at.
     SyncChanged,
+    /// Prep study, nanoseconds per frame: waiting for the submission lock,
+    /// giving up unused textures, snapshots ahead, the lists' deferred
+    /// steps and preludes, the last batch flush, clearing forgotten reads;
+    /// and wall time between one submission's end and the next's start.
+    PrepLockNs,
+    PrepEvictNs,
+    PrepSnapshotsNs,
+    PrepListsNs,
+    PrepFlushNs,
+    PrepForgottenNs,
+    ExecuteGapNs,
+    /// Heap syncs: comparing records, and the mirrors of stale slots;
+    /// stale slots that were stale at the last sync of them too.
+    SyncCompareNs,
+    SyncMirrorNs,
+    SyncStaleRepeat,
+    /// All mirrors: preparing views (`prepare`), making them, and how many
+    /// were made and how many found no view.
+    MirrorPrepareNs,
+    MirrorMakeNs,
+    MirrorMade,
+    MirrorNull,
+    /// Draw recording on title threads: preparing draws, of it tables.
+    DrawPrepareNs,
+    DrawTablesNs,
+    /// Heap texture uploads: calls, textures walked, textures queued.
+    UploadsCalls,
+    UploadsWalked,
+    UploadsQueued,
+    /// Settle: texture reads made, copy-back marks, the pull, copy-backs,
+    /// late copies and deferred work after.
+    SettleReadsNs,
+    SettleMarksNs,
+    SettlePullNs,
+    SettleBackNs,
+    SettleAfterNs,
     /// Nanoseconds threads waited for a copy's stale page lock another
     /// held (a riding pull holds them over its submission's wait).
     StaleLockWaitNs,
@@ -234,6 +270,32 @@ pub(crate) static HANDLER_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
 /// (`VirtualProtect`), since the last line, nanoseconds.
 pub(crate) static HANDLER_SAVE_MAX: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HANDLER_OPEN_MAX: AtomicU64 = AtomicU64::new(0);
+/// The longest wait of a title descriptor write for the shader-visible
+/// heaps' lock since the last line, nanoseconds.
+pub(crate) static MIRROR_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds since the first call.
+fn epoch_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// When the last host submission ended (0: none yet).
+static LAST_END: AtomicU64 = AtomicU64::new(0);
+
+/// A host submission took the submission lock: the time since the last
+/// one ended counts as the gap between them.
+pub(crate) fn execute_start() {
+    let (now, last) = (epoch_ns(), LAST_END.load(Relaxed));
+    if last != 0 {
+        add(C::ExecuteGapNs, now.saturating_sub(last));
+    }
+}
+
+/// A host submission ended.
+pub(crate) fn execute_end() {
+    LAST_END.store(epoch_ns(), Relaxed);
+}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -616,6 +678,35 @@ pub(crate) fn log(frames: f64) {
             c[C::ClosingTable as usize],
         );
     }
+    let n = |k: C| c[k as usize] / 1e6;
+    tracing::info!(
+        "  prep study per frame (ms): lock wait {:.2}, evict {:.2}, snapshots {:.2}, lists {:.2}, last flush {:.2}, forgotten reads {:.2}; gap between submissions {:.2}; sync heaps: compare {:.2}, mirror {:.2}, {:.0} stale again; mirrors: prepare {:.2}, make {:.2}, {:.0} made, {:.0} null; title writes' longest heap lock wait {:.2}; draws: prepare {:.2} (tables {:.2}); uploads: {:.1} calls, {:.0} textures walked, {:.1} queued; settle: reads {:.2}, marks {:.2}, pull {:.2}, copy-backs {:.2}, after {:.2}",
+        n(C::PrepLockNs),
+        n(C::PrepEvictNs),
+        n(C::PrepSnapshotsNs),
+        n(C::PrepListsNs),
+        n(C::PrepFlushNs),
+        n(C::PrepForgottenNs),
+        n(C::ExecuteGapNs),
+        n(C::SyncCompareNs),
+        n(C::SyncMirrorNs),
+        c[C::SyncStaleRepeat as usize],
+        n(C::MirrorPrepareNs),
+        n(C::MirrorMakeNs),
+        c[C::MirrorMade as usize],
+        c[C::MirrorNull as usize],
+        MIRROR_WAIT_MAX.swap(0, Relaxed) as f64 / 1e6,
+        n(C::DrawPrepareNs),
+        n(C::DrawTablesNs),
+        c[C::UploadsCalls as usize],
+        c[C::UploadsWalked as usize],
+        c[C::UploadsQueued as usize],
+        n(C::SettleReadsNs),
+        n(C::SettleMarksNs),
+        n(C::SettlePullNs),
+        n(C::SettleBackNs),
+        n(C::SettleAfterNs),
+    );
     tracing::info!(
         "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}",
         c[C::FlightPrepNs as usize] / 1e6,

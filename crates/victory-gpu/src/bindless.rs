@@ -234,8 +234,12 @@ pub(crate) fn uploads(
         }
     }
     let mut done = crate::fx::Set::default();
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::UploadsCalls, 1);
     for viewed in heaps {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::UploadsWalked, inner.textures.len() as u64);
         for &r in inner.textures.keys() {
             if !done.insert(r) {
                 continue;
@@ -266,6 +270,8 @@ pub(crate) fn uploads(
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::UploadsQueued, work.len() as u64);
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();

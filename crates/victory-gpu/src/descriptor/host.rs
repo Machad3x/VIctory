@@ -63,6 +63,9 @@ pub(crate) struct HostHeap {
     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+    /// Prep study: a bit per slot found stale at its last heap sync.
+    #[cfg(feature = "diagnostics")]
+    stale_seen: Mutex<Vec<u64>>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -216,6 +219,8 @@ impl HostHeap {
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            stale_seen: Default::default(),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -748,6 +753,12 @@ impl HostHeap {
         // Stale slots by reason: unmade, recycled, rewritten, released.
         #[cfg(feature = "diagnostics")]
         let mut reasons = [0u64; 4];
+        #[cfg(feature = "diagnostics")]
+        let (mut repeats, mut seen, comparing) = (
+            0u64,
+            self.stale_seen.lock().unwrap_or_else(|e| e.into_inner()),
+            std::time::Instant::now(),
+        );
         let mut stale = Vec::new();
         // The records' bytes, copied by the kernel in one read: reading
         // them in place faults on guarded pages (run gpu274: 63,602 faults
@@ -797,6 +808,19 @@ impl HostHeap {
                     // Made from this record: stale unless its view is current.
                     Some(_) => current() != Some(true),
                 };
+                #[cfg(feature = "diagnostics")]
+                {
+                    let (w, bit) = (i as usize / 64, 1u64 << (i % 64));
+                    if seen.len() <= w {
+                        seen.resize(w + 1, 0);
+                    }
+                    if is_stale {
+                        repeats += u64::from(seen[w] & bit != 0);
+                        seen[w] |= bit;
+                    } else {
+                        seen[w] &= !bit;
+                    }
+                }
                 if !is_stale {
                     continue;
                 }
@@ -827,7 +851,12 @@ impl HostHeap {
             add(C::SyncStaleRewritten, reasons[2]);
             add(C::SyncStaleReleased, reasons[3]);
             add(C::SyncChanged, stale.len() as u64);
+            add(C::SyncStaleRepeat, repeats);
+            add(C::SyncCompareNs, comparing.elapsed().as_nanos() as u64);
+            drop(seen);
         }
+        #[cfg(feature = "diagnostics")]
+        let _mirroring = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncMirrorNs);
         for &i in &stale {
             self.mirror(i, at(i), false);
         }
@@ -879,6 +908,8 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::MirrorNull, 1);
             }
             return None;
         };
@@ -952,7 +983,11 @@ impl HostHeap {
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
-            prepare(&view);
+            {
+                #[cfg(feature = "diagnostics")]
+                let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MirrorPrepareNs);
+                prepare(&view);
+            }
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
@@ -974,11 +1009,18 @@ impl HostHeap {
                 crate::shadow::forget_read(index);
             }
             made[index as usize] = key;
+            #[cfg(feature = "diagnostics")]
+            let making = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MirrorMakeNs);
             let (kept, mark, skip) = if later {
                 (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(index))
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                drop(making);
+                crate::copystat::add(crate::copystat::C::MirrorMade, 1);
+            }
             self.set_stride(index, Some(&view), skip);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
