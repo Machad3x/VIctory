@@ -36,15 +36,44 @@
 //! system has not unlocked the pages yet).
 //!
 //! Private memory (`MEM_PRIVATE`: `xmem`'s heaps, the title's
-//! `VirtualAlloc`s) is out of scope and falls back to what it was without
-//! the backstop: pages no copy holds stay misses (zeros, writes dropped,
-//! writes withheld). A heap over private memory would lock the title's own
-//! addresses, so the title's `VirtualProtect`/`VirtualFree` and the write
-//! guards would fail there (`crate::pinned` is how they would let go
-//! first). Nothing opens it: runs come only from views of our own, and
-//! [`open_run`] refuses any range that is not one mapped view.
-//! shortcut: private memory with no copy is not covered; open it (through
-//! `crate::pinned`) once the misses-by-kind frame line shows such misses.
+//! `VirtualAlloc`s) is out of the backstop's scope: pages no copy holds
+//! stay misses (zeros, writes dropped, writes withheld). A heap over it
+//! locks the title's own addresses, so the title's `VirtualProtect` and
+//! `VirtualFree` and the write guards fail there (error 87). [`open_run`]
+//! refuses any range that is not one mapped view of ours, with one
+//! exception, below: a private run, asked as such, wholly in private
+//! memory the runtime reported ([`private_open`]).
+//!
+//! `VICTORY_RT_MEMORY=1` (off by default; it turns the backstop on) covers
+//! it too, for the title's ray-tracing structures: its acceleration-
+//! structure builder reaches its inputs, scratch and output by addresses
+//! it computes, in committed private memory no view ever named (gpu287,
+//! gpu288: ~12,000 pages, whole 256 MiB regions), so every builder list
+//! read zeros there and all it wrote was dropped. The runtime reports the
+//! title's private allocations ([`title_memory_private`]); each page of
+//! them that is committed, read-write, held by no copy and no tracker is
+//! named in place, in runs of at most [`CHUNK`] pages, and the page table
+//! waits for the worker to open them ([`wait_private`]): they are there
+//! before the submission runs. Nothing is copied: what shaders write
+//! there is in title memory at once, for later submissions and for the
+//! title's CPU. With it, lists that still miss memory withhold nothing
+//! (`crate::memory::withholds`): part of a build in place and part
+//! dropped would be worse than either.
+//!
+//! What the lock on such pages asks:
+//! * The title protects, decommits or frees them: each run is registered
+//!   with `crate::pinned`, whose callers (the runtime's `VirtualProtect`,
+//!   `VirtualFree` and unmapping) let it go first ([`release_private`]:
+//!   forgotten, dropped from the page tables once no submission runs, its
+//!   heap released), and try again while the system unlocks the pages.
+//! * A tracker is made over them (a new buffer's copy, a texture's
+//!   staging) and wants to guard them: the runs there are let go first
+//!   ([`make_way`], which never waits), and the pages around are named
+//!   again. Until the heap is gone the pages stay locked ([`locked`]), and
+//!   `crate::watch` sets no guard on them: they count as changed and are
+//!   copied at each use, as memory that cannot be guarded.
+//! shortcut: such heaps are system memory, as loose copies are; move the
+//! hot ones to video memory if the builder's lists run long.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -89,14 +118,24 @@ pub(crate) fn open_at(device: &ID3D12Device, at: usize, len: usize) -> windows::
 pub(crate) fn backstop() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("VICTORY_INPLACE_BACKSTOP").is_some_and(|v| v == "1"));
+    *ON || rt_memory()
+}
+
+/// Whether the title's private memory no copy holds is named in place too,
+/// and nothing is withheld (`VICTORY_RT_MEMORY=1`).
+pub(crate) fn rt_memory() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RT_MEMORY").is_some_and(|v| v == "1"));
     *ON
 }
 
-/// The most bytes open in place at once (`VICTORY_INPLACE_MB`, 1024):
-/// opening locks the pages into the PC's memory.
+/// The most bytes open in place at once (`VICTORY_INPLACE_MB`, 1024; 8192
+/// with `VICTORY_RT_MEMORY`, the title's private heaps): opening locks the
+/// pages into the PC's memory.
 fn budget() -> usize {
     static MB: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024)
+        let most = if rt_memory() { 8192 } else { 1024 };
+        std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(most)
     });
     MB.saturating_mul(1 << 20)
 }
@@ -107,15 +146,39 @@ const MOST: usize = 1 << 28;
 /// overlap, up to a raw view's reach (2^27 dwords).
 const LONGEST: usize = 2 * MOST;
 
+/// Pages of a run over private memory, which starts and ends where title
+/// addresses are multiples of it (8 MiB): a tracker made in one, or a
+/// protection of the title's, lets go of that much, and opening it again
+/// takes ~2 ms.
+pub(crate) const CHUNK: usize = 128;
+/// The longest a page table waits for the worker to open private runs it
+/// asked for ([`wait_private`]): opening 256 MiB took 70 ms where measured.
+const PRIVATE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Our own view's `[at, at + len)` open in place: a heap over it and one
 /// buffer placed over all of it.
 pub(crate) struct Run {
     /// Tells runs apart in the page tables' view pairs (an address may be
     /// opened again after a release).
     pub(crate) id: u64,
+    /// Where it starts (our view's address; private memory's own).
+    at: usize,
     pub(crate) len: usize,
     pub(crate) buffer: ID3D12Resource,
+    /// Over the title's private memory, at its own address: its pages are
+    /// [`locked`] while it lives.
+    private: bool,
     _heap: ID3D12Heap,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        if self.private {
+            // The heap goes right after: the system unlocks the pages.
+            locked_ranges().remove(&(self.at, self.id));
+            LOCKED.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: D3D12 objects are free-threaded; the rest is plain data.
@@ -163,6 +226,48 @@ fn with_runs<R>(f: impl FnOnce(&mut Runs) -> R) -> R {
     f(RUNS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
+/// Held over a private run's open, to its insertion: a change of the
+/// title's there ([`release_private`]) waits for it. Opens over views of
+/// ours never take it, nor does a view's going.
+static PRIVATE_OPENING: Mutex<()> = Mutex::new(());
+/// Runs over private memory open now, asked of the worker and not opened
+/// yet, and alive (open, or let go with a page table still naming them).
+static PRIVATE_OPEN: AtomicUsize = AtomicUsize::new(0);
+static PRIVATE_PENDING: AtomicUsize = AtomicUsize::new(0);
+static LOCKED: AtomicUsize = AtomicUsize::new(0);
+/// The runs over private memory alive, (start, id) to end: their pages
+/// cannot be protected, decommitted or freed.
+static LOCKED_RANGES: Mutex<BTreeMap<(usize, u64), usize>> = Mutex::new(BTreeMap::new());
+/// Each open private run's registration with `crate::pinned`, by id.
+static PINS: Mutex<BTreeMap<u64, crate::pinned::Pin>> = Mutex::new(BTreeMap::new());
+/// The title's private allocations the runtime reported, start to end,
+/// merged ([`title_memory_private`]).
+static PRIVATE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+/// Since the start: runs over private memory opened, let go for a tracker,
+/// let go for a change of the title's, and page tables that stopped
+/// waiting for the worker; pages named in private memory by the last table.
+static RT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Since the last frame line, of lists with the builder's dispatches:
+/// pages written in place, pages written in copies that went back, pages
+/// written in copies that were withheld, pages missed.
+static BUILDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn locked_ranges() -> std::sync::MutexGuard<'static, BTreeMap<(usize, u64), usize>> {
+    LOCKED_RANGES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether title page `page` lies in a run over private memory that is
+/// alive: it cannot be guarded (`crate::watch` sets none on it). One atomic
+/// load while there is none.
+pub(crate) fn locked(page: usize) -> bool {
+    LOCKED.load(Ordering::Relaxed) != 0 && in_ranges(&locked_ranges(), page * PAGE)
+}
+
+/// Whether one of `ranges` ((start, id) to end, none longer than
+/// [`LONGEST`]) holds the page at `at`.
+fn in_ranges(ranges: &BTreeMap<(usize, u64), usize>, at: usize) -> bool {
+    ranges.range((at.saturating_sub(LONGEST), 0)..=(at, u64::MAX)).any(|(_, &end)| at + PAGE <= end)
+}
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static OPEN: AtomicUsize = AtomicUsize::new(0);
 /// Bumped when what the backstop would name changes: views of our own
@@ -195,14 +300,16 @@ pub(crate) fn entry_base(page: u64, offset: usize) -> u32 {
 
 /// `pages` (title page index, our view's address), in page order, cut into
 /// runs of consecutive pages that our view shows consecutively, each at
-/// most [`MOST`].
-pub(crate) fn runs(pages: &[(usize, usize)]) -> Vec<&[(usize, usize)]> {
+/// most [`MOST`], and none across a title page that is a multiple of
+/// `chunk` (0: no such cut).
+pub(crate) fn runs(pages: &[(usize, usize)], chunk: usize) -> Vec<&[(usize, usize)]> {
     let mut out = Vec::new();
     let mut start = 0;
     for i in 1..=pages.len() {
         let joined = i < pages.len()
             && pages[i].0 == pages[i - 1].0 + 1
             && pages[i].1 == pages[i - 1].1 + PAGE
+            && (chunk == 0 || !pages[i].0.is_multiple_of(chunk))
             && (i - start) * PAGE < MOST;
         if !joined {
             out.push(&pages[start..i]);
@@ -274,6 +381,28 @@ pub(crate) fn mapped_view(at: usize, len: usize) -> bool {
     len != 0
 }
 
+/// The one exception to opening only views of ours (`VICTORY_RT_MEMORY`):
+/// whether `[at, at + len)` lies wholly in private memory the runtime
+/// reported ([`title_memory_private`]) and is committed private read-write
+/// memory now, throughout. Such a run is registered with `crate::pinned`
+/// before its heap opens, so that the title's changes let it go first.
+pub(crate) fn private_open(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    // Reported only with `VICTORY_RT_MEMORY`.
+    if len == 0 || !PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).range(..=at).next_back().is_some_and(|(_, &e)| e >= end) {
+        return false;
+    }
+    let mut p = at;
+    while p < end {
+        let (next, opens) = region(p);
+        if !opens {
+            return false;
+        }
+        p = next;
+    }
+    true
+}
+
 /// The open run holding `[at, at + len)` in `open`, and where the range
 /// starts in it.
 fn holding(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
@@ -308,9 +437,10 @@ fn joined(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> ((usize, u
 
 /// The run holding our view's `[at, at + len)`, and where the range starts
 /// in it; None while it is not open yet: it is asked of the worker, which
-/// opens it off the submitting thread (a later table names it), unless the
-/// host refused it before.
-pub(crate) fn run_for(at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
+/// opens it off the submitting thread (a later table names it, or this one
+/// after [`wait_private`]), unless the host refused it before. `private`:
+/// the title's own memory at its own address.
+pub(crate) fn run_for(at: usize, len: usize, private: bool) -> Option<(Arc<Run>, usize)> {
     let ask = with_runs(|r| {
         if let Some(found) = holding(&r.open, at, len) {
             return Err(found);
@@ -320,41 +450,82 @@ pub(crate) fn run_for(at: usize, len: usize) -> Option<(Arc<Run>, usize)> {
     match ask {
         Err(found) => Some(found),
         Ok(true) => {
-            worker(at, len);
+            if private {
+                PRIVATE_PENDING.fetch_add(1, Ordering::Relaxed);
+            }
+            worker(at, len, private);
             None
         }
         Ok(false) => None,
     }
 }
 
+/// Waits for the worker to open the private runs asked of it, up to
+/// [`PRIVATE_WAIT`]: a page table written for a submission names them
+/// before it runs (the builder's first list reads no zeros). True if none
+/// is left waiting.
+pub(crate) fn wait_private() -> bool {
+    let started = std::time::Instant::now();
+    while PRIVATE_PENDING.load(Ordering::Relaxed) != 0 {
+        if started.elapsed() > PRIVATE_WAIT {
+            RT[3].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    true
+}
+
 /// Sends `[at, at + len)` to the opening thread.
-fn worker(at: usize, len: usize) {
-    static WORK: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = std::sync::OnceLock::new();
+fn worker(at: usize, len: usize, private: bool) {
+    type Work = (usize, usize, bool);
+    static WORK: std::sync::OnceLock<Mutex<std::sync::mpsc::Sender<Work>>> = std::sync::OnceLock::new();
     let work = WORK.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        let (tx, rx) = std::sync::mpsc::channel::<Work>();
         let _ = std::thread::Builder::new()
             .name("victory-in-place".into())
-            .spawn(move || rx.into_iter().for_each(|(at, len)| open_run(at, len)));
+            .spawn(move || rx.into_iter().for_each(|(at, len, private)| open_run(at, len, private)));
         Mutex::new(tx)
     });
-    if work.lock().unwrap_or_else(|e| e.into_inner()).send((at, len)).is_err() {
+    if work.lock().unwrap_or_else(|e| e.into_inner()).send((at, len, private)).is_err() {
         with_runs(|r| r.pending.remove(&(at, len)));
+        if private {
+            PRIVATE_PENDING.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A private run asked of the worker is no longer waited for, however
+/// [`open_run`] ends.
+struct Asked(bool);
+
+impl Drop for Asked {
+    fn drop(&mut self) {
+        if self.0 {
+            PRIVATE_PENDING.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 /// Opens our view's `[at, at + len)`, joined with the open runs it
 /// overlaps, which it replaces (the page tables naming them keep them
-/// until rewritten); on the opening thread.
-fn open_run(at: usize, len: usize) {
+/// until rewritten); on the opening thread. `private`: the title's own
+/// memory, committed by the title (nothing is committed here), registered
+/// with `crate::pinned` so that the title's changes let it go first.
+fn open_run(at: usize, len: usize, private: bool) {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    let _asked = Asked(private);
+    let _opening = private.then(|| PRIVATE_OPENING.lock().unwrap_or_else(|e| e.into_inner()));
     let started = std::time::Instant::now();
     // Set before the checks: a view going from here on stays mapped until
     // this open ends; one gone before has its views forgotten already
     // (the runtime forgets them before letting go of the section).
     with_runs(|r| r.opening = Some((at, len)));
     // Asked from a table written over views since gone: the address may
-    // hold other memory now, which a heap would lock. Never private memory.
-    if !crate::watch::own_views_show(at, len) || !mapped_view(at, len) {
+    // hold other memory now, which a heap would lock. Private memory only
+    // as the one exception, asked as such ([`private_open`]).
+    let allowed = if private { private_open(at, len) } else { crate::watch::own_views_show(at, len) && mapped_view(at, len) };
+    if !allowed {
         with_runs(|r| finish(r, at, len, None));
         return;
     }
@@ -371,7 +542,7 @@ fn open_run(at: usize, len: usize) {
     let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
         // SAFETY: our own view of sections whose pages the title's views
         // committed: commits nothing new.
-        if unsafe { VirtualAlloc(start as *const c_void, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        if !private && unsafe { VirtualAlloc(start as *const c_void, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
         }
         open_at(&host.device, start, bytes).map_err(|e| e.to_string())
@@ -379,7 +550,12 @@ fn open_run(at: usize, len: usize) {
     let run = match opened {
         Ok((heap, buffer)) => {
             crate::host::name(&buffer, || format!("title memory in place {start:#x}+{bytes:#x}"));
-            Arc::new(Run { id: NEXT.fetch_add(1, Ordering::Relaxed), len: bytes, buffer, _heap: heap })
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            if private {
+                locked_ranges().insert((start, id), start + bytes);
+                LOCKED.fetch_add(1, Ordering::Relaxed);
+            }
+            Arc::new(Run { id, at: start, len: bytes, buffer, private, _heap: heap })
         }
         Err(error) => {
             with_runs(|r| {
@@ -392,19 +568,33 @@ fn open_run(at: usize, len: usize) {
             return;
         }
     };
+    let id = run.id;
     STATS[5].fetch_add(1, Ordering::Relaxed);
     STATS[6].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-    if with_runs(|r| finish(r, at, len, Some((start, run, over)))) {
-        GENERATION.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(at = format_args!("{start:#x}"), len = bytes, "title memory opened in place");
+    let Some(old) = with_runs(|r| finish(r, at, len, Some((start, run, over)))) else {
+        return;
+    };
+    if private {
+        // The runs it replaces are let go with it from now on.
+        for run in old.iter().filter(|run| run.private) {
+            PRIVATE_OPEN.fetch_sub(1, Ordering::Relaxed);
+            unpin(run.id);
+        }
+        PRIVATE_OPEN.fetch_add(1, Ordering::Relaxed);
+        RT[0].fetch_add(1, Ordering::Relaxed);
+        let pin = crate::pinned::pin(start, bytes, Box::new(move || release_private(start, id)));
+        PINS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, pin);
     }
+    drop(old);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(at = format_args!("{start:#x}"), len = bytes, private, "title memory opened in place");
 }
 
 /// The open of `[at, at + len)` ended, with the run opened (at `start`, and
 /// the open runs it replaces) or not: it is open now, or, its view gone
-/// meanwhile, held by that view's going until no one else holds it. Whether
-/// it is open.
-fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, Vec<usize>)>) -> bool {
+/// meanwhile, held by that view's going until no one else holds it. The
+/// runs it replaced, if it is open.
+fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, Vec<usize>)>) -> Option<Vec<Arc<Run>>> {
     r.opening = None;
     r.pending.remove(&(at, len));
     let mut went = false;
@@ -416,20 +606,195 @@ fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, 
         }
         went = true;
     }
-    let Some((start, run, over)) = opened.filter(|_| !went) else {
-        return false;
-    };
-    for s in over {
-        if let Some(old) = r.open.remove(&s) {
-            OPEN.fetch_sub(old.len, Ordering::Relaxed);
-        }
-    }
+    let (start, run, over) = opened.filter(|_| !went)?;
+    let mut old: Vec<Arc<Run>> = over.iter().filter_map(|s| r.open.remove(s)).collect();
     OPEN.fetch_add(run.len, Ordering::Relaxed);
     // A run at the same address that the join left out (past LONGEST).
-    if let Some(old) = r.open.insert(start, run) {
-        OPEN.fetch_sub(old.len, Ordering::Relaxed);
+    old.extend(r.open.insert(start, run));
+    for run in &old {
+        OPEN.fetch_sub(run.len, Ordering::Relaxed);
     }
-    true
+    // Private runs replaced: the tables naming them drop them when the
+    // title changes the memory ([`release_private`]).
+    r.dead.extend(old.iter().filter(|run| run.private).map(|run| run.id));
+    Some(old)
+}
+
+/// The private run `id` is no longer registered with `crate::pinned`.
+fn unpin(id: u64) {
+    let pin = PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    if let Some(pin) = pin {
+        pin.forget();
+    }
+}
+
+/// The open private run `id` at `start` is forgotten: no page table names
+/// it anew, those naming it drop it ([`dead`]), and its pages stay
+/// [`locked`] until its heap goes. The run, if it was open.
+fn forget_private(start: usize, id: u64) -> Option<Arc<Run>> {
+    let run = with_runs(|r| {
+        if r.open.get(&start).is_none_or(|run| run.id != id) {
+            return None;
+        }
+        r.dead.push(id);
+        r.open.remove(&start)
+    })?;
+    OPEN.fetch_sub(run.len, Ordering::Relaxed);
+    PRIVATE_OPEN.fetch_sub(1, Ordering::Relaxed);
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    Some(run)
+}
+
+/// `crate::pinned`'s release of the private run `id` at `start`, before
+/// the title protects, decommits or frees memory in it: forgotten, and
+/// dropped from the page tables once no submission runs (waited for: a
+/// submission reading memory the title frees is the title's race), so
+/// that its heap goes and the system unlocks the pages. The caller tries
+/// its change again while that settles.
+fn release_private(start: usize, id: u64) {
+    // Released by the registry: nothing to forget there.
+    drop(PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id));
+    let Some(run) = forget_private(start, id) else {
+        return;
+    };
+    RT[2].fetch_add(1, Ordering::Relaxed);
+    drop(run);
+    // And the runs it replaced, if tables still name them.
+    crate::memory::drop_runs_wait(&dead());
+}
+
+/// A tracker is about to guard `[at, at + len)`: the open runs over
+/// private memory holding part of it are let go (their pages cannot be
+/// protected). Never waits: the page tables drop them at their next
+/// rewrite, and until the heaps are gone the pages stay [`locked`] and
+/// unguarded. One atomic load while none is open.
+pub(crate) fn make_way(at: usize, len: usize) {
+    if PRIVATE_OPEN.load(Ordering::Relaxed) == 0 || len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let hit: Vec<(usize, u64)> = with_runs(|r| {
+        r.open
+            .range(at.saturating_sub(LONGEST)..end)
+            .filter(|(s, run)| run.private && **s + run.len > at)
+            .map(|(&s, run)| (s, run.id))
+            .collect()
+    });
+    for (start, id) in hit {
+        if forget_private(start, id).is_some() {
+            unpin(id);
+            RT[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The runtime made or committed private title memory at `[at, at + len)`
+/// (`XMemVirtualAlloc`), or shaders missed committed private memory there:
+/// with `VICTORY_RT_MEMORY`, its pages no copy holds are named in place
+/// from the next submission on. Only below 2^40, where page tables reach.
+pub fn title_memory_private(at: usize, len: usize) {
+    if !rt_memory() || len == 0 || at.saturating_add(len) > 1 << 40 {
+        return;
+    }
+    let (start, end) = (at & !(PAGE - 1), (at + len).next_multiple_of(PAGE));
+    merge(&mut PRIVATE.lock().unwrap_or_else(|e| e.into_inner()), start, end);
+    // What the host refused there may open now (committed, unprotected).
+    with_runs(|r| r.refused.retain(|&(s, n)| s + n <= start || end <= s));
+    let regions: Vec<usize> = (start >> 28..=(end - 1) >> 28).collect();
+    crate::memory::want(&regions);
+    // Committed since the last table, maybe: asked again.
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `[start, end)` joins `ranges` (start to end, disjoint), merged with
+/// those it touches.
+fn merge(ranges: &mut BTreeMap<usize, usize>, mut start: usize, mut end: usize) {
+    let touching: Vec<usize> = ranges
+        .range(..=end)
+        .rev()
+        .take_while(|&(_, &e)| e >= start)
+        .map(|(&s, _)| s)
+        .collect();
+    for s in touching {
+        if let Some(e) = ranges.remove(&s) {
+            (start, end) = (start.min(s), end.max(e));
+        }
+    }
+    ranges.insert(start, end);
+}
+
+/// The pages `first..last` (page numbers) of the private allocations
+/// reported, in order.
+pub(crate) fn reported(first: usize, last: usize) -> Vec<usize> {
+    let ranges = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (from, to) = (first * PAGE, last * PAGE);
+    let before = ranges.range(..from).next_back().filter(|&(_, &e)| e > from);
+    before
+        .into_iter()
+        .chain(ranges.range(from..to))
+        .flat_map(|(&s, &e)| s.max(from) / PAGE..e.min(to) / PAGE)
+        .collect()
+}
+
+/// Those of `candidates` (page numbers in order, held by no copy and no
+/// tracker) that can be named in place, as (page, address): the ones in a
+/// run over private memory open already, and the ones wholly in committed
+/// private memory that is read-write now and not [`locked`] by a run let
+/// go (a heap over those would outlive the change that let it go).
+pub(crate) fn private_pages(candidates: &[usize]) -> Vec<(usize, usize)> {
+    let open: BTreeMap<(usize, u64), usize> =
+        with_runs(|r| r.open.iter().filter(|(_, run)| run.private).map(|(&s, run)| ((s, run.id), s + run.len)).collect());
+    let alive = locked_ranges().clone();
+    let covered = |page: usize| in_ranges(&open, page * PAGE);
+    let picked = pick(candidates, covered, region);
+    picked.into_iter().filter(|&(page, at)| covered(page) || !in_ranges(&alive, at)).collect()
+}
+
+/// [`private_pages`], with `covered` (a page lies in an open run) and
+/// `region` (the end of the memory of one kind holding an address, and
+/// whether that kind can be opened) given. A page reaching past its
+/// region is left out: a heap needs one protection throughout.
+fn pick(candidates: &[usize], covered: impl Fn(usize) -> bool, mut region: impl FnMut(usize) -> (usize, bool)) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < candidates.len() {
+        let page = candidates[i];
+        if covered(page) {
+            out.push((page, page * PAGE));
+            i += 1;
+            continue;
+        }
+        let (end, opens) = region(page * PAGE);
+        // Every candidate wholly below the region's end shares the answer.
+        let whole = candidates[i..].partition_point(|&p| (p + 1) * PAGE <= end);
+        out.extend(candidates[i..i + whole].iter().filter(|&&p| opens || covered(p)).map(|&p| (p, p * PAGE)));
+        // None whole: the page straddles the end, and is left out.
+        i += whole.max(1);
+    }
+    out
+}
+
+/// The end of the memory of one state, type and protection holding `at`,
+/// and whether it is committed private read-write memory.
+fn region(at: usize) -> (usize, bool) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+        return (at + PAGE, false);
+    }
+    let end = (info.BaseAddress as usize + info.RegionSize).max(at + 1);
+    (end, info.State == MEM_COMMIT && info.Type == MEM_PRIVATE && info.Protect == PAGE_READWRITE)
+}
+
+/// A list with dispatches of the title's acceleration-structure builder
+/// ran: the pages its shaders wrote in place, wrote in copies that went
+/// back into title memory, wrote in copies that were withheld, and missed.
+pub(crate) fn builder_list(in_place: u64, back: u64, withheld: u64, missed: u64) {
+    for (n, x) in BUILDER.iter().zip([in_place, back, withheld, missed]) {
+        n.fetch_add(x, Ordering::Relaxed);
+    }
 }
 
 /// The runtime lets go of our own view `[at, at + len)` of a section:
@@ -476,6 +841,9 @@ pub(crate) fn dead() -> Vec<u64> {
 /// next frame's end; after [`FRAMES_KEPT`] a view is left mapped.
 pub(crate) fn settle() {
     use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
+    // Private runs let go or replaced stay [`dead`] while their heaps live
+    // (until the tables dropped them).
+    let alive: Vec<u64> = locked_ranges().keys().map(|&(_, id)| id).collect();
     let ready = with_runs(|r| {
         let mut ready = Vec::new();
         let mut i = 0;
@@ -501,7 +869,7 @@ pub(crate) fn settle() {
             }
         }
         let live: Vec<u64> = r.gone.iter().flat_map(|g| g.runs.iter().map(|run| run.id)).collect();
-        r.dead.retain(|id| live.contains(id));
+        r.dead.retain(|id| live.contains(id) || alive.contains(id));
         ready
     });
     // Unmapped outside the lock (the unmap waits for writes through our views).
@@ -521,9 +889,11 @@ pub(crate) fn settle() {
     }
 }
 
-/// The last page table written named `pages` in place.
-pub(crate) fn named(pages: u64) {
+/// The last page table written named `pages` in place, `private` of them
+/// in private memory.
+pub(crate) fn named(pages: u64, private: u64) {
     STATS[2].store(pages, Ordering::Relaxed);
+    RT[4].store(private, Ordering::Relaxed);
 }
 
 /// Shaders wrote `pages` pages in place, `withheld` of them where their
@@ -544,6 +914,24 @@ pub(crate) fn log_frame() {
     let opened = STATS[5].swap(0, Ordering::Relaxed);
     let took = STATS[6].swap(0, Ordering::Relaxed);
     let named = STATS[2].load(Ordering::Relaxed);
+    let builder = BUILDER.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    if rt_memory() && (named > 0 || builder.iter().any(|&n| n > 0)) {
+        // Persisted: in place, or copied back. Lost: withheld or missed.
+        tracing::info!(
+            "ray tracing memory (VICTORY_RT_MEMORY): private memory in place: {} pages named, {} runs open, so far {} opened, {} let go for trackers, {} for the title's changes, {} tables written without waiting longer; builder lists this frame: {} pages written in place, {} copied back ({:.1} MB reached the title), {} withheld, {} missed",
+            RT[4].load(Ordering::Relaxed),
+            PRIVATE_OPEN.load(Ordering::Relaxed),
+            RT[0].load(Ordering::Relaxed),
+            RT[1].load(Ordering::Relaxed),
+            RT[2].load(Ordering::Relaxed),
+            RT[3].load(Ordering::Relaxed),
+            builder[0],
+            builder[1],
+            ((builder[0] + builder[1]) << 16) as f64 / 1e6,
+            builder[2],
+            builder[3]
+        );
+    }
     if named + written + opened == 0 {
         return;
     }
@@ -573,11 +961,11 @@ mod tests {
             // A page between them has none: another run.
             (0x105, o + 11 * PAGE),
         ];
-        let found = runs(&pages);
+        let found = runs(&pages, 0);
         let lens: Vec<usize> = found.iter().map(|r| r.len()).collect();
         assert_eq!(lens, [3, 1, 1]);
         assert_eq!(found[1][0], (0x103, o + 9 * PAGE));
-        assert!(runs(&[]).is_empty());
+        assert!(runs(&[], 0).is_empty());
     }
 
     /// Two sections' views side by side: a run over both is cut where the
@@ -655,7 +1043,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0, "kept mapped while the open runs");
         settle();
         assert_eq!(calls.load(Ordering::SeqCst), 0, "still opening");
-        assert!(!with_runs(|r| finish(r, at + PAGE, PAGE, None)));
+        assert!(with_runs(|r| finish(r, at + PAGE, PAGE, None)).is_none());
         settle();
         assert_eq!(calls.load(Ordering::SeqCst), 1, "refused as locked: kept");
         settle();
@@ -668,12 +1056,139 @@ mod tests {
         assert!(with_runs(|r| r.gone.is_empty()));
     }
 
+    /// Runs over private memory end where a chunk does, so that a tracker
+    /// or a change of the title's lets go of one chunk only.
+    #[test]
+    fn private_runs_end_at_chunk_boundaries() {
+        let page = |k: usize| (k, k * PAGE);
+        let first = 5 * CHUNK - 2;
+        let pages: Vec<(usize, usize)> = (first..first + CHUNK + 5).map(page).collect();
+        let cut = runs(&pages, CHUNK);
+        let lens: Vec<usize> = cut.iter().map(|r| r.len()).collect();
+        assert_eq!(lens, [2, CHUNK, 3]);
+        assert_eq!(cut[1][0], page(5 * CHUNK));
+    }
+
+    /// Reported allocations merge when they touch or overlap.
+    #[test]
+    fn reported_private_ranges_merge() {
+        let all = |r: &BTreeMap<usize, usize>| r.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>();
+        let mut r = BTreeMap::new();
+        merge(&mut r, 0x10_0000, 0x20_0000);
+        merge(&mut r, 0x40_0000, 0x50_0000);
+        assert_eq!(r.len(), 2);
+        // A commit inside one changes nothing.
+        merge(&mut r, 0x11_0000, 0x12_0000);
+        assert_eq!(all(&r), [(0x10_0000, 0x20_0000), (0x40_0000, 0x50_0000)]);
+        // One touching both joins them.
+        merge(&mut r, 0x20_0000, 0x40_0000);
+        assert_eq!(all(&r), [(0x10_0000, 0x50_0000)]);
+    }
+
+    /// Candidate pages are named in place when a run holds them already,
+    /// or when their whole 64 KiB is memory that opens; one query answers
+    /// for every candidate in a region, and a page reaching past its
+    /// region is left out.
+    #[test]
+    fn private_pages_are_those_that_open() {
+        // Memory: pages 0-3 and 4 KiB of page 4 open, the rest of page 4
+        // guarded, pages 5-7 reserved only, pages 8-9 open.
+        let regions = [(4 * PAGE + 0x1000, true), (5 * PAGE, false), (8 * PAGE, false), (10 * PAGE, true)];
+        let mut asked = 0;
+        let region = |at: usize| {
+            asked += 1;
+            *regions.iter().find(|&&(end, _)| at < end).expect("inside")
+        };
+        // Page 6 lies in an open run (it was committed when opened).
+        let got = pick(&[0, 1, 3, 4, 5, 6, 7, 8, 9], |p| p == 6, region);
+        let pages: Vec<usize> = got.iter().map(|&(p, _)| p).collect();
+        assert_eq!(pages, [0, 1, 3, 6, 8, 9]);
+        assert!(got.iter().all(|&(p, at)| at == p * PAGE), "private memory is at its own address");
+        // Pages 0-3, page 4, pages 5-7, pages 8-9.
+        assert_eq!(asked, 4);
+        assert!(pick(&[], |_| false, |at| (at + PAGE, true)).is_empty());
+    }
+
+    /// The pages of runs over private memory that are alive are locked
+    /// (no guard is set on them), whole pages only, whatever their order.
+    #[test]
+    fn pages_of_live_private_runs_are_locked() {
+        let base = 0x6000_0000_0000usize;
+        let mut ranges = BTreeMap::new();
+        ranges.insert((base, 7), base + 4 * PAGE);
+        // A run replaced by a longer one at the same start, both alive.
+        ranges.insert((base, 9), base + 8 * PAGE);
+        ranges.insert((base + 32 * PAGE, 8), base + 33 * PAGE);
+        assert!(in_ranges(&ranges, base));
+        assert!(in_ranges(&ranges, base + 7 * PAGE));
+        assert!(!in_ranges(&ranges, base + 8 * PAGE), "past the run's end");
+        assert!(!in_ranges(&ranges, base - PAGE));
+        assert!(in_ranges(&ranges, base + 32 * PAGE));
+        assert!(!in_ranges(&BTreeMap::new(), base));
+    }
+
+    /// The title protects, then frees, private memory open in place: the
+    /// plain calls fail while the run's heap locks the pages, and through
+    /// the runtime's path (`crate::pinned`, as the title's `VirtualProtect`
+    /// and `VirtualFree` go) the run is let go first and both work.
+    #[test]
+    fn a_title_protect_over_an_open_private_run_lets_it_go_first() {
+        use windows_sys::Win32::System::Memory as mem;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let len = 4 * PAGE;
+        // Private memory as `xmem` makes the title's heaps.
+        // SAFETY: plain allocation, freed below.
+        let at = unsafe {
+            mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        let free = || {
+            // SAFETY: our allocation.
+            crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) })
+        };
+        let protect = |to: u32| {
+            let mut old = 0;
+            // SAFETY: our allocation's first page.
+            unsafe { mem::VirtualProtect(at as *const c_void, PAGE, to, &mut old) }
+        };
+        // The one exception to views of ours: private memory the runtime
+        // reported (as `VICTORY_RT_MEMORY` does), and only that.
+        assert!(!private_open(at, len), "not reported: refused");
+        merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+        assert!(private_open(at, len) && !private_open(at, len + PAGE));
+        // Opened as the worker opens a run a page table asked for.
+        assert!(run_for(at, len, true).is_none(), "asked of the worker");
+        assert!(wait_private(), "the worker opened it or was refused");
+        let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) else {
+            assert_ne!(free(), 0);
+            return; // the host does not open private memory in place
+        };
+        let id = run.id;
+        drop(run);
+        assert!(locked(at / PAGE) && locked(at / PAGE + 3));
+        assert!(!locked(at / PAGE + 4));
+        assert_eq!(protect(mem::PAGE_READONLY), 0, "locked while the heap lives");
+        // The title's call, through the runtime.
+        let done = crate::pinned::title_memory_change(at, PAGE, || protect(mem::PAGE_READONLY));
+        assert_ne!(done, 0, "let go first, then protected");
+        assert!(with_runs(|r| holding(&r.open, at, len)).is_none(), "forgotten");
+        assert!(with_runs(|r| r.open.values().all(|run| run.id != id)));
+        assert!(!locked(at / PAGE), "its heap is gone");
+        assert_ne!(protect(mem::PAGE_READWRITE), 0);
+        // Not opened again while a tracker would guard it: nothing holds it.
+        make_way(at, len);
+        assert_ne!(free(), 0, "and freed");
+    }
+
     #[test]
     fn a_run_is_at_most_a_region() {
         let o = 0x7000_0000_0000usize;
         let n = MOST / PAGE + 2;
         let pages: Vec<(usize, usize)> = (0..n).map(|k| (k, o + k * PAGE)).collect();
-        let lens: Vec<usize> = runs(&pages).iter().map(|r| r.len()).collect();
+        let lens: Vec<usize> = runs(&pages, 0).iter().map(|r| r.len()).collect();
         assert_eq!(lens, [MOST / PAGE, 2]);
     }
 

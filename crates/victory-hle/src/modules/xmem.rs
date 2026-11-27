@@ -182,6 +182,12 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    // Committed private memory shaders may reach by address alone (the
+    // BVH builder's scratch): the GPU side may name it in place
+    // (`VICTORY_RT_MEMORY`).
+    if !at.is_null() && !placeholder && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_private(at as usize, size);
+    }
     at
 }
 

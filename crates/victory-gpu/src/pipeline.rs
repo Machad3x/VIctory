@@ -341,6 +341,13 @@ pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
 }
 
+/// Whether the title pipeline is one of the acceleration-structure
+/// builder's ([`builder`]).
+#[cfg(windows)]
+pub(crate) fn is_builder(this: This) -> bool {
+    !this.is_null() && pipeline(this).builder
+}
+
 /// A dispatch with the title pipeline was not run on the host (`why`): one
 /// of the acceleration-structure builder's holds the builder back
 /// ([`builder::dropped`]).

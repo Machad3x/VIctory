@@ -1216,6 +1216,11 @@ impl State {
                 if let Some((_, map)) = &self.memory {
                     map.program(&stage.shader.hash);
                 }
+                if crate::pipeline::is_builder(self.pipeline as This)
+                    && let Some((_, map)) = &self.memory
+                {
+                    map.builder();
+                }
                 // What shaders write through a root UAV goes back by its
                 // bytes, as through root views ([`root_view`]).
                 for (address, shadow) in &roots {
