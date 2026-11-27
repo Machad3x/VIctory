@@ -26,9 +26,11 @@
 //! (`crate::watch::title_memory_own`): the title's views stay free to be
 //! guarded and remapped, since a heap locks only the view it is opened on.
 //! Runs are opened on a thread of their own, joined with the open runs they
-//! overlap. The heaps stay open while the section lives; when the runtime
-//! lets go of our view, its runs are forgotten and the view stays mapped
-//! until no page table names them (a frame's end, [`settle`]).
+//! overlap, once checked to be views of ours still (a table written over a
+//! view since gone may ask for an address holding other memory). The heaps
+//! stay open while the section lives; when the runtime lets go of our view,
+//! its runs are forgotten and the view stays mapped until no page table
+//! names them (a frame's end, [`settle`]).
 //! shortcut: private memory with no copy is not covered: a heap over it
 //! would make the title's and the guards' protections fail; open it once
 //! the counters show such misses.
@@ -307,6 +309,13 @@ fn open_run(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
     let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
     let started = std::time::Instant::now();
+    // Asked from a table written over views since gone: the address may
+    // hold other memory now, which a heap would lock. (Open runs it joins
+    // are over live views: a view's going removes them under `OPENING`.)
+    if !crate::watch::own_views_show(at, len) {
+        with_runs(|r| r.pending.remove(&(at, len)));
+        return;
+    }
     let ((start, bytes), over, replaced) = with_runs(|r| {
         let (range, over) = joined(&r.open, at, len);
         let replaced: usize = over.iter().filter_map(|s| r.open.get(s)).map(|run| run.len).sum();

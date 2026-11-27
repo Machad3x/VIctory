@@ -1173,6 +1173,15 @@ pub(crate) fn own_views_in(first: usize, last: usize) -> Vec<(usize, usize)> {
     guards().own.range(first..last).map(|(&page, &own)| (page, own)).collect()
 }
 
+/// Whether every page of `[at, at + len)` (whole pages) is a view of our
+/// own showing some title page now ([`title_memory_own`]).
+pub(crate) fn own_views_show(at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    let shown: std::collections::BTreeSet<usize> =
+        guards().own.values().copied().filter(|&own| (at..end).contains(&own)).collect();
+    shown.len() == len.div_ceil(PAGE)
+}
+
 /// A write through views of our own into pages one tracker's copy writes
 /// back, under way: the title's views stay guarded, so its writes are seen,
 /// and every other tracker holding the memory is marked changed, before and
@@ -2121,6 +2130,20 @@ pub(crate) mod tests {
         assert!(writer.changed(page), "a title write is still seen");
         title_memory_remapped(title, PAGE);
         assert!(writer.write_unseen(title, title + PAGE).is_none(), "mapped anew: the view is forgotten");
+    }
+
+    /// What the in-place backstop opens is checked against the views of our
+    /// own shown now: a view the title mapped anew shows nothing.
+    #[test]
+    fn own_views_show_only_pages_shown_now() {
+        let (title, own) = (0x7a00_0000_0000usize, 0x7b00_0000_0000usize);
+        title_memory_own(title, 2 * PAGE, own);
+        assert!(own_views_show(own, 2 * PAGE) && own_views_show(own + PAGE, PAGE));
+        assert!(!own_views_show(own, 3 * PAGE), "the third page is no view of ours");
+        title_memory_remapped(title + PAGE, PAGE);
+        assert!(own_views_show(own, PAGE) && !own_views_show(own, 2 * PAGE));
+        title_memory_remapped(title, PAGE);
+        assert!(!own_views_show(own, PAGE));
     }
 
     /// A write through another mapping of the same pages marks the tracker
