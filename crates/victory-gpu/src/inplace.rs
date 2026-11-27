@@ -441,14 +441,16 @@ pub(crate) fn runs(pages: &[(usize, usize)], chunk: usize) -> Vec<&[(usize, usiz
     out
 }
 
-/// `run` cut where an allocation ends (`end_of` gives the end of the one
-/// holding an address of our views): sections' views may lie side by
-/// side, and a heap is opened on one allocation.
-pub(crate) fn per_view(run: &[(usize, usize)], end_of: impl Fn(usize) -> usize) -> Vec<&[(usize, usize)]> {
+/// `run` cut where an allocation ends (`end_of(at, limit)` gives the end of
+/// the one holding an address of our views, or any end at or past `limit`,
+/// the run's end): sections' views may lie side by side, and a heap is
+/// opened on one allocation.
+pub(crate) fn per_view(run: &[(usize, usize)], end_of: impl Fn(usize, usize) -> usize) -> Vec<&[(usize, usize)]> {
     let mut out = Vec::new();
     let mut rest = run;
     while let Some(&(_, own)) = rest.first() {
-        let end = end_of(own);
+        let limit = rest.last().map_or(own, |&(_, o)| o).saturating_add(PAGE);
+        let end = end_of(own, limit);
         let n = rest.iter().take_while(|&&(_, o)| o.saturating_add(PAGE) <= end).count().max(1);
         let (head, tail) = rest.split_at(n);
         out.push(head);
@@ -457,26 +459,36 @@ pub(crate) fn per_view(run: &[(usize, usize)], end_of: impl Fn(usize) -> usize) 
     out
 }
 
-/// Where the allocation (a view) holding `at` ends; no end if Windows
-/// does not say.
-pub(crate) fn allocation_end(at: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    let query = |p: usize| {
+/// Where the allocation (a view) holding `at` ends, or an end at or past
+/// `limit` once it reaches that far; no end if Windows does not say. Walks
+/// no further than `limit`: the title's private memory is one allocation
+/// of thousands of regions, and walking each run to its end on the
+/// submitting thread, once per run and page table, held submissions for
+/// tens of seconds (gpu312, gpu313: the title's 30 s watchdog).
+pub(crate) fn allocation_end(at: usize, limit: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    allocation_end_by(at, limit, |p| {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-        (n != 0).then_some(info)
-    };
-    let Some(first) = query(at) else {
+        (n != 0).then_some((info.BaseAddress as usize + info.RegionSize, info.AllocationBase as usize, info.State))
+    })
+}
+
+/// [`allocation_end`] with `query` (a region's end, allocation base and
+/// state).
+fn allocation_end_by(at: usize, limit: usize, mut query: impl FnMut(usize) -> Option<(usize, usize, u32)>) -> usize {
+    use windows_sys::Win32::System::Memory::MEM_FREE;
+    let Some((mut end, base, _)) = query(at) else {
         return usize::MAX;
     };
-    let mut end = first.BaseAddress as usize + first.RegionSize;
-    while let Some(info) = query(end)
-        && info.AllocationBase == first.AllocationBase
-        && info.State != MEM_FREE
+    while end < limit
+        && let Some((next, b, state)) = query(end)
+        && b == base
+        && state != MEM_FREE
     {
-        end = info.BaseAddress as usize + info.RegionSize;
+        end = next;
     }
     end
 }
@@ -523,7 +535,7 @@ pub(crate) fn private_open(at: usize, len: usize) -> bool {
         }
         p = next;
     }
-    allocation_end(at) >= end
+    allocation_end(at, end) >= end
 }
 
 /// Pages of private memory to name in place (in page order, at their own
@@ -1342,15 +1354,48 @@ mod tests {
     fn a_run_over_two_views_is_cut_between_them() {
         let o = 0x7000_0000_0000usize;
         let pages: Vec<(usize, usize)> = (0..5).map(|k| (0x200 + k, o + k * PAGE)).collect();
-        let end_of = |at: usize| if at < o + 2 * PAGE { o + 2 * PAGE } else { o + 64 * PAGE };
+        let asked = std::cell::RefCell::new(Vec::new());
+        let end_of = |at: usize, limit: usize| {
+            asked.borrow_mut().push(limit);
+            if at < o + 2 * PAGE { o + 2 * PAGE } else { o + 64 * PAGE }
+        };
         let cut = per_view(&pages, end_of);
         let lens: Vec<usize> = cut.iter().map(|r| r.len()).collect();
         assert_eq!(lens, [2, 3]);
         assert_eq!(cut[1][0], (0x202, o + 2 * PAGE));
+        // Each end is asked no further than the run's own end.
+        assert_eq!(*asked.borrow(), [o + 5 * PAGE, o + 5 * PAGE]);
         // One view: whole. No end known: whole.
-        assert_eq!(per_view(&pages, |_| o + 64 * PAGE).len(), 1);
-        assert_eq!(per_view(&pages, |_| usize::MAX).len(), 1);
-        assert!(per_view(&[], |_| 0).is_empty());
+        assert_eq!(per_view(&pages, |_, _| o + 64 * PAGE).len(), 1);
+        assert_eq!(per_view(&pages, |_, _| usize::MAX).len(), 1);
+        assert!(per_view(&[], |_, _| 0).is_empty());
+    }
+
+    /// One allocation of many regions (the title's private memory): its
+    /// end is walked no further than asked, so a run costs queries for its
+    /// own regions, not for the rest of the allocation (gpu312, gpu313: the
+    /// submitting thread walked to the end once per run, for seconds).
+    #[test]
+    fn an_allocation_is_walked_no_further_than_asked() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_FREE};
+        let base = 0x10_0000_0000usize;
+        // 100,000 regions of one page each, then free memory.
+        let regions = 100_000;
+        let queries = std::cell::Cell::new(0);
+        let query = |at: usize| {
+            queries.set(queries.get() + 1);
+            let page = (at - base) / PAGE;
+            Some(match page < regions {
+                true => (at + PAGE, base, MEM_COMMIT),
+                false => (usize::MAX, 0, MEM_FREE),
+            })
+        };
+        assert_eq!(allocation_end_by(base + 10 * PAGE, base + 14 * PAGE, query), base + 14 * PAGE);
+        assert_eq!(queries.get(), 4, "the run's own regions");
+        queries.set(0);
+        assert_eq!(allocation_end_by(base + 10 * PAGE, usize::MAX, query), base + regions * PAGE);
+        assert_eq!(queries.get(), regions - 10 + 1, "the whole walk when asked");
+        assert_eq!(allocation_end_by(base, base, |_| None), usize::MAX, "nothing known");
     }
 
     /// The real allocation end: two views of one section side by side are
@@ -1374,7 +1419,7 @@ mod tests {
         // SAFETY: a view of our section, unmapped below.
         let at = unsafe { mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, BYTES) }.Value as usize;
         assert_ne!(at, 0);
-        assert_eq!(allocation_end(at + PAGE), at + BYTES);
+        assert_eq!(allocation_end(at + PAGE, usize::MAX), at + BYTES);
         assert!(mapped_view(at, BYTES) && mapped_view(at + PAGE, PAGE));
         assert!(!mapped_view(at, BYTES + PAGE), "past the view");
         // SAFETY: plain allocation, released below.

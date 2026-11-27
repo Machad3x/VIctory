@@ -742,7 +742,7 @@ impl Shared {
         // for, so that this table names them: the submission it is
         // written for reads no zeros there.
         let unowned = |b: usize, first: usize, page: usize| owner.get(b * BLOCK + (page - first)).is_some_and(|o| o.is_none());
-        let private: Vec<Vec<(usize, usize)>> = blocks
+        let pages: Vec<Vec<(usize, usize)>> = blocks
             .iter()
             .enumerate()
             .map(|(b, &l1)| {
@@ -758,8 +758,10 @@ impl Shared {
                 crate::inplace::private_pages(&candidates)
             })
             .collect();
+        // Cut once: each cut queries the memory's regions.
+        let private: Vec<Vec<&[(usize, usize)]>> = pages.iter().map(|p| crate::inplace::private_runs(p)).collect();
         let mut asked = false;
-        for run in private.iter().flat_map(|pages| crate::inplace::private_runs(pages)) {
+        for &run in private.iter().flatten() {
             asked |= crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE, true).is_none();
         }
         if asked {
@@ -775,7 +777,7 @@ impl Shared {
                 .into_iter()
                 .flat_map(|run| crate::inplace::per_view(run, crate::inplace::allocation_end))
                 .map(|run| (run, false));
-            let own = crate::inplace::private_runs(&private[b]).into_iter().map(|run| (run, true));
+            let own = private[b].iter().map(|&run| (run, true));
             for (run, private) in mapped.chain(own) {
                 let Some((placed, offset)) = crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE, private) else {
                     continue;
