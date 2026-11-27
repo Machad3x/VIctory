@@ -852,7 +852,7 @@ pub fn title_memory_private(at: usize, len: usize) {
     let (start, end) = (at & !(PAGE - 1), (at + len).next_multiple_of(PAGE));
     merge(&mut PRIVATE.lock().unwrap_or_else(|e| e.into_inner()), start, end);
     // What the host refused there may open now (committed, unprotected).
-    with_runs(|r| r.refused.retain(|&(s, n)| s + n <= start || end <= s));
+    with_runs(|r| unrefuse(r, start, end));
     let regions: Vec<usize> = (start >> 28..=(end - 1) >> 28).collect();
     crate::memory::want(&regions);
     // Opened now, on the worker, so that the page table of the first
@@ -865,6 +865,74 @@ pub fn title_memory_private(at: usize, len: usize) {
     }
     // Committed since the last table, maybe: asked again.
     GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Shaders missed `[at, at + len)`, `private` telling whether it is
+/// private memory (asked only for memory not reported yet). Memory not
+/// reported is reported ([`title_memory_private`]). Memory reported already
+/// was not named (committed or made read-write since the last table, not
+/// open yet, or refused by the host): the page tables look again, once a
+/// frame. What the host refused stays refused until the title commits there
+/// again ([`title_memory_private`], [`title_memory_committed`]): asking it
+/// again at each miss made every table wait for the same refusal. Each miss
+/// came to O(pages) work and a table rewrite per submission before (~12,000
+/// missed pages, 256 MiB regions); this is one lookup a miss.
+pub(crate) fn missed_private(at: usize, len: usize, private: impl FnOnce() -> bool) {
+    if !rt_memory() || len == 0 || at.saturating_add(len) > 1 << 40 {
+        return;
+    }
+    let (start, end) = (at & !(PAGE - 1), (at + len).next_multiple_of(PAGE));
+    if !holds(&PRIVATE.lock().unwrap_or_else(|e| e.into_inner()), start, end) {
+        if private() {
+            title_memory_private(at, len);
+        }
+        return;
+    }
+    if !MISSED_AGAIN.swap(true, Ordering::Relaxed) {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The title committed `[at, at + len)` with its own `VirtualAlloc`: over
+/// private memory reported already, what the host refused may open now, and
+/// the page tables look again. Nothing new is reported (memory the title
+/// allocates itself is reported when shaders miss it). Cheap: two lookups.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if !rt_memory() || len == 0 || at.saturating_add(len) > 1 << 40 {
+        return;
+    }
+    let (start, end) = (at & !(PAGE - 1), (at + len).next_multiple_of(PAGE));
+    let reported = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
+    let touches = reported.range(..end).next_back().is_some_and(|(_, &e)| e > start);
+    drop(reported);
+    if touches {
+        with_runs(|r| unrefuse(r, start, end));
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A miss of reported memory rewrote the page tables this frame
+/// ([`missed_private`]).
+static MISSED_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `ranges` (start to end, disjoint, merged) hold `[start, end)`
+/// whole.
+fn holds(ranges: &BTreeMap<usize, usize>, start: usize, end: usize) -> bool {
+    ranges.range(..=start).next_back().is_some_and(|(_, &e)| e >= end)
+}
+
+/// What the host refused over `[start, end)` may be asked again.
+fn unrefuse(r: &mut Runs, start: usize, end: usize) {
+    // No refused run is longer than [`LONGEST`].
+    let hit: Vec<(usize, usize)> = r
+        .refused
+        .range((start.saturating_sub(LONGEST), 0)..(end, 0))
+        .filter(|&&(s, n)| s + n > start)
+        .copied()
+        .collect();
+    for key in hit {
+        r.refused.remove(&key);
+    }
 }
 
 /// `[start, end)` joins `ranges` (start to end, disjoint), merged with
@@ -903,12 +971,42 @@ pub(crate) fn reported(first: usize, last: usize) -> Vec<usize> {
 /// private memory that is read-write now and not [`locked`] by a run let
 /// go (a heap over those would outlive the change that let it go).
 pub(crate) fn private_pages(candidates: &[usize]) -> Vec<(usize, usize)> {
-    let open: BTreeMap<(usize, u64), usize> =
-        with_runs(|r| r.open.iter().filter(|(_, run)| run.private).map(|(&s, run)| ((s, run.id), s + run.len)).collect());
-    let alive = locked_ranges().clone();
-    let covered = |page: usize| in_ranges(&open, page * PAGE);
+    let (Some(&first), Some(&last)) = (candidates.first(), candidates.last()) else {
+        return Vec::new();
+    };
+    let (from, to) = (first * PAGE, (last + 1) * PAGE);
+    // Only the runs reaching the candidates, merged: one binary search a
+    // page (65,536 pages for a 256 MiB region).
+    let open = spans(with_runs(|r| {
+        r.open
+            .range(from.saturating_sub(LONGEST)..to)
+            .filter(|(_, run)| run.private)
+            .map(|(&s, run)| (s, s + run.len))
+            .collect()
+    }));
+    let alive = spans(locked_ranges().range((from.saturating_sub(LONGEST), 0)..(to, 0)).map(|(&(s, _), &e)| (s, e)).collect());
+    let covered = |page: usize| within(&open, page * PAGE);
     let picked = pick(candidates, covered, region);
-    picked.into_iter().filter(|&(page, at)| covered(page) || !in_ranges(&alive, at)).collect()
+    picked.into_iter().filter(|&(page, at)| covered(page) || !within(&alive, at)).collect()
+}
+
+/// `ranges` (start, end) sorted and merged where they overlap or touch.
+fn spans(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
+/// Whether the page at `at` lies wholly in one of `spans` ([`spans`]).
+fn within(spans: &[(usize, usize)], at: usize) -> bool {
+    let i = spans.partition_point(|&(s, _)| s <= at);
+    i > 0 && at + PAGE <= spans[i - 1].1
 }
 
 /// [`private_pages`], with `covered` (a page lies in an open run) and
@@ -1070,6 +1168,7 @@ pub(crate) fn log_frame() {
     if !backstop() {
         return;
     }
+    MISSED_AGAIN.store(false, Ordering::Relaxed);
     let written = STATS[3].swap(0, Ordering::Relaxed);
     let withheld = STATS[4].swap(0, Ordering::Relaxed);
     let opened = STATS[5].swap(0, Ordering::Relaxed);
@@ -1390,6 +1489,33 @@ mod tests {
         } else {
             assert_ne!(free(), 0, "and freed");
         }
+    }
+
+    /// Spans merge touching ranges, and a page counts as within one only
+    /// whole; reported ranges hold a range only whole.
+    #[test]
+    fn spans_answer_for_whole_pages() {
+        let s = spans(vec![(4 * PAGE, 6 * PAGE), (0, 2 * PAGE), (2 * PAGE, 3 * PAGE), (5 * PAGE, 8 * PAGE)]);
+        assert_eq!(s, [(0, 3 * PAGE), (4 * PAGE, 8 * PAGE)]);
+        assert!(within(&s, 0) && within(&s, 2 * PAGE) && within(&s, 7 * PAGE));
+        assert!(!within(&s, 3 * PAGE) && !within(&s, 8 * PAGE));
+        assert!(!within(&[], 0));
+        let mut r = BTreeMap::new();
+        merge(&mut r, 0x10_0000, 0x20_0000);
+        assert!(holds(&r, 0x10_0000, 0x20_0000) && holds(&r, 0x11_0000, 0x12_0000));
+        assert!(!holds(&r, 0x1F_0000, 0x21_0000) && !holds(&r, 0, 0x1_0000));
+    }
+
+    /// A commit lets the host be asked again where it refused, there only.
+    #[test]
+    fn unrefuse_clears_overlapping_refusals_only() {
+        let mut r = Runs::default();
+        let base = 0x5000_0000_0000usize;
+        r.refused.extend([(base, 4 * PAGE), (base + 8 * PAGE, PAGE), (base - MOST, MOST)]);
+        unrefuse(&mut r, base + 3 * PAGE, base + 4 * PAGE);
+        assert_eq!(r.refused.iter().copied().collect::<Vec<_>>(), [(base - MOST, MOST), (base + 8 * PAGE, PAGE)]);
+        unrefuse(&mut r, base - PAGE, base);
+        assert_eq!(r.refused.len(), 1);
     }
 
     #[test]

@@ -86,7 +86,7 @@ pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use inplace::{title_memory_own_gone, title_memory_private};
+pub use inplace::{title_memory_committed, title_memory_own_gone, title_memory_private};
 #[cfg(windows)]
 pub use pinned::{title_memory_change, title_memory_held, title_memory_retry};
 #[cfg(windows)]

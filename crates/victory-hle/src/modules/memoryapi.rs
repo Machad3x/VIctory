@@ -16,7 +16,7 @@
 
 use std::ffi::c_void;
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE, SetLastError};
 use windows_sys::Win32::System::Memory::{
     self as mem, MEM_RELEASE, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
 };
@@ -141,20 +141,33 @@ pub extern "system" fn VirtualProtectEx(
 /// Allocates at `at` with `allocate` (a host call): over memory the GPU
 /// side holds in place, a commit with another protection is refused as
 /// locked, so the GPU side lets go and it is tried again
-/// (`victory_gpu::title_memory_retry`). Elsewhere, the host's answer.
+/// (`victory_gpu::title_memory_retry`). Elsewhere, the host's answer. A
+/// commit is told to the GPU side (`victory_gpu::title_memory_committed`),
+/// which may open there what it could not before.
 fn allocate_at(
     at: *const c_void,
     size: usize,
+    kind: u32,
     mut allocate: impl FnMut() -> *mut c_void,
 ) -> *mut c_void {
-    if at.is_null() || size == 0 {
-        return allocate();
+    let out = if at.is_null() || size == 0 {
+        allocate()
+    } else {
+        let mut out = std::ptr::null_mut();
+        victory_gpu::title_memory_retry(at as usize, size, || {
+            out = allocate();
+            BOOL::from(!out.is_null())
+        });
+        out
+    };
+    if !out.is_null() && kind & mem::MEM_COMMIT != 0 {
+        // SAFETY: a plain read and restore of this thread's last error,
+        // which the title may read after a call that worked.
+        let error = unsafe { GetLastError() };
+        victory_gpu::title_memory_committed(out as usize, size);
+        // SAFETY: as above.
+        unsafe { SetLastError(error) };
     }
-    let mut out = std::ptr::null_mut();
-    victory_gpu::title_memory_retry(at as usize, size, || {
-        out = allocate();
-        BOOL::from(!out.is_null())
-    });
     out
 }
 
@@ -165,7 +178,7 @@ pub extern "system" fn VirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     // SAFETY: the title's arguments.
-    allocate_at(at, size, || unsafe {
+    allocate_at(at, size, kind, || unsafe {
         mem::VirtualAlloc(at, size, kind, protect)
     })
 }
@@ -180,7 +193,7 @@ pub extern "system" fn VirtualAllocEx(
     // SAFETY: the title's arguments.
     let allocate = || unsafe { mem::VirtualAllocEx(process, at, size, kind, protect) };
     if this_process(process) {
-        allocate_at(at, size, allocate)
+        allocate_at(at, size, kind, allocate)
     } else {
         allocate()
     }

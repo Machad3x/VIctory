@@ -1434,9 +1434,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             // Private memory the runtime did not report (the title's own
             // `VirtualAlloc`), or committed since the table was written:
             // in place from the next submission on.
-            for &at in missed.iter().filter(|&&at| memory_kind(at) == PRIVATE) {
+            for &at in &missed {
                 let whole_region = at & 0xFFF_FFFF == 0 && regions > 0 && !missed_at.contains(&at);
-                crate::inplace::title_memory_private(at as usize, if whole_region { 1 << 28 } else { 1 << 16 });
+                let len = if whole_region { 1 << 28 } else { 1 << 16 };
+                crate::inplace::missed_private(at as usize, len, || memory_kind(at) == PRIVATE);
             }
             if builders.load(std::sync::atomic::Ordering::Relaxed) {
                 let wrote = writes.len() as u64;
