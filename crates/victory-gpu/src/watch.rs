@@ -393,9 +393,59 @@ fn count_fault_kind(page: usize, armed: bool) {
     );
 }
 
+thread_local! {
+    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread holds the guard lock (debug builds; false in
+/// others). Lock order: `crate::shadow`'s buffers' lock is taken before
+/// the guard lock (a copy made or dropped under it takes this one),
+/// never while it is held; that module asserts it.
+pub(crate) fn guards_held() -> bool {
+    cfg!(debug_assertions) && HOLDING.get()
+}
+
+/// This thread holds the guard lock while it lives ([`guards_held`]).
+struct Holding;
+
+impl Holding {
+    fn new() -> Holding {
+        if cfg!(debug_assertions) {
+            HOLDING.set(true);
+        }
+        Holding
+    }
+}
+
+impl Drop for Holding {
+    fn drop(&mut self) {
+        if cfg!(debug_assertions) {
+            HOLDING.set(false);
+        }
+    }
+}
+
 #[cfg(not(feature = "diagnostics"))]
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards() -> Held {
+    Held(GUARDS.lock().unwrap_or_else(|e| e.into_inner()), Holding::new())
+}
+
+#[cfg(not(feature = "diagnostics"))]
+struct Held(std::sync::MutexGuard<'static, Guards>, Holding);
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::Deref for Held {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        &self.0
+    }
+}
+
+#[cfg(not(feature = "diagnostics"))]
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Guards {
+        &mut self.0
+    }
 }
 
 /// The guard lock, timed while held by the line that took it
@@ -405,11 +455,11 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
-    Held(Some(guard), std::time::Instant::now(), line)
+    Held(Some(guard), std::time::Instant::now(), line, Holding::new())
 }
 
 #[cfg(feature = "diagnostics")]
-struct Held(Option<std::sync::MutexGuard<'static, Guards>>, std::time::Instant, u32);
+struct Held(Option<std::sync::MutexGuard<'static, Guards>>, std::time::Instant, u32, Holding);
 
 #[cfg(feature = "diagnostics")]
 impl std::ops::Deref for Held {
@@ -1246,8 +1296,9 @@ fn own_views() -> bool {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    // Before the guards' lock: buffers sharing a copy over these pages
-    // part (`crate::shadow::remapped` takes the buffers' lock).
+    // Buffers sharing a copy over these pages part first: that takes the
+    // buffers' lock, which is never taken under the guard lock
+    // ([`guards_held`]), and is released before it is taken here.
     #[cfg(windows)]
     crate::shadow::remapped(at as u64, len as u64);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
@@ -1453,6 +1504,28 @@ pub(crate) mod tests {
         VirtualFree,
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// The guard lock is known held on its thread while it is (debug
+    /// builds), and the buffers' lock is not taken then: the order is
+    /// buffers, then guards.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_guard_lock_is_known_held_while_it_is() {
+        assert!(!guards_held());
+        let g = guards();
+        assert!(guards_held());
+        drop(g);
+        assert!(!guards_held());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the buffers' lock taken under the guard lock")]
+    fn the_buffers_lock_is_never_taken_under_the_guard_lock() {
+        // As held, without the lock: nothing else waits for this test.
+        let _held = Holding::new();
+        crate::shadow::unregister(0, 0);
+    }
 
     #[test]
     fn page_runs_preserve_missing_pages_gaps_and_partial_bounds() {

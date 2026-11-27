@@ -2152,9 +2152,14 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
+/// Lock order: this lock, then [`HOMES`], then the leaves (the runtime's
+/// page runs, a copy's windows, the guard lock, marks, the arena) that a
+/// copy made, shared, parted or dropped under it takes. None of those is
+/// held when it is taken (the guard lock asserted in debug builds).
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    debug_assert!(!crate::watch::guards_held(), "the buffers' lock taken under the guard lock");
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
