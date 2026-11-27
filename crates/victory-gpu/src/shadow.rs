@@ -1754,7 +1754,7 @@ fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
         merged.push((copy, at, n));
     }
     // Locked in address order (the runs are sorted by copy).
-    let mut locked: Vec<(&Shadow, std::sync::MutexGuard<'_, Vec<u64>>, Vec<(usize, usize)>)> = Vec::new();
+    let mut locked: Vec<(&Shadow, StaleBits<'_>, Pages)> = Vec::new();
     let mut regions = Vec::with_capacity(merged.len());
     for &(copy, at, n) in &merged {
         let Some(v) = &copy.vram else { continue };
@@ -1787,7 +1787,12 @@ fn bring_back<'a>(runs: &mut [(&'a Shadow, usize, usize)]) -> Held<'a> {
 
 /// Stale page locks a riding pull holds until its copies ran, with the
 /// pages (index ranges) it marked current under each.
-pub(crate) struct Held<'a>(Vec<(std::sync::MutexGuard<'a, Vec<u64>>, Vec<(usize, usize)>)>);
+pub(crate) struct Held<'a>(Vec<(StaleBits<'a>, Pages)>);
+
+/// A copy's stale bits, locked.
+type StaleBits<'a> = std::sync::MutexGuard<'a, Vec<u64>>;
+/// Page index ranges.
+type Pages = Vec<(usize, usize)>;
 
 impl Held<'_> {
     /// The copies may not have run: their pages are stale again.
@@ -1809,16 +1814,17 @@ impl Held<'_> {
 /// another holder (a riding pull holds them over its submission) counted.
 fn lock_stale(stale: &Mutex<Vec<u64>>) -> std::sync::MutexGuard<'_, Vec<u64>> {
     #[cfg(feature = "diagnostics")]
-    match stale.try_lock() {
-        Ok(bits) => return bits,
-        Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+    let bits = match stale.try_lock() {
+        Ok(bits) => bits,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::StaleLockWaitNs);
-            return stale.lock().unwrap_or_else(|e| e.into_inner());
+            stale.lock().unwrap_or_else(|e| e.into_inner())
         }
-    }
+    };
     #[cfg(not(feature = "diagnostics"))]
-    stale.lock().unwrap_or_else(|e| e.into_inner())
+    let bits = stale.lock().unwrap_or_else(|e| e.into_inner());
+    bits
 }
 
 /// GPU copies [`bring_back`] made (tests).

@@ -447,8 +447,8 @@ fn unbound_once(pipeline: &str, slot: u8, kind: u8, address: u64) {
         slot,
         kind,
         address = format_args!("{address:#x}"),
-        aligned_256 = address % 256 == 0,
-        aligned_16 = address % 16 == 0,
+        aligned_256 = address.is_multiple_of(256),
+        aligned_16 = address.is_multiple_of(16),
         whereabouts = %crate::shadow::whereabouts(address),
         "a root view outside title buffers: scratch bound unless VICTORY_UNBOUND_SCRATCH=0"
     );

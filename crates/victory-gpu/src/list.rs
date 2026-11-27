@@ -2269,7 +2269,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
             let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
             list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
-            if groups.iter().any(|g| orders_arguments(g)) {
+            if groups.iter().any(orders_arguments) {
                 list.note_args_barrier();
             }
         }

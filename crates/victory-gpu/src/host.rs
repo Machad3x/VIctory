@@ -2060,12 +2060,14 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         drop(pulling);
-        struct Kept(Regions);
+        struct Kept {
+            _regions: Regions,
+        }
         // SAFETY: D3D12 resources are free-threaded; only released there.
         unsafe impl Send for Kept {}
         // Not waited for: its buffers go with the submission's (`back`).
         let kept = match riding.take() {
-            Some(Some(r)) if unwaited => Some(Kept(r._regions)),
+            Some(Some(r)) if unwaited => Some(Kept { _regions: r._regions }),
             _ => None,
         };
         static RETAKE_ALL: std::sync::LazyLock<bool> =
