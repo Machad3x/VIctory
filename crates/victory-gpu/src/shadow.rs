@@ -225,27 +225,30 @@ const SPAN_GAP: usize = 256;
 // A compare without a snapshot marks whole 64-byte windows as one run.
 const _: () = assert!(SPAN_GAP >= 64);
 
-/// `VICTORY_REFRESH_SERIAL=1`: video-memory refresh writes on the
-/// preparing thread, not in the copy pool.
-fn refresh_serial() -> bool {
-    static SERIAL: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| refresh_serial_set(std::env::var_os("VICTORY_REFRESH_SERIAL")));
+/// `VICTORY_REFRESH_POOL=1`: video-memory refresh writes in the copy
+/// pool, not on the preparing thread. Off unless asked for: writes
+/// through the BAR did not gain from more threads where it was measured
+/// (RTX 3080 Ti, Ryzen 5700X, the same binary: refresh batches 51.2 ms a
+/// frame pooled, 38.3 ms on the preparing thread).
+fn refresh_pooled() -> bool {
+    static POOLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| refresh_pool_set(std::env::var_os("VICTORY_REFRESH_POOL")));
     #[cfg(test)]
-    if REFRESH_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+    if REFRESH_POOL.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    *SERIAL
+    *POOLED
 }
 
-/// Whether `VICTORY_REFRESH_SERIAL`'s value turns the serial path on.
-fn refresh_serial_set(value: Option<std::ffi::OsString>) -> bool {
+/// Whether `VICTORY_REFRESH_POOL`'s value turns the pooled path on.
+fn refresh_pool_set(value: Option<std::ffi::OsString>) -> bool {
     value.is_some_and(|v| v == "1")
 }
 
-/// Tests: as `VICTORY_REFRESH_SERIAL=1` (held under
+/// Tests: as `VICTORY_REFRESH_POOL=1` (held under
 /// [`crate::copy_pool::test_lock`]).
 #[cfg(test)]
-static REFRESH_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REFRESH_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Writes the runs `[start, end)` of `merged` (title memory as read, with
 /// the shaders' bytes in the runs) into title memory at `at`, and nothing
@@ -1253,7 +1256,7 @@ impl Shadow {
         // SAFETY: inside the video memory mapping (offsets within the copy).
         let at = unsafe { v.data.add(from) };
         let src = (self.start as usize + from) as *const u8;
-        if serial || refresh_serial() {
+        if serial || !refresh_pooled() {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshSerialUs);
             #[cfg(feature = "diagnostics")]
@@ -2887,10 +2890,10 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
-    /// A mirrored copy's refresh inside [`crate::copy_pool::queued`] queues
-    /// its video-memory writes: made by [`crate::copy_pool::run`] (on the
-    /// workers, and on the calling thread alone), not before, with the
-    /// mirror left behind.
+    /// With `VICTORY_REFRESH_POOL=1`, a mirrored copy's refresh inside
+    /// [`crate::copy_pool::queued`] queues its video-memory writes: made by
+    /// [`crate::copy_pool::run`] (on the workers, and on the calling thread
+    /// alone), not before, with the mirror left behind.
     #[test]
     fn queued_video_refresh_lands_when_the_pool_runs() {
         if !rerun_with_gpu_upload(
@@ -2910,6 +2913,15 @@ pub(crate) mod tests {
         let (p, len, copy) = mirrored_buffer(pages);
         copy.freshen(0, len);
         let _serial = crate::copy_pool::test_lock();
+        // Off again on every way out, a failed assertion too.
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                REFRESH_POOL.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        REFRESH_POOL.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _off = Off;
         for (serial, stamp) in [(false, 0xA5u8), (true, 0x5A)] {
             crate::copy_pool::SERIAL.store(serial, std::sync::atomic::Ordering::Relaxed);
             for page in 0..pages {
@@ -2933,18 +2945,18 @@ pub(crate) mod tests {
         unregister(p, p as u64);
     }
 
-    /// `VICTORY_REFRESH_SERIAL=1` (only "1"): inside
+    /// Without `VICTORY_REFRESH_POOL=1` (only "1" turns it on): inside
     /// [`crate::copy_pool::queued`] a mirrored copy's refresh writes video
     /// memory at once, queues nothing, and leaves the mirror behind.
     #[test]
-    fn refresh_serial_writes_video_memory_at_once() {
-        assert!(refresh_serial_set(Some("1".into())));
+    fn video_refresh_is_written_at_once_unless_pooled() {
+        assert!(refresh_pool_set(Some("1".into())));
         let offs: [Option<std::ffi::OsString>; 4] = [None, Some("0".into()), Some("".into()), Some("true".into())];
         for off in offs {
-            assert!(!refresh_serial_set(off.clone()), "{off:?}");
+            assert!(!refresh_pool_set(off.clone()), "{off:?}");
         }
         if !rerun_with_gpu_upload(
-            "shadow::tests::refresh_serial_writes_video_memory_at_once",
+            "shadow::tests::video_refresh_is_written_at_once_unless_pooled",
             true,
         ) {
             return;
@@ -2958,22 +2970,14 @@ pub(crate) mod tests {
         let pages = 80;
         let (p, len, copy) = mirrored_buffer(pages);
         copy.freshen(0, len);
+        // Under the lock no test has the pooled path switched on.
         let _serial = crate::copy_pool::test_lock();
-        // Off again on every way out, a failed assertion too.
-        struct Off;
-        impl Drop for Off {
-            fn drop(&mut self) {
-                REFRESH_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        REFRESH_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
-        let off = Off;
+        assert!(!REFRESH_POOL.load(std::sync::atomic::Ordering::Relaxed));
         for page in 0..pages {
             // SAFETY: our pool's bytes.
             unsafe { ((p + page * PAGE + 100) as *mut u8).write_volatile(0xC3) };
         }
         let (_, pieces) = crate::copy_pool::queued(|| copy.update(p, len));
-        drop(off);
         assert!(pieces.is_empty(), "nothing queued");
         for page in 0..pages {
             assert_eq!(gpu_bytes(&copy, p + page * PAGE + 100, 1), [0xC3], "page {page}");
