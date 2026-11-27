@@ -12,8 +12,13 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-/// A copy of title memory into host memory: destination, source, bytes.
-pub(crate) type Piece = (usize, usize, usize);
+/// Called once a copy's bytes landed: `(f, context)`, as
+/// `f(context, destination, bytes)` (for each piece a copy is cut into).
+pub(crate) type Then = (fn(usize, usize, usize), usize);
+
+/// A copy of title memory into host memory: destination, source, bytes,
+/// and what to call once they landed.
+pub(crate) type Piece = (usize, usize, usize, Option<Then>);
 
 thread_local! {
     static QUEUE: RefCell<Option<Vec<Piece>>> = const { RefCell::new(None) };
@@ -32,10 +37,24 @@ pub(crate) fn queued<R>(f: impl FnOnce() -> R) -> (R, Vec<Piece>) {
 /// ([`crate::host::copy_mapped`]), or queues the copy inside [`queued`].
 /// The caller must not read the destination before [`run`] then.
 pub(crate) fn copy(dst: *mut u8, src: *const u8, len: usize) {
-    let piece = (dst as usize, src as usize, len);
+    copy_then(dst, src, len, None);
+}
+
+/// As [`copy`], calling `then` once the bytes landed (at once, or on the
+/// thread that made the queued copy, before [`run`] returns).
+pub(crate) fn copy_then(dst: *mut u8, src: *const u8, len: usize, then: Option<Then>) {
+    let piece = (dst as usize, src as usize, len, then);
     let queued = QUEUE.with(|q| q.borrow_mut().as_mut().map(|q| q.push(piece)).is_some());
     if !queued {
-        crate::host::copy_mapped(dst, src, len, false);
+        land(piece);
+    }
+}
+
+/// Makes one copy, then calls its `then`.
+fn land((dst, src, len, then): Piece) {
+    crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+    if let Some((f, context)) = then {
+        f(context, dst, len);
     }
 }
 
@@ -49,8 +68,20 @@ const PARALLEL_FROM: usize = 4 << 20;
 const WORKERS: usize = 3;
 
 /// Tests: every copy on the calling thread (to compare with the workers).
+/// Tests that set it, or need the workers, hold [`TEST_LOCK`].
 #[cfg(test)]
 pub(crate) static SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tests: held while a test sets [`SERIAL`] or another switch of the
+/// refreshes' threads, so that two such tests do not interleave.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Tests: [`TEST_LOCK`], also after a test that held it failed.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn serial() -> bool {
     #[cfg(test)]
@@ -79,17 +110,17 @@ pub(crate) fn run(pieces: Vec<Piece>) {
     let total: usize = pieces.iter().map(|p| p.2).sum();
     let pool = (total >= PARALLEL_FROM && !serial()).then(pool).flatten();
     let Some(pool) = pool else {
-        for (dst, src, len) in pieces {
-            crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        for piece in pieces {
+            land(piece);
         }
         return;
     };
     let mut cut = Vec::with_capacity(pieces.len() + total / PIECE);
-    for (dst, src, len) in pieces {
+    for (dst, src, len, then) in pieces {
         let mut at = 0;
         while at < len {
             let n = (len - at).min(PIECE);
-            cut.push((dst + at, src + at, n));
+            cut.push((dst + at, src + at, n, then));
             at += n;
         }
     }
@@ -109,10 +140,10 @@ impl Job {
     fn work(&self, worker: bool) {
         loop {
             let i = self.next.fetch_add(1, Ordering::Relaxed);
-            let Some(&(dst, src, len)) = self.pieces.get(i) else {
+            let Some(&piece) = self.pieces.get(i) else {
                 return;
             };
-            crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            land(piece);
             #[cfg(test)]
             if worker {
                 WORKER_PIECES.fetch_add(1, Ordering::Relaxed);
@@ -224,6 +255,8 @@ mod tests {
             }
         });
         assert!(pool().is_some(), "workers started");
+        // Not with a test that copies on the calling thread meanwhile.
+        let _serial = test_lock();
         WORKERS_ALONE.store(true, Ordering::Relaxed);
         let before = WORKER_PIECES.load(Ordering::Relaxed);
         run(pieces);
@@ -232,6 +265,51 @@ mod tests {
         // At least: runs of other tests meanwhile count too.
         assert!(copied >= 128, "pieces the workers copied: {copied}");
         assert!(dst == src, "every byte where it belongs");
+    }
+
+    /// A copy's `then` is called once its bytes landed, for each piece it
+    /// was cut into, together covering it, on the workers too.
+    #[test]
+    fn then_follows_each_piece_once_its_bytes_landed() {
+        static LANDED: AtomicUsize = AtomicUsize::new(0);
+        static WRONG: AtomicUsize = AtomicUsize::new(0);
+        // `context`: source minus destination; the destination must hold
+        // the source's bytes.
+        fn landed(delta: usize, dst: usize, len: usize) {
+            let src = dst.wrapping_add(delta);
+            // SAFETY: (both) `len` bytes inside the test's buffers.
+            let (s, d) = unsafe {
+                (
+                    std::slice::from_raw_parts(src as *const u8, len),
+                    std::slice::from_raw_parts(dst as *const u8, len),
+                )
+            };
+            if s != d {
+                WRONG.fetch_add(1, Ordering::Relaxed);
+            }
+            LANDED.fetch_add(len, Ordering::Relaxed);
+        }
+        let len = 12 << 20;
+        let src: Vec<u8> = (0..len).map(|i| (i * 11 + i / 4096) as u8).collect();
+        let mut dst = vec![0u8; len];
+        let (s, d) = (src.as_ptr(), dst.as_mut_ptr());
+        let delta = (s as usize).wrapping_sub(d as usize);
+        let ((), pieces) = queued(|| {
+            // One big copy (cut into pieces) and two small ones.
+            // SAFETY: (all) inside the two buffers.
+            copy_then(d, s, 8 << 20, Some((landed, delta)));
+            copy_then(unsafe { d.add(8 << 20) }, unsafe { s.add(8 << 20) }, 1 << 20, Some((landed, delta)));
+            copy(unsafe { d.add(9 << 20) }, unsafe { s.add(9 << 20) }, 3 << 20);
+        });
+        assert_eq!(LANDED.load(Ordering::Relaxed), 0, "not before the run");
+        run(pieces);
+        assert_eq!(LANDED.load(Ordering::Relaxed), 9 << 20, "every byte once");
+        assert_eq!(WRONG.load(Ordering::Relaxed), 0, "called after the bytes landed");
+        assert!(dst == src, "every byte where it belongs");
+        // Outside `queued`: at once.
+        dst[..16].fill(0);
+        copy_then(d, s, 16, Some((landed, delta)));
+        assert_eq!(LANDED.load(Ordering::Relaxed), (9 << 20) + 16);
     }
 
     /// Queued copies are made by `run`, on the workers past the threshold,

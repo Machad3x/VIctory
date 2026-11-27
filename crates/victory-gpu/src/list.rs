@@ -1189,6 +1189,8 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
                 (data + at) as *const u8
             };
             crate::host::write_mapped((title + at) as *mut u8, src, n);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::ours_wrote(title + at, n);
         }
     });
 }

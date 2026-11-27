@@ -84,6 +84,27 @@ struct Vram {
     ahead: Mutex<Vec<(usize, usize)>>,
 }
 
+impl Vram {
+    /// The mirror is behind video memory over offsets `[from, to)`.
+    fn behind(&self, from: usize, to: usize) {
+        let mut bits = lock_stale(&self.stale);
+        for k in from / PAGE..to.div_ceil(PAGE) {
+            bits[k / 64] |= 1 << (k % 64);
+        }
+    }
+
+    /// [`crate::copy_pool::Then`] of a pooled video-memory write: `vram` a
+    /// `&Vram`, `dst` and `len` the bytes of its copy that landed.
+    fn landed(vram: usize, dst: usize, len: usize) {
+        // SAFETY: the copy holding it outlives the pool's run, which makes
+        // the queued write and calls this before it returns (the write's
+        // destination lives as long).
+        let v = unsafe { &*(vram as *const Vram) };
+        let from = dst - v.data as usize;
+        v.behind(from, from + len);
+    }
+}
+
 /// Snapshot segments (offset, bytes) and the pieces compared.
 type Snapshot = (Vec<(usize, Vec<u8>)>, crate::fx::Set<usize>);
 
@@ -206,9 +227,23 @@ const _: () = assert!(SPAN_GAP >= 64);
 /// preparing thread, not in the copy pool.
 fn refresh_serial() -> bool {
     static SERIAL: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_REFRESH_SERIAL").is_some_and(|v| v == "1"));
+        std::sync::LazyLock::new(|| refresh_serial_set(std::env::var_os("VICTORY_REFRESH_SERIAL")));
+    #[cfg(test)]
+    if REFRESH_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     *SERIAL
 }
+
+/// Whether `VICTORY_REFRESH_SERIAL`'s value turns the serial path on.
+fn refresh_serial_set(value: Option<std::ffi::OsString>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// Tests: as `VICTORY_REFRESH_SERIAL=1` (held under
+/// [`crate::copy_pool::test_lock`]).
+#[cfg(test)]
+static REFRESH_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Writes the runs `[start, end)` of `merged` (title memory as read, with
 /// the shaders' bytes in the runs) into title memory at `at`, and nothing
@@ -1222,14 +1257,15 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::RefreshSerialBytes, (to - from) as u64);
             crate::host::copy_mapped(at, src, to - from, false);
+            v.behind(from, to);
         } else {
-            // Pooled: nothing reads video memory before the pool's run returns, ahead of the submission.
+            // Pooled: nothing reads video memory before the pool's run
+            // returns, ahead of the submission; the stale bits are set as
+            // the write lands.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::RefreshPoolBytes, (to - from) as u64);
-            crate::copy_pool::copy(at, src, to - from);
+            crate::copy_pool::copy_then(at, src, to - from, Some((Vram::landed, std::ptr::from_ref(v) as usize)));
         }
-        // Set before a pooled write lands: every reader of the stale bits runs on the flushing thread after `copy_pool::run`.
-        self.stale(from, to);
     }
 
     /// Title memory at offsets `[from, to)` into the copy (the mirror, and
@@ -1254,15 +1290,6 @@ impl Shadow {
             });
         }
         self.push(from, to - from);
-    }
-
-    /// The mirror is behind video memory over offsets `[from, to)`.
-    fn stale(&self, from: usize, to: usize) {
-        let Some(v) = &self.vram else { return };
-        let mut bits = lock_stale(&v.stale);
-        for k in from / PAGE..to.div_ceil(PAGE) {
-            bits[k / 64] |= 1 << (k % 64);
-        }
     }
 
     /// Before the CPU reads offsets `[from, to)` of a mirrored copy: the
@@ -2880,6 +2907,7 @@ pub(crate) mod tests {
         let pages = 80;
         let (p, len, copy) = mirrored_buffer(pages);
         copy.freshen(0, len);
+        let _serial = crate::copy_pool::test_lock();
         for (serial, stamp) in [(false, 0xA5u8), (true, 0x5A)] {
             crate::copy_pool::SERIAL.store(serial, std::sync::atomic::Ordering::Relaxed);
             for page in 0..pages {
@@ -2889,6 +2917,7 @@ pub(crate) mod tests {
             let (_, pieces) = crate::copy_pool::queued(|| copy.update(p, len));
             assert!(!pieces.is_empty(), "serial {serial}: video writes queued");
             assert_ne!(gpu_bytes(&copy, p + PAGE + 100, 1), [stamp], "serial {serial}: not before the run");
+            assert_eq!(copy.stale_pages(), Vec::<usize>::new(), "serial {serial}: stale only once written");
             crate::copy_pool::run(pieces);
             for page in 0..pages {
                 assert_eq!(gpu_bytes(&copy, p + page * PAGE + 100, 1), [stamp], "serial {serial}: page {page}");
@@ -2896,8 +2925,52 @@ pub(crate) mod tests {
             assert_eq!(copy.stale_pages(), (0..pages).collect::<Vec<_>>(), "serial {serial}: mirror behind");
             // SAFETY: the mirror's bytes.
             assert_ne!(unsafe { *copy.data.add(PAGE + 100) }, stamp, "serial {serial}: mirror not written");
+            copy.freshen(0, len);
         }
         crate::copy_pool::SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+        unregister(p, p as u64);
+    }
+
+    /// `VICTORY_REFRESH_SERIAL=1` (only "1"): inside
+    /// [`crate::copy_pool::queued`] a mirrored copy's refresh writes video
+    /// memory at once, queues nothing, and leaves the mirror behind.
+    #[test]
+    fn refresh_serial_writes_video_memory_at_once() {
+        assert!(refresh_serial_set(Some("1".into())));
+        let offs: [Option<std::ffi::OsString>; 4] = [None, Some("0".into()), Some("".into()), Some("true".into())];
+        for off in offs {
+            assert!(!refresh_serial_set(off.clone()), "{off:?}");
+        }
+        if !rerun_with_gpu_upload(
+            "shadow::tests::refresh_serial_writes_video_memory_at_once",
+            true,
+        ) {
+            return;
+        }
+        let Some(host) = host() else {
+            return;
+        };
+        if !host.gpu_upload_writes() {
+            return; // no GPU upload heaps here
+        }
+        let pages = 80;
+        let (p, len, copy) = mirrored_buffer(pages);
+        copy.freshen(0, len);
+        let _serial = crate::copy_pool::test_lock();
+        REFRESH_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
+        for page in 0..pages {
+            // SAFETY: our pool's bytes.
+            unsafe { ((p + page * PAGE + 100) as *mut u8).write_volatile(0xC3) };
+        }
+        let (_, pieces) = crate::copy_pool::queued(|| copy.update(p, len));
+        REFRESH_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(pieces.is_empty(), "nothing queued");
+        for page in 0..pages {
+            assert_eq!(gpu_bytes(&copy, p + page * PAGE + 100, 1), [0xC3], "page {page}");
+        }
+        assert_eq!(copy.stale_pages(), (0..pages).collect::<Vec<_>>(), "mirror behind");
+        // SAFETY: the mirror's bytes.
+        assert_ne!(unsafe { *copy.data.add(PAGE + 100) }, 0xC3, "mirror not written");
         unregister(p, p as u64);
     }
 

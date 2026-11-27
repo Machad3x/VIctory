@@ -3401,6 +3401,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
+        #[cfg(feature = "diagnostics")]
+        if title_dst {
+            crate::copystat::ours_wrote(dst as usize, len);
+        }
         return;
     }
     // The copy stopped at an unmapped page. One of a title destination ends
@@ -3429,6 +3433,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
     });
+    #[cfg(feature = "diagnostics")]
+    if title_dst {
+        crate::copystat::ours_wrote(dst as usize, len);
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -5453,6 +5461,8 @@ mod batch {   // `mod tests` is already taken at the top of this file
         batch.add(&copy, p, HEAP);
         batch.flush();
         let mut stamp = 1u64;
+        // Not with another test switching the refreshes' threads meanwhile.
+        let _serial = crate::copy_pool::test_lock();
         let mut frame = |serial: bool| -> (Duration, usize) {
             crate::copy_pool::SERIAL.store(serial, Ordering::Relaxed);
             let (mut took, mut copied) = (Duration::ZERO, 0);
