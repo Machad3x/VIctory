@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -48,11 +48,17 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Fast-path flag: `true` once `ranged` holds any non-zero range, avoiding
+    /// the `ranged` mutex lock on buffers that never recorded a partial-page range.
+    ranged_any: AtomicBool,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Fast-path flag: `true` while `pending` is non-empty, avoiding the
+    /// `pending` mutex lock on read-only buffers during refreshes.
+    pending_any: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -1673,6 +1679,35 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
     wide(jobs);
 }
 
+/// Calls `work` with disjoint contiguous chunks of `0..n` of size up to
+/// `chunk`, claimed per worker with a single atomic increment: reduces
+/// cache-line contention on `next` and allows per-chunk amortization of
+/// shared read locks and counters.
+pub(crate) fn wide_chunks(n: usize, chunk: usize, work: impl Fn(std::ops::Range<usize>) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    let chunk = chunk.max(1);
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let work = Arc::new(work);
+    let threads = (wide_threads() + 1).min(n.div_ceil(chunk));
+    let jobs = (0..threads)
+        .map(|_| {
+            let (next, work) = (next.clone(), work.clone());
+            Box::new(move || {
+                loop {
+                    let start = next.fetch_add(chunk, Ordering::Relaxed);
+                    if start >= n {
+                        break;
+                    }
+                    work(start..(start + chunk).min(n));
+                }
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -2178,6 +2213,21 @@ fn wc_no_back_min() -> u64 {
     })
 }
 
+/// Whether the write-back cutoff is in force for write-combined copies.
+fn wc_no_back_cutoff() -> Option<u64> {
+    wc_no_back().then(wc_no_back_min)
+}
+
+/// `VICTORY_WC_BAR` policy: mode 1 honours the write-back cutoff, mode 2 is
+/// the original unrestricted path kept for comparison.
+fn wc_bar_allowed(mode: Option<&str>, cutoff: Option<u64>, len: u64) -> bool {
+    match mode {
+        Some("1") => cutoff.is_some_and(|min| len >= min),
+        Some("2") => true,
+        _ => false,
+    }
+}
+
 /// Bytes shaders were declared to write in write-combined copies and that
 /// were left on the card ([`wc_no_back`]), since the last frame-rate line.
 pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -2185,7 +2235,9 @@ pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 /// Whether a title buffer in write-combined memory gets one copy, in card
 /// memory the CPU maps (`D3D12_HEAP_TYPE_GPU_UPLOAD`: a resizable BAR, this
 /// PC's 4070 SUPER has a 16 GiB one) instead of two sides
-/// (`VICTORY_WC_BAR=1`; off by default: an experiment).
+/// (`VICTORY_WC_BAR=1`; off by default). Honour the write-back size policy:
+/// small shader results can feed title CPU reads or refreshes of other copies.
+/// `VICTORY_WC_BAR=2` selects the original policy for comparison.
 ///
 /// Refreshes write title memory into the mapping through the bus (as they
 /// write a CPU's side now); shaders read and write the card's memory; there
@@ -2201,9 +2253,10 @@ pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
 /// fifth of the budget is free; the PC's memory of the CPU's side is saved.
 /// Copies already made, or turned down for room, keep their two sides or
 /// stay in the PC's memory.
-fn wc_bar() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_BAR").is_some_and(|v| v == "1"))
+fn wc_bar(len: u64) -> bool {
+    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| std::env::var("VICTORY_WC_BAR").ok());
+    wc_bar_allowed(mode.as_deref(), wc_no_back_cutoff(), len)
 }
 
 /// A buffer of `size` bytes in card memory the CPU maps, for [`wc_bar`],
@@ -3178,8 +3231,10 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            ranged_any: AtomicBool::new(false),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_any: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3230,7 +3285,7 @@ impl Shadow {
         // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
         // which the CPU would read through the bus): what shaders write stays
         // on the card.
-        if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
+        if (self.card.is_some() && wc_no_back_cutoff().is_some_and(|min| self.len >= min) || self.mapped && !self.window)
             && self.write_combined()
         {
             self.written.store(true, Ordering::Relaxed);
@@ -3292,6 +3347,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_any.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3316,6 +3372,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_any.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3605,6 +3662,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_any.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3662,12 +3720,15 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_any.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        if !self.pending_any.load(Ordering::Acquire) {
+            return false;
+        }
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
@@ -3957,6 +4018,13 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        let journal = crate::watch::read_journal();
+        self.nothing_new_with(&journal, address, len)
+    }
+
+    /// As [`Shadow::nothing_new`], reusing a caller-held [`crate::watch::JournalRead`]
+    /// to avoid per-buffer `RwLock::read` traffic across large refresh batches.
+    pub(crate) fn nothing_new_with(&self, journal: &crate::watch::JournalRead, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3969,11 +4037,13 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.pending_any.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = journal.nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3986,6 +4056,9 @@ impl Shadow {
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
+        if !self.ranged_any.load(Ordering::Acquire) {
+            return 0;
+        }
         let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
         ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
     }
@@ -4140,6 +4213,7 @@ impl Shadow {
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
             }
+            self.ranged_any.store(true, Ordering::Release);
         }
         bytes
     }
@@ -4810,7 +4884,7 @@ impl Shadow {
 mod land_tests {
     use super::{Card, PIECE, Shadow};
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
     /// A copy in the card's memory of title memory at `title` (its card side
     /// is never looked at here), all bytes 0 on the CPU's side.
@@ -4935,6 +5009,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.pending_any.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -4987,6 +5062,36 @@ mod land_tests {
             let last = writer.join().expect("nothing undone");
             assert!((1..LEN / 4).step_by(4 * 331).all(|i| dword(i).load(Ordering::Relaxed) == last));
         });
+    }
+
+    #[test]
+    fn wide_chunks_visits_every_index_once() {
+        for &(n, chunk) in &[(0usize, 32usize), (1, 32), (5, 32), (32, 32), (64, 32), (1000, 32), (257, 17)] {
+            let hits: std::sync::Arc<Vec<AtomicUsize>> = std::sync::Arc::new((0..n).map(|_| AtomicUsize::new(0)).collect());
+            let hits_work = hits.clone();
+            super::wide_chunks(n, chunk, move |range| {
+                let (lo, hi) = (range.start, range.end);
+                assert!(lo < hi, "empty chunk ({lo}..{hi}) for n={n}");
+                assert!(hi <= n, "out of bounds ({lo}..{hi}) for n={n}");
+                assert!(hi - lo <= chunk, "oversized chunk ({lo}..{hi}) > {chunk}");
+                for slot in &hits_work[lo..hi] {
+                    slot.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            for (i, slot) in hits.iter().enumerate() {
+                assert_eq!(slot.load(Ordering::Relaxed), 1, "index {i} for n={n}, chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn journal_read_matches_watch_nothing_new() {
+        let journal = crate::watch::read_journal();
+        let copied = [u64::MAX];
+        assert_eq!(
+            journal.nothing_new(0x1000, 0x2000, 0x1000, &copied, u64::MAX),
+            crate::watch::nothing_new(0x1000, 0x2000, 0x1000, &copied, u64::MAX),
+        );
     }
 }
 
@@ -5232,7 +5337,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Write-combined memory with `VICTORY_WC_BAR`: one buffer in the card's
         // memory that the CPU maps, no CPU's side, nothing sent, and what
         // shaders write stays there ([`wc_bar`]).
-        if wc_bar()
+        if wc_bar(len)
             && is_write_combined(key.0, len)
             && let Some((buffer, data)) = wc_mapped_for(size)
         {
@@ -5699,7 +5804,20 @@ pub(crate) fn exact_line(frames: f64) {
 
 #[cfg(test)]
 mod write_combined_tests {
-    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
+    use super::{is_write_combined, title_memory_write_combined, wc_bar_allowed, write_combined_freed};
+
+    #[test]
+    fn bar_obeys_write_back_policy_unless_legacy_mode_is_selected() {
+        let min = 1 << 20;
+        assert!(!wc_bar_allowed(None, Some(min), min));
+        assert!(!wc_bar_allowed(Some("0"), Some(min), min));
+        assert!(!wc_bar_allowed(Some("1"), None, min));
+        assert!(!wc_bar_allowed(Some("1"), Some(min), min - 1));
+        assert!(wc_bar_allowed(Some("1"), Some(min), min));
+        assert!(wc_bar_allowed(Some("1"), Some(0), 4));
+        assert!(wc_bar_allowed(Some("2"), None, 4));
+        assert!(wc_bar_allowed(Some("2"), Some(min), 4));
+    }
 
     /// A copy counts as write-combined only inside one such region, and not
     /// after the region is let go (part of it or the whole allocation).
