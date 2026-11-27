@@ -96,8 +96,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     let completed = fence.value.load(Ordering::Acquire);
     #[cfg(all(windows, feature = "diagnostics"))]
-    if value > completed && !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
+    if value > completed {
         crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::copystat::add(crate::copystat::C::FenceEventsUnmet, 1);
     }
     if completed >= value {
         if !event.is_null() {

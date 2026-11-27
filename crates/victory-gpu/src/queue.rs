@@ -118,6 +118,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() {
+        #[cfg(feature = "diagnostics")]
+        let _in = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::TitleExecNs);
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held();

@@ -151,6 +151,11 @@ impl<S> Held<S> {
                             if !waits.is_empty() && !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
+                            // Pipelining study: what wrote the words, once per segment.
+                            #[cfg(all(windows, feature = "diagnostics"))]
+                            if *fresh {
+                                waits.iter().for_each(|w| crate::copystat::wait_source(w.address));
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -179,6 +184,10 @@ impl<S> Held<S> {
                             #[cfg(all(windows, feature = "diagnostics"))]
                             if !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            #[cfg(all(windows, feature = "diagnostics"))]
+                            if *fresh {
+                                crate::copystat::add(crate::copystat::C::QueueFenceWaits, 1);
                             }
                             let ok = (w.fence)(*fence) >= *value;
                             if !ok {

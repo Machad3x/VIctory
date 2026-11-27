@@ -223,8 +223,41 @@ pub(crate) enum C {
     StaleLockWaitNs,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
+    /// Pipelining study (title submissions only): title bytes a submission
+    /// takes that the one before declared written, by step: a refresh of a
+    /// clean copy (nothing copied), of a changed copy the one before wrote
+    /// (same copy) or did not (alias), a texture staging, a title copy or
+    /// fill, a range its shaders write; submissions with a real conflict
+    /// (any but clean, or a heap page below).
+    RangeClean,
+    RangeSame,
+    RangeAlias,
+    RangeStaging,
+    RangeCopy,
+    RangeGpuWrite,
+    DrainReal,
+    /// Heap pages synced that the submission before declared written.
+    HeapInFlight,
+    /// Queue memory value waits at their first test, by what last wrote the
+    /// word: a bottom-of-pipe value (predictable), a query result, a
+    /// timestamp, none of ours (the CPU, or unknown); queue fence Waits;
+    /// title event waits for a fence value not reached.
+    WaitsValue,
+    WaitsHostValue,
+    WaitsTimestamp,
+    WaitsCpu,
+    QueueFenceWaits,
+    FenceEventsUnmet,
+    /// Null views made after a submission for shaders that read them: slots,
+    /// and submissions making any.
+    MadeReadSlots,
+    MadeReadSubs,
+    /// Title submissions using a host copy the one before wrote.
+    SharedCopySubs,
+    /// Nanoseconds the title's threads spent in ExecuteCommandLists.
+    TitleExecNs,
 }
-const COUNTERS: usize = C::VideoBytes as usize + 1;
+const COUNTERS: usize = C::TitleExecNs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 /// The guard handler's longest single wait for the guard lock since the
@@ -263,8 +296,16 @@ static FLIGHT_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Frames presented at the last title submission.
 static FLIGHT_PRESENTED: AtomicU64 = AtomicU64::new(0);
 /// The last title submission's written title ranges (start, end), sorted
-/// and merged; only taken under the host's submission lock.
-static FLIGHT_WRITES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// and merged, and the host copies it wrote (sorted); only set under the
+/// host's submission lock.
+static FLIGHT_WRITES: Mutex<(Vec<(usize, usize)>, Vec<usize>)> = Mutex::new((Vec::new(), Vec::new()));
+/// Whether the submission being prepared is the title's.
+static FLIGHT_TITLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A heap page synced for this submission was written by the one before.
+static FLIGHT_HEAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What last wrote each bottom-of-pipe word: 0 a value, 1 a query result,
+/// 2 a timestamp.
+static LABELS: Mutex<Option<HashMap<u64, u8>>> = Mutex::new(None);
 
 /// Why a title submission would drain the one before (fence, sync
 /// executes, present); `None` for our own executes.
@@ -272,7 +313,9 @@ pub(crate) struct Flight(bool, bool, bool);
 
 /// At a submission's start: `None` (and noted) for our own.
 pub(crate) fn flight_begin() -> Option<Flight> {
-    if !TITLE.replace(false) {
+    let title = TITLE.replace(false);
+    FLIGHT_TITLE.store(title, Relaxed);
+    if !title {
         FLIGHT_SYNC.store(true, Relaxed);
         return None;
     }
@@ -293,17 +336,67 @@ pub(crate) fn flight_sent(f: &mut Option<Flight>) {
     }
 }
 
-/// The ranges the last title submission wrote (empty for our own).
-pub(crate) fn flight_writes(flight: &Option<Flight>) -> Vec<(usize, usize)> {
+/// The ranges and host copies the last title submission wrote (empty for
+/// our own).
+pub(crate) fn flight_writes(flight: &Option<Flight>) -> (Vec<(usize, usize)>, Vec<usize>) {
     if flight.is_none() {
-        return Vec::new();
+        return Default::default();
     }
-    std::mem::take(&mut *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()))
+    FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// At a title submission's end: its counts, and its written ranges for the
-/// next.
-pub(crate) fn flight_end(f: Flight, range: bool, times: [u64; 4], mut writes: Vec<(usize, usize)>) {
+/// A heap page a title submission's sync takes: counted if the submission
+/// before declared it written.
+pub(crate) fn heap_page(at: usize, len: usize) {
+    if FLIGHT_TITLE.load(Relaxed) && touches(&FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()).0, at, len) {
+        add(C::HeapInFlight, 1);
+        FLIGHT_HEAP.store(true, Relaxed);
+    }
+}
+
+/// A bottom-of-pipe write at `at`, for [`wait_source`].
+pub(crate) fn label_written(at: usize, what: &crate::queue::Written) {
+    let kind = match what {
+        crate::queue::Written::Value(_) => 0,
+        crate::queue::Written::HostValue(_) => 1,
+        crate::queue::Written::GpuTimestamp | crate::queue::Written::SystemTimestamp => 2,
+    };
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(at as u64, kind);
+}
+
+/// A queue's memory value wait at its first test, counted by what last
+/// wrote its word.
+pub(crate) fn wait_source(address: u64) {
+    let kind = LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&address).copied());
+    add(
+        match kind {
+            Some(0) => C::WaitsValue,
+            Some(1) => C::WaitsHostValue,
+            Some(_) => C::WaitsTimestamp,
+            None => C::WaitsCpu,
+        },
+        1,
+    );
+}
+
+/// At a title submission's end: its counts, and its written ranges and
+/// copies for the next (`real`: a conflict that needs the one before
+/// settled; `shared`: it used a copy the one before wrote).
+pub(crate) fn flight_end(
+    f: Flight,
+    range: bool,
+    real: bool,
+    shared: bool,
+    times: [u64; 4],
+    mut writes: Vec<(usize, usize)>,
+    mut copies: Vec<usize>,
+) {
+    if real | FLIGHT_HEAP.swap(false, Relaxed) {
+        add(C::DrainReal, 1);
+    }
+    if shared {
+        add(C::SharedCopySubs, 1);
+    }
     for (c, t) in [C::FlightPrepNs, C::FlightSyncHeapsNs, C::FlightGpuWaitNs, C::FlightSettleNs].into_iter().zip(times) {
         add(c, t);
     }
@@ -316,7 +409,9 @@ pub(crate) fn flight_end(f: Flight, range: bool, times: [u64; 4], mut writes: Ve
         add(C::DrainFree, 1);
     }
     merge(&mut writes);
-    *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()) = writes;
+    copies.sort_unstable();
+    copies.dedup();
+    *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()) = (writes, copies);
 }
 
 /// Sorts and merges ranges (start, end) into disjoint ones.
@@ -617,7 +712,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}",
+        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}; pipelining: real drains {:.1}; taken while the one before wrote them: clean refreshes {:.1}, changed same copy {:.1}, changed alias {:.1}, stagings {:.1}, copies {:.1}, shader writes {:.1}, heap pages {:.1}; value waits by writer: value {:.1}, query {:.1}, timestamp {:.1}, cpu or unknown {:.1}; queue fence waits {:.1}; unmet fence events {:.1}; null views made {:.1} in {:.1} submissions; submissions using a copy the one before wrote {:.1}; title in ExecuteCommandLists {:.2} ms",
         c[C::FlightPrepNs as usize] / 1e6,
         c[C::FlightSyncHeapsNs as usize] / 1e6,
         c[C::FlightGpuWaitNs as usize] / 1e6,
@@ -628,6 +723,24 @@ pub(crate) fn log(frames: f64) {
         c[C::DrainPresent as usize],
         c[C::DrainFree as usize],
         c[C::FlightFencePolls as usize],
+        c[C::DrainReal as usize],
+        c[C::RangeClean as usize],
+        c[C::RangeSame as usize],
+        c[C::RangeAlias as usize],
+        c[C::RangeStaging as usize],
+        c[C::RangeCopy as usize],
+        c[C::RangeGpuWrite as usize],
+        c[C::HeapInFlight as usize],
+        c[C::WaitsValue as usize],
+        c[C::WaitsHostValue as usize],
+        c[C::WaitsTimestamp as usize],
+        c[C::WaitsCpu as usize],
+        c[C::QueueFenceWaits as usize],
+        c[C::FenceEventsUnmet as usize],
+        c[C::MadeReadSlots as usize],
+        c[C::MadeReadSubs as usize],
+        c[C::SharedCopySubs as usize],
+        c[C::TitleExecNs as usize] / 1e6,
     );
     let kinds = [
         C::GuardFaultsPool as usize,

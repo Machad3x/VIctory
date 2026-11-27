@@ -1695,10 +1695,10 @@ impl Host {
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         {
-            batch.flight_prev = crate::copystat::flight_writes(&flight);
+            (batch.flight_prev, batch.flight_prev_copies) = crate::copystat::flight_writes(&flight);
             for (staging, _) in &textures {
                 let (at, len) = staging.title_range();
-                batch.touch(at, len);
+                batch.touch(at, len, crate::copystat::C::RangeStaging);
             }
         }
         for (i, list) in runs.iter().enumerate() {
@@ -1993,6 +1993,11 @@ impl Host {
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::MadeReadSlots, read.len() as u64);
+                crate::copystat::add(crate::copystat::C::MadeReadSubs, 1);
+            }
             crate::descriptor::make_read(&read);
         }
         // What shaders wrote into copies in video memory, for the copy-backs
@@ -2061,6 +2066,8 @@ impl Host {
                     crate::queue::Written::HostValue(_) if unwaited => crate::queue::Written::Value(1 << 20),
                     what => what,
                 };
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::label_written(at, &what);
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -2079,11 +2086,15 @@ impl Host {
                     l.deferred().writes.iter().map(|&(at, _, bytes)| (at, at + bytes)).collect::<Vec<_>>()
                 }))
                 .collect();
+            let copies = back.iter().map(|b| std::sync::Arc::as_ptr(&b.0) as usize).collect();
             crate::copystat::flight_end(
                 f,
                 batch.flight_touched,
+                batch.flight_real,
+                batch.flight_shared,
                 [ns(sent - started), sync_heaps_ns, ns(waited_at - sent), ns(copying.elapsed())],
                 writes,
+                copies,
             );
         }
         // The submission has run and the next waits for our lock. Host
@@ -3104,8 +3115,8 @@ impl HostList {
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
-                        batch.touch(src, len);
-                        batch.touch(dst, len);
+                        batch.touch(src, len, C::RangeCopy);
+                        batch.touch(dst, len, C::RangeCopy);
                     }
                     batch.title_written();
                     // The flush counted its own time.
@@ -3139,7 +3150,7 @@ impl HostList {
                         len
                     };
                     #[cfg(feature = "diagnostics")]
-                    batch.touch(src, len);
+                    batch.touch(src, len, C::RangeCopy);
                     let mut copied = fill(dst, src, len);
                     // A run of fills (a list's constant buffers, mostly a
                     // few hundred bytes each) is timed as one: reading the
@@ -3148,7 +3159,7 @@ impl HostList {
                         steps.next_if(|s| matches!(s, Step::Fill(..)))
                     {
                         #[cfg(feature = "diagnostics")]
-                        batch.touch(src, len);
+                        batch.touch(src, len, C::RangeCopy);
                         copied += fill(dst, src, len);
                     }
                     copied
@@ -3183,7 +3194,7 @@ impl HostList {
                         batch.flush();
                     }
                     #[cfg(feature = "diagnostics")]
-                    batch.touch(*address, *len);
+                    batch.touch(*address, *len, C::RangeGpuWrite);
                     batch.gpu_write(*address, *len);
                     shadow.writing(*address, *len, *marked);
                     continue;
@@ -3245,30 +3256,50 @@ struct Batch {
     flight_prev: Vec<(usize, usize)>,
     #[cfg(feature = "diagnostics")]
     flight_touched: bool,
+    /// Pipelining study: the host copies the last title submission wrote
+    /// (sorted); whether this one takes bytes it wrote other than through a
+    /// clean refresh, and whether it uses one of those copies.
+    #[cfg(feature = "diagnostics")]
+    flight_prev_copies: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    flight_real: bool,
+    #[cfg(feature = "diagnostics")]
+    flight_shared: bool,
 }
 
 impl Batch {
-    /// Flight study: title bytes the submission reads or writes.
+    /// Flight study: title bytes the submission reads or writes, counted
+    /// under `c` when the last title submission wrote them.
     #[cfg(feature = "diagnostics")]
-    fn touch(&mut self, at: usize, len: usize) {
-        if !self.flight_touched {
-            self.flight_touched = crate::copystat::touches(&self.flight_prev, at, len);
+    fn touch(&mut self, at: usize, len: usize, c: crate::copystat::C) {
+        if !crate::copystat::touches(&self.flight_prev, at, len) {
+            return;
         }
+        self.flight_touched = true;
+        self.flight_real |= !matches!(c, crate::copystat::C::RangeClean);
+        crate::copystat::add(c, 1);
     }
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         #[cfg(feature = "diagnostics")]
-        self.touch(address, len);
+        let same = self.flight_prev_copies.binary_search(&(std::sync::Arc::as_ptr(shadow) as usize)).is_ok();
+        #[cfg(feature = "diagnostics")]
+        {
+            self.flight_shared |= same;
+        }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
             #[cfg(feature = "diagnostics")]
             {
+                self.touch(address, len, crate::copystat::C::RangeClean);
                 crate::copystat::add(crate::copystat::C::Skipped, 1);
                 crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
             }
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        self.touch(address, len, if same { crate::copystat::C::RangeSame } else { crate::copystat::C::RangeAlias });
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
