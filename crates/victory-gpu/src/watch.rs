@@ -399,6 +399,7 @@ fn count_fault_kind(page: usize, armed: bool) {
 
 #[cfg(not(feature = "diagnostics"))]
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
+    crate::inplace::order::guards();
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -408,6 +409,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 #[track_caller]
 fn guards() -> Held {
     let line = std::panic::Location::caller().line();
+    crate::inplace::order::guards();
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
     Held(Some(guard), std::time::Instant::now(), line)
 }

@@ -52,9 +52,11 @@
 //! read zeros there and all it wrote was dropped. The runtime reports the
 //! title's private allocations ([`title_memory_private`]); each page of
 //! them that is committed, read-write, held by no copy and no tracker is
-//! named in place, in runs of at most [`CHUNK`] pages, and the page table
-//! waits for the worker to open them ([`wait_private`]): they are there
-//! before the submission runs. Nothing is copied: what shaders write
+//! named in place, in runs of at most [`CHUNK`] pages. The worker opens
+//! them when the runtime reports the memory, long before a list reads it;
+//! a page table that still finds some asked for and not open waits for the
+//! worker ([`wait_private`], bounded per frame): they are there before the
+//! submission runs. Nothing is copied: what shaders write
 //! there is in title memory at once, for later submissions and for the
 //! title's CPU. With it, lists that still miss memory withhold nothing
 //! (`crate::memory::withholds`): part of a build in place and part
@@ -151,9 +153,14 @@ const LONGEST: usize = 2 * MOST;
 /// protection of the title's, lets go of that much, and opening it again
 /// takes ~2 ms.
 pub(crate) const CHUNK: usize = 128;
-/// The longest a page table waits for the worker to open private runs it
-/// asked for ([`wait_private`]): opening 256 MiB took 70 ms where measured.
-const PRIVATE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// The longest page tables wait in one frame for the worker to open
+/// private runs ([`wait_private`]), in microseconds: opening 256 MiB took
+/// 70 ms where measured, and runs are opened when their memory is
+/// reported, so a table mostly waits for nothing.
+const PRIVATE_WAIT_US: u64 = 100_000;
+/// Microseconds page tables waited for the worker since the last frame
+/// line.
+static WAITED_US: AtomicU64 = AtomicU64::new(0);
 
 /// Our own view's `[at, at + len)` open in place: a heap over it and one
 /// buffer placed over all of it.
@@ -245,15 +252,125 @@ static PINS: Mutex<BTreeMap<u64, crate::pinned::Pin>> = Mutex::new(BTreeMap::new
 static PRIVATE: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
 /// Since the start: runs over private memory opened, let go for a tracker,
 /// let go for a change of the title's, and page tables that stopped
-/// waiting for the worker; pages named in private memory by the last table.
-static RT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// waiting for the worker; pages named in private memory by the last
+/// table; since the start again, page tables that waited for the worker
+/// and the microseconds they waited.
+static RT: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// Since the last frame line, of lists with the builder's dispatches:
 /// pages written in place, pages written in copies that went back, pages
 /// written in copies that were withheld, pages missed.
 static BUILDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-fn locked_ranges() -> std::sync::MutexGuard<'static, BTreeMap<(usize, u64), usize>> {
-    LOCKED_RANGES.lock().unwrap_or_else(|e| e.into_inner())
+fn locked_ranges() -> order::Ranges {
+    order::Ranges::new(LOCKED_RANGES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The lock order around title memory in place, asserted in debug builds:
+/// * `crate::watch`'s guard lock is taken before [`LOCKED_RANGES`]
+///   (`protect_noting` asks [`locked`] under it), never after: nothing
+///   takes the guard lock while holding the ranges.
+/// * The page tables' lock is held while waiting for the opening thread
+///   ([`wait_private`]), so that thread never takes it.
+pub(crate) mod order {
+    use std::collections::BTreeMap;
+    use std::sync::MutexGuard;
+
+    thread_local! {
+        /// This thread holds [`super::LOCKED_RANGES`].
+        static RANGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// This thread is the opening thread.
+        static WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    type Map = BTreeMap<(usize, u64), usize>;
+
+    /// [`super::LOCKED_RANGES`] held, known to [`guards`].
+    pub(crate) struct Ranges(MutexGuard<'static, Map>);
+
+    impl Ranges {
+        pub(super) fn new(guard: MutexGuard<'static, Map>) -> Ranges {
+            RANGES.set(true);
+            Ranges(guard)
+        }
+    }
+
+    impl Drop for Ranges {
+        fn drop(&mut self) {
+            RANGES.set(false);
+        }
+    }
+
+    impl std::ops::Deref for Ranges {
+        type Target = Map;
+        fn deref(&self) -> &Map {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for Ranges {
+        fn deref_mut(&mut self) -> &mut Map {
+            &mut self.0
+        }
+    }
+
+    /// Whether this thread holds the ranges.
+    pub(super) fn ranges_held() -> bool {
+        RANGES.get()
+    }
+
+    /// This thread is the opening thread from now on.
+    pub(super) fn worker() {
+        WORKER.set(true);
+    }
+
+    /// `crate::watch`'s guard lock is about to be taken.
+    #[inline]
+    pub(crate) fn guards() {
+        debug_assert!(!RANGES.get(), "the guard lock taken while holding the ranges locked in place");
+    }
+
+    /// The page tables' lock is about to be taken.
+    #[inline]
+    pub(crate) fn tables() {
+        debug_assert!(!WORKER.get(), "the page tables' lock taken on the opening thread, which its holder waits for");
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// The ranges count as held exactly while their guard lives, and
+        /// only on the thread holding them.
+        #[test]
+        fn the_ranges_are_held_while_their_guard_lives() {
+            assert!(!super::ranges_held());
+            let held = super::super::locked_ranges();
+            assert!(super::ranges_held());
+            assert!(!std::thread::spawn(super::ranges_held).join().unwrap());
+            drop(held);
+            assert!(!super::ranges_held());
+            super::guards(); // in order: the ranges are not held
+        }
+
+        /// Taking the guard lock under the ranges is out of order.
+        #[test]
+        #[cfg(debug_assertions)]
+        #[should_panic(expected = "while holding the ranges")]
+        fn the_guard_lock_under_the_ranges_is_refused() {
+            let _held = super::super::locked_ranges();
+            super::guards();
+        }
+
+        /// The opening thread never takes the page tables' lock.
+        #[test]
+        #[cfg(debug_assertions)]
+        fn the_opening_thread_may_not_take_the_tables() {
+            super::tables();
+            let refused = std::thread::spawn(|| {
+                super::worker();
+                std::panic::catch_unwind(super::tables).is_err()
+            });
+            assert!(refused.join().unwrap());
+        }
+    }
 }
 
 /// Whether title page `page` lies in a run over private memory that is
@@ -460,20 +577,33 @@ pub(crate) fn run_for(at: usize, len: usize, private: bool) -> Option<(Arc<Run>,
     }
 }
 
-/// Waits for the worker to open the private runs asked of it, up to
-/// [`PRIVATE_WAIT`]: a page table written for a submission names them
-/// before it runs (the builder's first list reads no zeros). True if none
-/// is left waiting.
+/// Waits for the worker to open the private runs asked of it: a page
+/// table written for a submission names them before it runs (the
+/// builder's first list reads no zeros). All the tables of a frame wait
+/// [`PRIVATE_WAIT_US`] at most between them; one that stops waiting is
+/// counted, and the pages not open miss for its submission. True if none
+/// is left waiting. Called with the page tables' lock held, which the
+/// worker never takes ([`order`]).
 pub(crate) fn wait_private() -> bool {
-    let started = std::time::Instant::now();
-    while PRIVATE_PENDING.load(Ordering::Relaxed) != 0 {
-        if started.elapsed() > PRIVATE_WAIT {
-            RT[3].fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_micros(200));
+    debug_assert!(!order::ranges_held(), "waiting for the opening thread while holding the ranges");
+    if PRIVATE_PENDING.load(Ordering::Relaxed) == 0 {
+        return true;
     }
-    true
+    let started = std::time::Instant::now();
+    let left = PRIVATE_WAIT_US.saturating_sub(WAITED_US.load(Ordering::Relaxed));
+    let mut done = false;
+    while !done && (started.elapsed().as_micros() as u64) < left {
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        done = PRIVATE_PENDING.load(Ordering::Relaxed) == 0;
+    }
+    let waited = started.elapsed().as_micros() as u64;
+    WAITED_US.fetch_add(waited, Ordering::Relaxed);
+    RT[5].fetch_add(1, Ordering::Relaxed);
+    RT[6].fetch_add(waited, Ordering::Relaxed);
+    if !done {
+        RT[3].fetch_add(1, Ordering::Relaxed);
+    }
+    done
 }
 
 /// Sends `[at, at + len)` to the opening thread.
@@ -484,7 +614,10 @@ fn worker(at: usize, len: usize, private: bool) {
         let (tx, rx) = std::sync::mpsc::channel::<Work>();
         let _ = std::thread::Builder::new()
             .name("victory-in-place".into())
-            .spawn(move || rx.into_iter().for_each(|(at, len, private)| open_run(at, len, private)));
+            .spawn(move || {
+                order::worker();
+                rx.into_iter().for_each(|(at, len, private)| open_run(at, len, private))
+            });
         Mutex::new(tx)
     });
     if work.lock().unwrap_or_else(|e| e.into_inner()).send((at, len, private)).is_err() {
@@ -702,6 +835,14 @@ pub fn title_memory_private(at: usize, len: usize) {
     with_runs(|r| r.refused.retain(|&(s, n)| s + n <= start || end <= s));
     let regions: Vec<usize> = (start >> 28..=(end - 1) >> 28).collect();
     crate::memory::want(&regions);
+    // Opened now, on the worker, so that the page table of the first
+    // submission reading it waits for nothing: the pages no tracker holds
+    // (fresh memory has no copy; a copy made later lets its run go).
+    let tracked = crate::watch::tracked_pages(start / PAGE, end / PAGE);
+    let candidates: Vec<usize> = (start / PAGE..end / PAGE).filter(|page| tracked.binary_search(page).is_err()).collect();
+    for run in runs(&private_pages(&candidates), CHUNK) {
+        let _ = run_for(run[0].1, run.len() * PAGE, true);
+    }
     // Committed since the last table, maybe: asked again.
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
@@ -915,15 +1056,20 @@ pub(crate) fn log_frame() {
     let took = STATS[6].swap(0, Ordering::Relaxed);
     let named = STATS[2].load(Ordering::Relaxed);
     let builder = BUILDER.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    // A frame's allowance of waiting starts anew.
+    let waited = WAITED_US.swap(0, Ordering::Relaxed);
     if rt_memory() && (named > 0 || builder.iter().any(|&n| n > 0)) {
         // Persisted: in place, or copied back. Lost: withheld or missed.
         tracing::info!(
-            "ray tracing memory (VICTORY_RT_MEMORY): private memory in place: {} pages named, {} runs open, so far {} opened, {} let go for trackers, {} for the title's changes, {} tables written without waiting longer; builder lists this frame: {} pages written in place, {} copied back ({:.1} MB reached the title), {} withheld, {} missed",
+            "ray tracing memory (VICTORY_RT_MEMORY): private memory in place: {} pages named, {} runs open, so far {} opened, {} let go for trackers, {} for the title's changes; page tables waited for the opening thread {:.1} ms this frame, so far {} times and {:.1} ms, {} of them stopped waiting; builder lists this frame: {} pages written in place, {} copied back ({:.1} MB reached the title), {} withheld, {} missed",
             RT[4].load(Ordering::Relaxed),
             PRIVATE_OPEN.load(Ordering::Relaxed),
             RT[0].load(Ordering::Relaxed),
             RT[1].load(Ordering::Relaxed),
             RT[2].load(Ordering::Relaxed),
+            waited as f64 / 1e3,
+            RT[5].load(Ordering::Relaxed),
+            RT[6].load(Ordering::Relaxed) as f64 / 1e3,
             RT[3].load(Ordering::Relaxed),
             builder[0],
             builder[1],
@@ -1167,7 +1313,11 @@ mod tests {
             return; // the host does not open private memory in place
         };
         let id = run.id;
-        drop(run);
+        // Lists ran with a layout naming it, and their table was rewritten
+        // since: that layout alone would keep the heap.
+        let key = usize::MAX - 0x51;
+        crate::memory::ran_with(key, run);
+        assert!(crate::memory::ran_names(id));
         assert!(locked(at / PAGE) && locked(at / PAGE + 3));
         assert!(!locked(at / PAGE + 4));
         assert_eq!(protect(mem::PAGE_READONLY), 0, "locked while the heap lives");
@@ -1176,8 +1326,28 @@ mod tests {
         assert_ne!(done, 0, "let go first, then protected");
         assert!(with_runs(|r| holding(&r.open, at, len)).is_none(), "forgotten");
         assert!(with_runs(|r| r.open.values().all(|run| run.id != id)));
+        assert!(!crate::memory::ran_names(id), "the layout its lists ran with let it go too");
         assert!(!locked(at / PAGE), "its heap is gone");
         assert_ne!(protect(mem::PAGE_READWRITE), 0);
+        // Open again, and the title commits a page of it anew with another
+        // protection (`XMemVirtualAlloc` at an address): let go if the host
+        // refuses that as locked, and done either way.
+        assert!(run_for(at, len, true).is_none());
+        assert!(wait_private());
+        let reopened = with_runs(|r| holding(&r.open, at, len)).is_some();
+        let commit = || {
+            // SAFETY: our allocation's first page, committed already.
+            let p = unsafe { mem::VirtualAlloc(at as *const c_void, PAGE, mem::MEM_COMMIT, mem::PAGE_READONLY) };
+            i32::from(!p.is_null())
+        };
+        assert_ne!(crate::pinned::title_memory_retry(at, PAGE, commit), 0, "committed read-only (run open: {reopened})");
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of::<mem::MEMORY_BASIC_INFORMATION>()) };
+        assert_eq!(info.Protect, mem::PAGE_READONLY);
+        assert!(!locked(at / PAGE) || with_runs(|r| holding(&r.open, at, len)).is_some(), "locked only by an open run");
+        assert_ne!(crate::pinned::title_memory_change(at, PAGE, || protect(mem::PAGE_READWRITE)), 0);
         // Not opened again while a tracker would guard it: nothing holds it.
         make_way(at, len);
         assert_ne!(free(), 0, "and freed");

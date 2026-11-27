@@ -190,6 +190,8 @@ unsafe impl Send for Shared {}
 static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
 
 fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
+    // Its holder waits for the opening thread (`inplace::wait_private`).
+    crate::inplace::order::tables();
     SHARED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -837,7 +839,11 @@ impl Shared {
 /// the tables drop them at their next rewrite instead). False if they
 /// still name one.
 pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
-    let named = || shared().iter().any(|(_, s)| s.layout.runs.iter().any(|r| dead.contains(&r.id)));
+    // The tables, and the layouts their lists last ran with ([`RAN`]): a
+    // table rewritten since no longer names a run its lists ran with, and
+    // that layout would keep the run's heap.
+    let names = |l: &Layout| l.runs.iter().any(|r| dead.contains(&r.id));
+    let named = || shared().iter().any(|(_, s)| names(&s.layout)) || with_ran(|m| m.values().any(|l| names(l)));
     let Some(host) = crate::host::host() else {
         return true;
     };
@@ -853,6 +859,10 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
         if dropped.is_some() {
             return true;
         }
+        // Layouts of tables that are gone (their heap released): no list
+        // of theirs is left to read its marks against them.
+        let live: Vec<usize> = shared().iter().map(|(k, _)| *k).collect();
+        with_ran(|m| m.retain(|key, l| live.contains(key) || !names(l)));
         if started.elapsed() > std::time::Duration::from_secs(2) {
             return false;
         }
@@ -1499,6 +1509,21 @@ mod split_tests {
         assert_eq!(split_pages(&[(5 * K64 + 16, 64), (5 * K64 + 256, 64)]), 1);
         assert_eq!(split_pages(&[]), 0);
     }
+}
+
+/// Tests: the lists of a view heap `key` (no table's) last ran with a
+/// layout naming `run`, as after a submission whose table was rewritten
+/// since.
+#[cfg(test)]
+pub(crate) fn ran_with(key: usize, run: Arc<crate::inplace::Run>) {
+    let layout = Arc::new(Layout { backstopped: vec![1], runs: vec![run], ..Layout::default() });
+    with_ran(|m| m.insert(key, layout));
+}
+
+/// Tests: whether a layout lists last ran with still names run `id`.
+#[cfg(test)]
+pub(crate) fn ran_names(id: u64) -> bool {
+    with_ran(|m| m.values().any(|l| l.runs.iter().any(|r| r.id == id)))
 }
 
 /// Held by the tests that miss title memory or need writes to go back:

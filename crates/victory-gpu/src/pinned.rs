@@ -161,6 +161,21 @@ pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i3
     worked
 }
 
+/// The runtime changes title memory at `[at, at + len)` with `change` (as
+/// [`title_memory_change`]), which mostly works on memory held in place too
+/// (committing again what is committed): the holders let go only if the
+/// host refuses it as locked (`ERROR_INVALID_PARAMETER`), and it is then
+/// tried again. For `XMemVirtualAlloc` at an address the title names: a
+/// commit with another protection over an open heap is refused.
+pub fn title_memory_retry(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
+    let worked = change();
+    // SAFETY: a plain read of this thread's last error.
+    if worked != 0 || !title_memory_held() || unsafe { GetLastError() } != ERROR_INVALID_PARAMETER {
+        return worked;
+    }
+    title_memory_change(at, len, change)
+}
+
 /// Lets every holder of part of `[at, at + len)` go, after waiting for
 /// other threads' releases there to return; how many holders there were,
 /// those waited for among them.
@@ -315,6 +330,37 @@ mod tests {
         assert_eq!(title_memory_change(base, 0x1000, denied), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 2);
+    }
+
+    /// A change that works on memory held in place leaves the holder; one
+    /// the host refuses as locked lets it go and is tried again; any other
+    /// refusal is the answer.
+    #[test]
+    fn a_change_refused_as_locked_lets_go_and_is_tried_again() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, SetLastError};
+        let base = 0x7400_0000_0000;
+        let n = Arc::new(AtomicUsize::new(0));
+        let _p = pin(base, 0x1_0000, counting(&n));
+        // Committing again what is committed: nothing let go.
+        assert_eq!(title_memory_retry(base, 0x1000, || 1), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 0);
+        // Refused for another reason: the answer, and nothing let go.
+        let denied = || {
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_ACCESS_DENIED) };
+            0
+        };
+        assert_eq!(title_memory_retry(base, 0x1000, denied), 0);
+        assert_eq!(n.load(Ordering::Relaxed), 0);
+        // Refused as locked while the holder has it: let go, then done.
+        let held = n.clone();
+        let locked = move || {
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            i32::from(held.load(Ordering::Relaxed) == 1)
+        };
+        assert_eq!(title_memory_retry(base, 0x1000, locked), 1);
+        assert_eq!(n.load(Ordering::Relaxed), 1, "let go once");
     }
 
     /// A second thread changing the range while the first is still
