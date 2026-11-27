@@ -15,10 +15,12 @@
 //!
 //! Nothing is allocated after [`Gate::new`].
 
-/// A word a submission in flight writes at the bottom of the pipe.
+/// A word (`bytes`: 4 or 8) a submission in flight writes at the bottom
+/// of the pipe.
 #[derive(Debug, Clone, Copy)]
 struct Label {
     address: u64,
+    bytes: u8,
     /// None: only the GPU knows it (a query result, a timestamp).
     value: Option<u64>,
     ticket: u64,
@@ -35,6 +37,18 @@ pub(crate) enum Seen {
     After(u64),
     /// Not known until what is in flight is retired, or not met.
     Unknown,
+}
+
+/// Why [`Gate::label`] kept no label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// No room: the caller retires what is in flight first.
+    Full,
+    /// The ticket is not in flight. Retired, its write is in title memory
+    /// and the word itself answers waits; a label kept for it would
+    /// answer `After` a submission nothing waits behind any more. Not
+    /// submitted yet, it names no submission to run after.
+    Ticket,
 }
 
 /// Tickets and the labels of those in flight.
@@ -70,15 +84,24 @@ impl Gate {
         ticket <= self.retired
     }
 
-    /// The submission `ticket` writes `value` at `address` at the bottom
-    /// of the pipe (None: a value only the GPU knows). False when no more
-    /// labels can be kept: the caller retires what is in flight first.
-    pub(crate) fn label(&mut self, address: u64, value: Option<u64>, ticket: u64) -> bool {
-        if self.labels.len() == self.most {
-            return false;
+    /// The submission `ticket`, in flight, writes the `bytes` bytes of
+    /// `value` at `address` at the bottom of the pipe (None: a value only
+    /// the GPU knows).
+    pub(crate) fn label(
+        &mut self,
+        address: u64,
+        bytes: u8,
+        value: Option<u64>,
+        ticket: u64,
+    ) -> Result<(), Refused> {
+        if ticket <= self.retired || ticket > self.submitted {
+            return Err(Refused::Ticket);
         }
-        self.labels.push(Label { address, value, ticket });
-        true
+        if self.labels.len() == self.most {
+            return Err(Refused::Full);
+        }
+        self.labels.push(Label { address, bytes, value, ticket });
+        Ok(())
     }
 
     /// The copy-back of every submission up to `ticket` is in title
@@ -89,21 +112,27 @@ impl Gate {
         self.labels.retain(|l| l.ticket > retired);
     }
 
-    /// A wait on the word at `address`, which holds `current` now and is
-    /// met by the values `holds` accepts.
-    pub(crate) fn wait(&self, address: u64, current: u64, holds: impl Fn(u64) -> bool) -> Seen {
-        // The last write in flight decides: the word's value now is about
-        // to be replaced.
+    /// A wait on the word of `bytes` bytes at `address`, which holds
+    /// `current` now and is met by the values `holds` accepts.
+    pub(crate) fn wait(&self, address: u64, bytes: u8, current: u64, holds: impl Fn(u64) -> bool) -> Seen {
+        // The last write in flight that touches any byte of the word
+        // decides: the word's value now is about to be replaced.
+        let end = address.saturating_add(u64::from(bytes));
         let last = self
             .labels
             .iter()
-            .filter(|l| l.address == address)
+            .filter(|l| l.address < end && address < l.address.saturating_add(u64::from(l.bytes)))
             .fold(None, |last: Option<&Label>, l| match last {
                 Some(found) if found.ticket > l.ticket => Some(found),
                 _ => Some(l),
             });
         match last {
-            Some(Label { value: Some(value), ticket, .. }) if holds(*value) => Seen::After(*ticket),
+            // The same word: its value is the write's.
+            Some(l) if l.address == address && l.bytes == bytes => match l.value {
+                Some(value) if holds(value) => Seen::After(l.ticket),
+                _ => Seen::Unknown,
+            },
+            // Part of the word, or more than it: not worked out here.
             Some(_) => Seen::Unknown,
             None if holds(current) => Seen::Now,
             None => Seen::Unknown,
@@ -138,36 +167,79 @@ mod tests {
         let mut gate = Gate::new(8);
         let is = |want: u64| move |value: u64| value == want;
         // Nothing in flight: the word itself.
-        assert_eq!(gate.wait(0x1000, 7, is(7)), Seen::Now);
-        assert_eq!(gate.wait(0x1000, 6, is(7)), Seen::Unknown);
+        assert_eq!(gate.wait(0x1000, 4, 7, is(7)), Seen::Now);
+        assert_eq!(gate.wait(0x1000, 4, 6, is(7)), Seen::Unknown);
         let (a, b) = (gate.submit(), gate.submit());
-        assert!(gate.label(0x1000, Some(7), a));
-        assert!(gate.label(0x2000, Some(1), a));
+        assert_eq!(gate.label(0x1000, 4, Some(7), a), Ok(()));
+        assert_eq!(gate.label(0x2000, 4, Some(1), a), Ok(()));
         // The word still holds the old value; the writer is in flight.
-        assert_eq!(gate.wait(0x1000, 6, is(7)), Seen::After(a));
+        assert_eq!(gate.wait(0x1000, 4, 6, is(7)), Seen::After(a));
         // A later write replaces it: the value now does not count.
-        assert!(gate.label(0x1000, Some(8), b));
-        assert_eq!(gate.wait(0x1000, 7, is(7)), Seen::Unknown);
-        assert_eq!(gate.wait(0x1000, 7, is(8)), Seen::After(b));
-        assert_eq!(gate.wait(0x2000, 0, is(1)), Seen::After(a));
+        assert_eq!(gate.label(0x1000, 4, Some(8), b), Ok(()));
+        assert_eq!(gate.wait(0x1000, 4, 7, is(7)), Seen::Unknown);
+        assert_eq!(gate.wait(0x1000, 4, 7, is(8)), Seen::After(b));
+        assert_eq!(gate.wait(0x2000, 4, 0, is(1)), Seen::After(a));
         // Retired: in title memory, so the word decides again.
         gate.retire(a);
-        assert_eq!(gate.wait(0x2000, 1, is(1)), Seen::Now);
-        assert_eq!(gate.wait(0x1000, 7, is(8)), Seen::After(b));
+        assert_eq!(gate.wait(0x2000, 4, 1, is(1)), Seen::Now);
+        assert_eq!(gate.wait(0x1000, 4, 7, is(8)), Seen::After(b));
         gate.retire(b);
-        assert_eq!(gate.wait(0x1000, 8, is(8)), Seen::Now);
+        assert_eq!(gate.wait(0x1000, 4, 8, is(8)), Seen::Now);
+    }
+
+    /// A write in flight that shares bytes with the word waited on makes
+    /// its value unknown, whatever the word holds now; one next to it
+    /// does not.
+    #[test]
+    fn a_label_over_part_of_the_word_leaves_it_unknown() {
+        let mut gate = Gate::new(8);
+        let a = gate.submit();
+        // A 64-bit label over 0x1000..0x1008.
+        assert_eq!(gate.label(0x1000, 8, Some(7), a), Ok(()));
+        assert_eq!(gate.wait(0x1000, 8, 0, |v| v == 7), Seen::After(a));
+        // Its low and high halves, and a word across its end.
+        assert_eq!(gate.wait(0x1000, 4, 7, |v| v == 7), Seen::Unknown);
+        assert_eq!(gate.wait(0x1004, 4, 0, |v| v == 0), Seen::Unknown);
+        assert_eq!(gate.wait(0x1006, 4, 0, |v| v == 0), Seen::Unknown);
+        assert_eq!(gate.wait(0xffc, 8, 0, |v| v == 0), Seen::Unknown);
+        // The words on either side are their own.
+        assert_eq!(gate.wait(0x1008, 4, 3, |v| v == 3), Seen::Now);
+        assert_eq!(gate.wait(0xffc, 4, 3, |v| v == 3), Seen::Now);
+        // A newer write of a half hides the whole word's value.
+        let b = gate.submit();
+        assert_eq!(gate.label(0x1004, 4, Some(1), b), Ok(()));
+        assert_eq!(gate.wait(0x1000, 8, 0, |v| v == 7), Seen::Unknown);
+        assert_eq!(gate.wait(0x1004, 4, 0, |v| v == 1), Seen::After(b));
+    }
+
+    /// Only a submission in flight has labels: one retired has written
+    /// its own, and one not submitted is nothing to run after.
+    #[test]
+    fn a_label_needs_a_ticket_in_flight() {
+        let mut gate = Gate::new(8);
+        assert_eq!(gate.label(0x1000, 4, Some(1), 1), Err(Refused::Ticket), "not submitted");
+        let (a, b) = (gate.submit(), gate.submit());
+        assert_eq!(gate.label(0x1000, 4, Some(1), 0), Err(Refused::Ticket), "no such ticket");
+        assert_eq!(gate.label(0x1000, 4, Some(1), b + 1), Err(Refused::Ticket), "not submitted");
+        gate.retire(a);
+        assert_eq!(gate.label(0x1000, 4, Some(1), a), Err(Refused::Ticket), "retired");
+        // Nothing was kept: the word itself answers.
+        assert_eq!(gate.wait(0x1000, 4, 1, |v| v == 1), Seen::Now);
+        assert_eq!(gate.label(0x1000, 4, Some(2), b), Ok(()));
+        assert_eq!(gate.wait(0x1000, 4, 1, |v| v == 2), Seen::After(b));
     }
 
     #[test]
     fn a_value_only_the_gpu_knows_is_not_guessed() {
         let mut gate = Gate::new(2);
         let a = gate.submit();
-        assert!(gate.label(0x3000, None, a));
-        assert_eq!(gate.wait(0x3000, 5, |v| v == 5), Seen::Unknown);
-        assert!(gate.label(0x3008, Some(1), a));
-        assert!(!gate.label(0x3010, Some(1), a), "no room: retire first");
+        assert_eq!(gate.label(0x3000, 8, None, a), Ok(()));
+        assert_eq!(gate.wait(0x3000, 8, 5, |v| v == 5), Seen::Unknown);
+        assert_eq!(gate.label(0x3008, 8, Some(1), a), Ok(()));
+        assert_eq!(gate.label(0x3010, 8, Some(1), a), Err(Refused::Full), "no room: retire first");
         gate.retire(a);
-        assert_eq!(gate.wait(0x3000, 5, |v| v == 5), Seen::Now);
-        assert!(gate.label(0x3010, Some(1), gate.submitted + 1), "room again");
+        assert_eq!(gate.wait(0x3000, 8, 5, |v| v == 5), Seen::Now);
+        let b = gate.submit();
+        assert_eq!(gate.label(0x3010, 8, Some(1), b), Ok(()), "room again");
     }
 }
