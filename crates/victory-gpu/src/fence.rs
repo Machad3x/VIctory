@@ -3,10 +3,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -38,6 +38,8 @@ struct Fence {
     /// Events to set once the value reaches theirs (handles as integers),
     /// and since when.
     waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
+    /// Woken under `waiters` whenever the value moves (blocking waits).
+    moved: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -58,6 +60,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        moved: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -96,8 +99,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     let completed = fence.value.load(Ordering::Acquire);
     #[cfg(all(windows, feature = "diagnostics"))]
-    if value > completed && !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
+    if value > completed {
         crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::copystat::add(crate::copystat::C::FenceEventsUnmet, 1);
     }
     if completed >= value {
         if !event.is_null() {
@@ -106,10 +110,43 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+        // A null event blocks until the value is reached.
+        #[cfg(windows)]
+        debug_assert!(
+            !crate::queue::pumping_here() && !crate::host::submitting_here(),
+            "a blocking fence wait inside held work or a host submission never ends"
+        );
+        let since = std::time::Instant::now();
+        let mut warn_at = WARN_EVERY;
+        while fence.value.load(Ordering::Acquire) < value {
+            waiters = fence
+                .moved
+                .wait_timeout(waiters, std::time::Duration::from_millis(2))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            if fence.value.load(Ordering::Acquire) >= value {
+                break;
+            }
+            // Held work may be what signals it: pumped without our lock.
+            drop(waiters);
+            crate::queue::pump_held_if_free(crate::queue::Why::Fence);
+            if since.elapsed() >= warn_at {
+                warn_at += WARN_EVERY;
+                tracing::warn!(value, secs = since.elapsed().as_secs(), "a blocking fence wait is still waiting");
+            }
+            // Nothing signals it on a removed device: the run ends with the cause.
+            #[cfg(windows)]
+            if let Some(host) = crate::host::host()
+                // SAFETY: a plain query.
+                && unsafe { host.device.GetDeviceRemovedReason() }.is_err()
+            {
+                crate::host::fail(format_args!("host GPU device removed while the title waited for fence value {value}"));
+            }
+            waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        WAITED.0.fetch_add(1, Ordering::Relaxed);
+        WAITED.1.fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+        return S_OK;
     }
     waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
@@ -128,6 +165,7 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    fence.moved.notify_all();
     waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
         if reached {
@@ -139,6 +177,9 @@ pub(crate) fn set(this: This, value: u64) -> HRESULT {
     });
     S_OK
 }
+
+/// How often a blocking fence wait still waiting says so.
+const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Events the title waited on for a fence value, and their summed waits in
 /// microseconds (the held-work frame line: work held back shows here as the
@@ -216,7 +257,6 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
         // the title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
@@ -232,6 +272,29 @@ mod tests {
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// A null event blocks until another thread's Signal reaches the value.
+    #[test]
+    fn null_event_waits_block_until_reached() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        let signal = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        assert_eq!(wait(f, 1, std::ptr::null_mut()), S_OK, "already reached");
+        let at = f as usize;
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert_eq!(signal(at as This, 3), S_OK, "below the value: still blocked");
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            assert_eq!(signal(at as This, 9), S_OK);
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(wait(f, 9, std::ptr::null_mut()), S_OK);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+        assert_eq!(value(f), 9);
+        signaller.join().unwrap();
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 

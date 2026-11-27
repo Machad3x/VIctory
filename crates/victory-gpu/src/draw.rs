@@ -2765,6 +2765,53 @@ void main() {
         crate::shadow::unregister(buf as usize, p as u64);
     }
 
+    /// The title writes a page after its ExecuteCommandLists returned and
+    /// before the retire thread settled a marked shader write to the same
+    /// page: the copy-back keeps the title's bytes and brings the shader's.
+    #[test]
+    fn a_title_write_after_an_async_submit_survives_the_copy_back() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: committed write-watched page of 64 KiB.
+        unsafe {
+            ((p + 0x100) as *mut u32).write_volatile(0x1122_3344);
+            ((p + 0x2000) as *mut u32).write_volatile(0x5566_7788);
+        }
+        let buf = buffer_at_address(p as u64, crate::watch::PAGE as u64);
+        let (_, title_heap, heap_host) = view_heap(8);
+        let _ = host.log_messages();
+
+        let uav_desc: [u32; 10] = [39, 1, 1024, 0, 64, 0, 0, 0, 1, 0];
+        let slot0 = title_heap.start;
+        crate::descriptor::create_uav(std::ptr::null(), buf, std::ptr::null(), &uav_desc, slot0);
+        let view = crate::descriptor::view(slot0).expect("subpage uav view");
+        let _ = heap_host.mirror(0, slot0, true);
+
+        let shader = compile_cs(MARKED_WRITE_SOURCE);
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &view, true);
+        dispatch_marked_uav(&list, heap_host, &shader, 0, 0, 0, 0xDEAD_BEEF);
+        list.close();
+        host.execute_later(vec![std::sync::Arc::new(list)], Box::new(|| {}));
+        // SAFETY: a byte inside our page, the shader's untouched.
+        unsafe { ((p + 0x2000) as *mut u32).write_volatile(0xCAFE_BABE) };
+        // The next submission waits for the retire.
+        let next = host.new_list().unwrap();
+        next.close();
+        host.execute(&[&next]);
+
+        assert_eq!(host.log_messages(), None);
+        // SAFETY: bytes inside our page.
+        unsafe {
+            assert_eq!(((p + 4096) as *const u32).read_volatile(), 0xDEAD_BEEF);
+            assert_eq!(((p + 0x2000) as *const u32).read_volatile(), 0xCAFE_BABE, "the title's write wins");
+            assert_eq!(((p + 0x100) as *const u32).read_volatile(), 0x1122_3344);
+        }
+        crate::shadow::unregister(buf as usize, p as u64);
+    }
+
     /// A title copy to a disjoint offset on the same 64 KiB page while a
     /// sub-64 KiB marked UAV is pending arms `Tracked::saved`, and
     /// `copy_back_marks` 3-way merges GPU, CPU, and pre-existing bytes.

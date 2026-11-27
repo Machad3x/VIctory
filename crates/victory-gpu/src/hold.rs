@@ -110,6 +110,9 @@ impl<S> Held<S> {
 pub(crate) struct World<'a, S> {
     /// A memory value (address, bytes).
     pub(crate) read: &'a dyn Fn(u64, u8) -> Option<u64>,
+    /// Whether a sent, unsettled submission will write the word in a way
+    /// not known ahead ([`Pending::predict`]): a wait on it does not hold.
+    pub(crate) unsettled: &'a dyn Fn(u64, u8) -> bool,
     /// A fence's value.
     pub(crate) fence: &'a dyn Fn(usize) -> u64,
     /// Runs a piece (a queue, its segments in order) to completion, the
@@ -151,8 +154,17 @@ impl<S> Held<S> {
                             if !waits.is_empty() && !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
                             }
+                            // Pipelining study: what wrote the words, once per segment.
+                            #[cfg(all(windows, feature = "diagnostics"))]
+                            if *fresh {
+                                waits.iter().for_each(|w| crate::copystat::wait_source(w.address));
+                            }
                             let mut ok = true;
                             for wait in waits.iter() {
+                                if (w.unsettled)(wait.address, wait.bytes) {
+                                    ok = false;
+                                    continue;
+                                }
                                 match wait.holds(w.read) {
                                     Some(true) => {}
                                     Some(false) => ok = false,
@@ -179,6 +191,10 @@ impl<S> Held<S> {
                             #[cfg(all(windows, feature = "diagnostics"))]
                             if !crate::copystat::FLIGHT_FENCE.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::copystat::FLIGHT_FENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            #[cfg(all(windows, feature = "diagnostics"))]
+                            if *fresh {
+                                crate::copystat::add(crate::copystat::C::QueueFenceWaits, 1);
                             }
                             let ok = (w.fence)(*fence) >= *value;
                             if !ok {
@@ -257,6 +273,52 @@ impl<S> Held<S> {
     }
 }
 
+/// Bottom-of-pipe writes of submissions sent to the host GPU and not yet
+/// settled, oldest first: (ticket, address, value or `None` when not known
+/// before the GPU runs, bytes written). All host work goes to one host
+/// queue, so a wait behind them on the GPU sees what they will write.
+#[derive(Default)]
+pub(crate) struct Pending(Vec<(u64, u64, Option<u64>, u8)>);
+
+impl Pending {
+    pub(crate) const fn new() -> Self {
+        Pending(Vec::new())
+    }
+
+    pub(crate) fn sent(&mut self, ticket: u64, address: u64, value: Option<u64>, bytes: u8) {
+        self.0.push((ticket, address, value, bytes));
+    }
+
+    /// A ticket settled: its writes are in memory now.
+    pub(crate) fn retired(&mut self, ticket: u64) {
+        self.0.retain(|w| w.0 != ticket);
+    }
+
+    /// What a read of `bytes` at `address` will give once pending writes
+    /// land: `None` when none touches it, `Err(ticket)` when the newest that
+    /// does is not known ahead or covers it only in part (known once that
+    /// ticket settles).
+    pub(crate) fn predict(&self, address: u64, bytes: u8) -> Option<Result<u64, u64>> {
+        let &(ticket, at, value, n) =
+            self.0.iter().rev().find(|w| w.1 < address + u64::from(bytes) && address < w.1 + u64::from(w.3))?;
+        let low = |v: u64| if bytes >= 8 { v } else { v & ((1 << (8 * u32::from(bytes))) - 1) };
+        Some(value.filter(|_| at == address && bytes <= n).map(low).ok_or(ticket))
+    }
+
+    /// A wait's read: the predicted value, else `memory`'s.
+    pub(crate) fn read(&self, address: u64, bytes: u8, memory: &dyn Fn(u64, u8) -> Option<u64>) -> Option<u64> {
+        match self.predict(address, bytes) {
+            Some(Ok(v)) => Some(v),
+            _ => memory(address, bytes),
+        }
+    }
+
+    /// Whether the newest pending write to the word is not known ahead.
+    pub(crate) fn unsettled(&self, address: u64, bytes: u8) -> bool {
+        matches!(self.predict(address, bytes), Some(Err(_)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +356,7 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, unsettled: &|_, _| false })
     }
 
     #[test]
@@ -488,5 +550,61 @@ mod tests {
         assert_eq!(forced, [(2, vec![ge(0x100, 1)])]);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: stuck"]);
+    }
+
+    #[test]
+    fn pending_writes_predict_known_values_only() {
+        let mut p = Pending::new();
+        assert_eq!(p.predict(0x100, 8), None, "nothing pending: memory");
+        p.sent(1, 0x100, Some(0x1_0000_0007), 8);
+        assert_eq!(p.predict(0x100, 8), Some(Ok(0x1_0000_0007)));
+        assert_eq!(p.predict(0x100, 4), Some(Ok(7)), "the low half");
+        assert_eq!(p.predict(0x104, 4), Some(Err(1)), "part of it");
+        p.sent(2, 0x100, None, 8);
+        assert_eq!(p.predict(0x100, 8), Some(Err(2)), "the newest is a query result");
+        p.retired(2);
+        assert_eq!(p.predict(0x100, 8), Some(Ok(0x1_0000_0007)));
+        p.sent(3, 0x200, Some(5), 4);
+        assert_eq!(p.predict(0x200, 8), Some(Err(3)), "wider than the write");
+        assert_eq!(p.predict(0x204, 4), None, "past it");
+        p.retired(1);
+        p.retired(3);
+        assert_eq!(p.predict(0x100, 8), None);
+    }
+
+    /// Two waits on one segment: one on a value a sent list will write, one
+    /// on memory. It runs once both hold; a write not known ahead keeps it
+    /// held whatever memory says, until its ticket settles.
+    #[test]
+    fn a_wait_on_a_pending_write_runs_without_its_settle() {
+        let memory: RefCell<HashMap<u64, u64>> = RefCell::new(HashMap::new());
+        let pending = RefCell::new(Pending::new());
+        let ran: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+        let mut held = Held::default();
+        held.push(2, Item::Segment("depth", vec![ge(0x100, 7), ge(0x200, 1)]));
+        let go = |held: &mut Held<&'static str>| {
+            let read = |a: u64, b: u8| pending.borrow().read(a, b, &|a: u64, _: u8| Some(*memory.borrow().get(&a).unwrap_or(&0)));
+            let unsettled = |a: u64, b: u8| pending.borrow().unsettled(a, b);
+            let fence = |_: usize| 0u64;
+            let mut run = |_: usize, s: Vec<&'static str>| ran.borrow_mut().extend(s);
+            let mut signal = |_: usize, _: u64| {};
+            held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, unsettled: &unsettled })
+        };
+        pending.borrow_mut().sent(1, 0x100, Some(7), 8);
+        go(&mut held);
+        assert!(ran.borrow().is_empty(), "the memory wait does not hold");
+        memory.borrow_mut().insert(0x200, 1);
+        go(&mut held);
+        assert_eq!(*ran.borrow(), ["depth"], "the predicted one holds with memory at 0");
+        // Tickets retire in order: the first one's write is in memory first.
+        pending.borrow_mut().retired(1);
+        held.push(2, Item::Segment("again", vec![ge(0x100, 9)]));
+        pending.borrow_mut().sent(2, 0x100, None, 8);
+        memory.borrow_mut().insert(0x100, 9);
+        go(&mut held);
+        assert_eq!(*ran.borrow(), ["depth"], "a query result not settled: held");
+        pending.borrow_mut().retired(2);
+        go(&mut held);
+        assert_eq!(*ran.borrow(), ["depth", "again"]);
     }
 }

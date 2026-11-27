@@ -201,20 +201,22 @@ pub(crate) fn uploads(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = UPLOAD_LIST.lock().unwrap_or_else(|e| e.into_inner());
     crate::texture::recycle();
-    match &guard.0 {
+    let made = match guard.0.take() {
         // Closed by the last submission, which has run.
-        Some(list) => list.reset(),
+        Some(list) => {
+            list.reset();
+            list
+        }
         // Made open.
         None => {
             let list = crate::host::host()?.new_list().ok()?;
             list.set_ours();
-            guard.0 = Some(list);
+            list
         }
-    }
-    let list = guard.0.as_ref()?;
+    };
+    let list = &made;
     // What to bring up: the textures lists read through tables, and those
     // the heaps view that shaders read lately. Collected under the heaps'
     // locks and brought up without them, several at a time: reading title
@@ -285,8 +287,15 @@ pub(crate) fn uploads(
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    if !recorded {
+        guard.0 = Some(made);
+        return None;
+    }
+    Some(Uploads(Some(made)))
 }
+
+/// The upload list while no submission has it.
+static UPLOAD_LIST: Mutex<Holder> = Mutex::new(Holder(None));
 
 /// The upload list, used under its lock only.
 pub(crate) struct Holder(Option<HostList>);
@@ -295,11 +304,22 @@ pub(crate) struct Holder(Option<HostList>);
 unsafe impl Send for Holder {}
 
 /// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+pub(crate) struct Uploads(Option<HostList>);
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+        self.0.as_ref().expect("held until dropped")
+    }
+}
+
+impl Drop for Uploads {
+    /// Its submission has run: the list is kept for the next (one is kept;
+    /// another made meanwhile goes).
+    fn drop(&mut self) {
+        let mut guard = UPLOAD_LIST.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.0.is_none() {
+            guard.0 = self.0.take();
+        }
     }
 }
 

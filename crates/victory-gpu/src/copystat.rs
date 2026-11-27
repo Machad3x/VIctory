@@ -235,8 +235,53 @@ pub(crate) enum C {
     RefreshSerialBytes,
     RefreshSerialUs,
     RefreshPoolBytes,
+    /// Pipelining study (title submissions only): title bytes a submission
+    /// takes that the one before declared written, by step: a refresh of a
+    /// clean copy (nothing copied), of a changed copy the one before wrote
+    /// (same copy) or did not (alias), a texture staging, a title copy or
+    /// fill, a range its shaders write; submissions with a real conflict
+    /// (any but clean, or a heap page below).
+    RangeClean,
+    RangeSame,
+    RangeAlias,
+    RangeStaging,
+    RangeCopy,
+    RangeGpuWrite,
+    DrainReal,
+    /// Heap pages synced that the submission before declared written.
+    HeapInFlight,
+    /// Queue memory value waits at their first test, by what last wrote the
+    /// word: a bottom-of-pipe value (predictable), a query result, a
+    /// timestamp, none of ours (the CPU, or unknown); queue fence Waits;
+    /// title event waits for a fence value not reached.
+    WaitsValue,
+    WaitsHostValue,
+    WaitsTimestamp,
+    WaitsCpu,
+    QueueFenceWaits,
+    FenceEventsUnmet,
+    /// Null views made after a submission for shaders that read them: slots,
+    /// and submissions making any.
+    MadeReadSlots,
+    MadeReadSubs,
+    /// Title submissions using a host copy the one before wrote.
+    SharedCopySubs,
+    /// Preparing a title submission while the one before would still be on
+    /// the GPU (the hazards that keep `VICTORY_PIPELINE` from overlapping
+    /// them): submissions meeting any; changed copies refreshed that the
+    /// one before used; heap pages synced (slots it may read); submissions
+    /// with marked writes after one with marked writes (one marks bitmap);
+    /// snapshot ranges and marked ranges of copies the one before wrote.
+    PrepHazardSubs,
+    PrepDirtyInUse,
+    PrepHeapPages,
+    PrepMarkedAfterMarked,
+    PrepSnapshotWritten,
+    PrepMarkedWritten,
+    /// Nanoseconds the title's threads spent in ExecuteCommandLists.
+    TitleExecNs,
 }
-const COUNTERS: usize = C::RefreshPoolBytes as usize + 1;
+const COUNTERS: usize = C::TitleExecNs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 /// Whether the refresh's own statistics are kept (who wrote the pages
@@ -351,8 +396,42 @@ static FLIGHT_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// Frames presented at the last title submission.
 static FLIGHT_PRESENTED: AtomicU64 = AtomicU64::new(0);
 /// The last title submission's written title ranges (start, end), sorted
-/// and merged; only taken under the host's submission lock.
-static FLIGHT_WRITES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+/// and merged, and the host copies it wrote (sorted); only set under the
+/// host's submission lock.
+static FLIGHT_WRITES: Mutex<Last> = Mutex::new(Last { writes: Vec::new(), copies: Vec::new(), used: Vec::new(), marked: false });
+
+/// What the last title submission wrote and used: title ranges (merged),
+/// host copies written and used (sorted), and whether it marked pages.
+#[derive(Clone, Default)]
+pub(crate) struct Last {
+    pub(crate) writes: Vec<(usize, usize)>,
+    pub(crate) copies: Vec<usize>,
+    pub(crate) used: Vec<usize>,
+    pub(crate) marked: bool,
+}
+
+/// A title submission's own findings, for [`flight_end`]: a conflict that
+/// needs the one before settled; it used a copy the one before wrote; the
+/// copies it used; it marked pages; it met an overlap hazard.
+pub(crate) struct Mine {
+    pub(crate) real: bool,
+    pub(crate) shared: bool,
+    pub(crate) used: Vec<usize>,
+    pub(crate) marked: bool,
+    pub(crate) hazard: bool,
+}
+/// Whether a title submission is being prepared: set at its start, unset
+/// once its lists are made ([`flight_prepared`]), so heap syncs elsewhere
+/// (tests, our own submissions) are not counted.
+static FLIGHT_TITLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A heap page synced for this submission was written by the one before.
+static FLIGHT_HEAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A heap page was synced for this title submission at all.
+static FLIGHT_HEAP_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What last wrote each bottom-of-pipe word (0 a value, 1 a query result,
+/// 2 a timestamp) and the frame it did; words not written for two frames
+/// are dropped at each line.
+static LABELS: Mutex<Option<HashMap<u64, (u8, u64)>>> = Mutex::new(None);
 
 /// Why a title submission would drain the one before (fence, sync
 /// executes, present); `None` for our own executes.
@@ -360,7 +439,9 @@ pub(crate) struct Flight(bool, bool, bool);
 
 /// At a submission's start: `None` (and noted) for our own.
 pub(crate) fn flight_begin() -> Option<Flight> {
-    if !TITLE.replace(false) {
+    let title = TITLE.replace(false);
+    FLIGHT_TITLE.store(title, Relaxed);
+    if !title {
         FLIGHT_SYNC.store(true, Relaxed);
         return None;
     }
@@ -381,17 +462,76 @@ pub(crate) fn flight_sent(f: &mut Option<Flight>) {
     }
 }
 
-/// The ranges the last title submission wrote (empty for our own).
-pub(crate) fn flight_writes(flight: &Option<Flight>) -> Vec<(usize, usize)> {
+/// What the last title submission wrote and used (empty for our own).
+pub(crate) fn flight_writes(flight: &Option<Flight>) -> Last {
     if flight.is_none() {
-        return Vec::new();
+        return Default::default();
     }
-    std::mem::take(&mut *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()))
+    FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-/// At a title submission's end: its counts, and its written ranges for the
-/// next.
-pub(crate) fn flight_end(f: Flight, range: bool, times: [u64; 4], mut writes: Vec<(usize, usize)>) {
+/// A submission's lists are made: heap syncs after are not its own.
+pub(crate) fn flight_prepared() {
+    FLIGHT_TITLE.store(false, Relaxed);
+}
+
+/// A heap page a title submission's sync takes: counted, and also if the
+/// submission before declared it written.
+pub(crate) fn heap_page(at: usize, len: usize) {
+    if !FLIGHT_TITLE.load(Relaxed) {
+        return;
+    }
+    add(C::PrepHeapPages, 1);
+    FLIGHT_HEAP_ANY.store(true, Relaxed);
+    if touches(&FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()).writes, at, len) {
+        add(C::HeapInFlight, 1);
+        FLIGHT_HEAP.store(true, Relaxed);
+    }
+}
+
+/// A bottom-of-pipe write at `at`, for [`wait_source`].
+pub(crate) fn label_written(at: usize, what: &crate::queue::Written) {
+    let kind = match what {
+        crate::queue::Written::Value(_) => 0,
+        crate::queue::Written::HostValue(_) => 1,
+        crate::queue::Written::GpuTimestamp | crate::queue::Written::SystemTimestamp => 2,
+    };
+    let frame = crate::queue::presented();
+    LABELS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default().insert(at as u64, (kind, frame));
+}
+
+/// A queue's memory value wait at its first test, counted by what last
+/// wrote its word.
+pub(crate) fn wait_source(address: u64) {
+    let kind = LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.get(&address).map(|w| w.0));
+    add(
+        match kind {
+            Some(0) => C::WaitsValue,
+            Some(1) => C::WaitsHostValue,
+            Some(_) => C::WaitsTimestamp,
+            None => C::WaitsCpu,
+        },
+        1,
+    );
+}
+
+/// At a title submission's end: its counts, and what it wrote and used,
+/// for the next.
+pub(crate) fn flight_end(f: Flight, range: bool, times: [u64; 4], mut writes: Vec<(usize, usize)>, mut copies: Vec<usize>, mine: Mine) {
+    let Mine { real, shared, mut used, marked, hazard } = mine;
+    let after_marked = marked && FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()).marked;
+    if after_marked {
+        add(C::PrepMarkedAfterMarked, 1);
+    }
+    if hazard | after_marked | FLIGHT_HEAP_ANY.swap(false, Relaxed) {
+        add(C::PrepHazardSubs, 1);
+    }
+    if real | FLIGHT_HEAP.swap(false, Relaxed) {
+        add(C::DrainReal, 1);
+    }
+    if shared {
+        add(C::SharedCopySubs, 1);
+    }
     for (c, t) in [C::FlightPrepNs, C::FlightSyncHeapsNs, C::FlightGpuWaitNs, C::FlightSettleNs].into_iter().zip(times) {
         add(c, t);
     }
@@ -404,7 +544,11 @@ pub(crate) fn flight_end(f: Flight, range: bool, times: [u64; 4], mut writes: Ve
         add(C::DrainFree, 1);
     }
     merge(&mut writes);
-    *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()) = writes;
+    copies.sort_unstable();
+    copies.dedup();
+    used.sort_unstable();
+    used.dedup();
+    *FLIGHT_WRITES.lock().unwrap_or_else(|e| e.into_inner()) = Last { writes, copies, used, marked };
 }
 
 /// Sorts and merges ranges (start, end) into disjoint ones.
@@ -542,6 +686,10 @@ pub(crate) fn page_faults() -> u64 {
 /// Logs the counters per frame over `frames` frames, and the ranges that
 /// took most bytes.
 pub(crate) fn log(frames: f64) {
+    let now = crate::queue::presented();
+    if let Some(labels) = LABELS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        labels.retain(|_, w| w.1 + 2 >= now);
+    }
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
@@ -712,7 +860,7 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
-        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}",
+        "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}; pipelining: real drains {:.1}; taken while the one before wrote them: clean refreshes {:.1}, changed same copy {:.1}, changed alias {:.1}, stagings {:.1}, copies {:.1}, shader writes {:.1}, heap pages {:.1}; value waits by writer: value {:.1}, query {:.1}, timestamp {:.1}, cpu or unknown {:.1}; queue fence waits {:.1}; unmet fence events {:.1}; null views made {:.1} in {:.1} submissions; submissions using a copy the one before wrote {:.1}; title in ExecuteCommandLists {:.2} ms; overlap hazards: submissions {:.1}, changed copies in use {:.1}, heap pages {:.1}, marked after marked {:.1}, snapshots of written copies {:.1}, marks on written copies {:.1}",
         c[C::FlightPrepNs as usize] / 1e6,
         c[C::FlightSyncHeapsNs as usize] / 1e6,
         c[C::FlightGpuWaitNs as usize] / 1e6,
@@ -723,6 +871,30 @@ pub(crate) fn log(frames: f64) {
         c[C::DrainPresent as usize],
         c[C::DrainFree as usize],
         c[C::FlightFencePolls as usize],
+        c[C::DrainReal as usize],
+        c[C::RangeClean as usize],
+        c[C::RangeSame as usize],
+        c[C::RangeAlias as usize],
+        c[C::RangeStaging as usize],
+        c[C::RangeCopy as usize],
+        c[C::RangeGpuWrite as usize],
+        c[C::HeapInFlight as usize],
+        c[C::WaitsValue as usize],
+        c[C::WaitsHostValue as usize],
+        c[C::WaitsTimestamp as usize],
+        c[C::WaitsCpu as usize],
+        c[C::QueueFenceWaits as usize],
+        c[C::FenceEventsUnmet as usize],
+        c[C::MadeReadSlots as usize],
+        c[C::MadeReadSubs as usize],
+        c[C::SharedCopySubs as usize],
+        c[C::TitleExecNs as usize] / 1e6,
+        c[C::PrepHazardSubs as usize],
+        c[C::PrepDirtyInUse as usize],
+        c[C::PrepHeapPages as usize],
+        c[C::PrepMarkedAfterMarked as usize],
+        c[C::PrepSnapshotWritten as usize],
+        c[C::PrepMarkedWritten as usize],
     );
     let kinds = [
         C::GuardFaultsPool as usize,

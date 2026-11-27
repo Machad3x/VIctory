@@ -1,5 +1,6 @@
 //! Command queues. Submitted lists run on the host GPU and are waited for,
-//! so fence signals complete at once.
+//! so fence signals complete at once; with `VICTORY_PIPELINE=1` they are
+//! waited for on the retire thread, which signals them after the settle.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -118,6 +119,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() {
+        #[cfg(feature = "diagnostics")]
+        let _in = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::TitleExecNs);
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held();
@@ -224,7 +227,23 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    struct Pumping(bool);
+    impl Drop for Pumping {
+        fn drop(&mut self) {
+            PUMPING.set(self.0);
+        }
+    }
+    let _pumping = Pumping(PUMPING.replace(true));
+    let read = |address: u64, bytes: u8| {
+        if !predicting() {
+            return read_value(address, bytes);
+        }
+        pending().read(address, bytes, &read_value)
+    };
+    // Another thread may be between submit and retire: a write of its not
+    // known ahead keeps the wait held until it settles (the timer tests
+    // again).
+    let unsettled = |address: u64, bytes: u8| predicting() && pending().unsettled(address, bytes);
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
@@ -233,29 +252,40 @@ fn pump(held: &mut Holding, why: Why) {
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
     let mut run = |_: usize, segments: Vec<Segment>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
+        let finish = move |segments: Vec<Segment>| {
+            for (list, lease) in segments {
+                if let Some(lease) = lease {
+                    lease.finish();
+                }
+                crate::list::recycle(list);
+            }
+        };
         let at = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::TITLE.set(true);
-        host.execute(&lists);
-        ran += at.elapsed();
-        drop(lists);
-        for (list, lease) in segments {
-            if let Some(lease) = lease {
-                lease.finish();
-            }
-            crate::list::recycle(list);
+        if crate::host::pipelining() {
+            let lists = segments.iter().map(|(s, _)| s.clone()).collect();
+            host.execute_later(lists, Box::new(move || finish(segments)));
+        } else {
+            let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
+            host.execute(&lists);
+            drop(lists);
+            after_retired(move || finish(segments));
         }
+        ran += at.elapsed();
     };
     let mut signal = |f: usize, value: u64| {
-        crate::fence::set(f as This, value);
-        crate::fence::let_go(f as This);
+        after_retired(move || {
+            crate::fence::set(f as This, value);
+            crate::fence::let_go(f as This);
+        });
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
+        unsettled: &unsettled,
     });
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
@@ -275,10 +305,87 @@ fn pump(held: &mut Holding, why: Why) {
     static TIMER: std::sync::Once = std::sync::Once::new();
     TIMER.call_once(|| {
         let _ = std::thread::Builder::new().name("victory held work".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut woken = WAKE.0.lock().unwrap_or_else(|e| e.into_inner());
+            if !*woken {
+                woken = WAKE.1.wait_timeout(woken, std::time::Duration::from_millis(2)).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            *woken = false;
+            drop(woken);
             pump_held_if_free(Why::Timer);
         });
     });
+}
+
+/// Wakes the held-work timer early.
+#[cfg(windows)]
+static WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// A retire signalled fences and wrote labels: held work is tested again
+/// at once (by the timer's thread, which may submit; a retire may not).
+#[cfg(windows)]
+pub(crate) fn wake_held() {
+    *WAKE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    WAKE.1.notify_all();
+}
+
+/// Runs `then` once every host submission sent so far is retired: the
+/// lists' leases and recycling, and title fence Signals queued behind
+/// them, which tell the title the work is done ([`crate::host::after_retired`]).
+#[cfg(windows)]
+fn after_retired(then: impl FnOnce() + Send + 'static) {
+    crate::host::after_retired(Box::new(then));
+}
+
+#[cfg(windows)]
+thread_local! {
+    static PUMPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is running held work: a blocking fence wait here
+/// would never end.
+#[cfg(windows)]
+pub(crate) fn pumping_here() -> bool {
+    PUMPING.get()
+}
+
+/// Whether queue waits read what sent, unsettled submissions will write
+/// (`VICTORY_PREDICT_LABELS`, off by default).
+#[cfg(windows)]
+fn predicting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PREDICT_LABELS"))
+}
+
+#[cfg(windows)]
+fn pending() -> std::sync::MutexGuard<'static, crate::hold::Pending> {
+    static PENDING: std::sync::Mutex<crate::hold::Pending> = std::sync::Mutex::new(crate::hold::Pending::new());
+    PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A host submission sent (`ticket`, its fence value): its bottom-of-pipe
+/// writes (address, what, bytes) are pending until it is retired.
+#[cfg(windows)]
+pub(crate) fn labels_sent(ticket: u64, writes: impl Iterator<Item = (usize, Written, usize)>) {
+    if !predicting() {
+        return;
+    }
+    let mut pending = pending();
+    for (at, what, bytes) in writes {
+        let value = match what {
+            Written::Value(v) => Some(v),
+            _ => None,
+        };
+        // `Written::write` stores 4 bytes or 8.
+        pending.sent(ticket, at as u64, value, if bytes == 4 { 4 } else { 8 });
+    }
+}
+
+/// A host submission settled: its writes are in memory.
+#[cfg(windows)]
+pub(crate) fn labels_retired(ticket: u64) {
+    if predicting() {
+        pending().retired(ticket);
+    }
 }
 
 /// The value a wait tests (4 or 8 bytes), if the memory can be read.

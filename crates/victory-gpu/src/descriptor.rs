@@ -196,7 +196,10 @@ pub(crate) fn sync_heaps() {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::SyncSlots, last - first);
+                {
+                    crate::copystat::add(crate::copystat::C::SyncSlots, last - first);
+                    crate::copystat::heap_page(page, end - page);
+                }
                 host.sync_slots(first as u32, last as u32, start, step);
             }
         }
