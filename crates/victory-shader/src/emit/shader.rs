@@ -77,6 +77,47 @@ pub fn set_heap_views(views: u32) -> u32 {
     *HOST_VIEWS.get_or_init(|| views)
 }
 
+static SLOT_MAP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SLOT_MAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether title heap indices go through the host's slot map (`emit`,
+/// "Slot map"): the host says so before any translation
+/// ([`set_slot_map`]), else not. Fixed for the process at first use, and
+/// part of every translation: caches must key on it.
+pub fn slot_map() -> bool {
+    #[cfg(test)]
+    if TEST_SLOT_MAP.with(std::cell::Cell::get) {
+        return true;
+    }
+    *SLOT_MAP.get_or_init(|| false)
+}
+
+/// The host keeps a slot map (`on`). Returns the setting in effect: the
+/// other one if [`slot_map`] was fixed before this call.
+pub fn set_slot_map(on: bool) -> bool {
+    *SLOT_MAP.get_or_init(|| on)
+}
+
+/// The heap index of the host's raw SRV of the slot map (`emit`, "Slot
+/// map"), below the null raw unordered access view: shaders reach the map
+/// through the heap, so it costs no root parameter.
+pub fn slot_map_view() -> u32 {
+    heap_views() - 4
+}
+
+/// Runs `f` with the slot map on, on this thread (tests).
+#[cfg(test)]
+pub(crate) fn with_slot_map<R>(f: impl FnOnce() -> R) -> R {
+    TEST_SLOT_MAP.with(|c| c.set(true));
+    let r = f();
+    TEST_SLOT_MAP.with(|c| c.set(false));
+    r
+}
+
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
 /// holds no buffer view where a shader reads one at an index it computes
@@ -173,6 +214,8 @@ pub(crate) struct Shader {
     pub root_uavs: Vec<(u8, V)>,
     /// Root UAVs among them that an operation may write ([`Shader::op`]).
     pub written_root_uavs: Vec<u8>,
+    /// The slot map's handle ([`Shader::slot_map_handle`]), once read.
+    pub slot_map_h: Option<V>,
     /// The title-memory page table's handle, once read.
     pub memory: Option<V>,
     /// The written-pages bitmap's handle, once title memory is written.
@@ -201,6 +244,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Heap handles made (resource and sampler heaps).
+    pub heap_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -274,6 +319,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            slot_map_h: None,
             written_root_uavs: Vec::new(),
             memory: None,
             memory_dirty: None,
@@ -287,6 +333,7 @@ impl Shader {
             texture_reads: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            heap_handles: 0,
             threads: None,
             wave_size: None,
             compute_derivatives: false,
@@ -498,6 +545,20 @@ impl Shader {
         h
     }
 
+    /// The handle of the slot map's raw view, resource-heap index
+    /// [`slot_map_view`] (`emit`, "Slot map"), made in the entry block: no
+    /// root parameter, so a root signature at its 64 DWORDs takes it too.
+    pub fn slot_map_handle(&mut self) -> V {
+        if let Some(h) = self.slot_map_h {
+            return h;
+        }
+        let index = self.m.i32(slot_map_view());
+        let block = self.entry;
+        let h = self.heap_handle(block, index, false, false, (11, 0));
+        self.slot_map_h = Some(h);
+        h
+    }
+
     /// The handle of the view addresses (`t1` in [`MEMORY_SPACE`], a raw
     /// buffer: per resource-heap index, a descriptor's dwords 0-3 as far as
     /// the host knows them, `emit` "View addresses"), made in the entry
@@ -662,6 +723,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        self.heap_handles += 1;
         let asked = index;
         // An index past the host's heap faults the device (a console shader
         // reads whatever memory follows its heap): the last slot instead.

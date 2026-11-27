@@ -103,6 +103,19 @@
 //!   buffer SRV (UAV). The index comes from data, and a texture descriptor
 //!   read as a buffer one is a wild address (the texture's shifted 8 bits
 //!   down: GPU faults at low addresses).
+//! * **Slot map** (added 2026-11-27, only where the host keeps one,
+//!   [`slot_map`]): every heap index a program computes from a title
+//!   descriptor address (tables and the resource heap itself, not
+//!   samplers) is clamped below [`heap_views`] and replaced by dword
+//!   [`heap_views`] + index of the view-stride table, read through the raw
+//!   view the host keeps at heap index [`slot_map_view`] (no root
+//!   parameter: a root signature at its limit takes it as it is): the host
+//!   slot holding that slot's view, plus 1; 0 (what a null view reads too)
+//!   keeps the index. Title slots holding the same
+//!   record then share one host descriptor; the host keeps the entry of
+//!   every other index (its own slots, the nulls) at the index itself, and
+//!   every table it indexes there (strides, marks, view addresses, read
+//!   marks) follows the slot looked up.
 //! * **Views off 16 bytes** (added 2026-11-25): the host makes a
 //!   structured view raw from the 16 bytes at or below its first byte, in
 //!   its buffer's own copy, and keeps the bytes skipped in the top bits of
@@ -262,7 +275,7 @@ pub use shader::{
     HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, PORTABLE_TITLE_VIEWS, PORTABLE_VIEWS, ROOT_CBV_SPACE,
     SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS,
     VIEW_SIGNED, VIEW_SKIP_SHIFT, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
-    heap_views, null_buffer_view, set_heap_views,
+    heap_views, null_buffer_view, set_heap_views, set_slot_map, slot_map, slot_map_view,
 };
 
 /// The loop limit without an override: 2^20.
@@ -355,6 +368,11 @@ pub struct HostShader {
     /// Whether it writes through buffer views. Unlike [`Self::view_marks`],
     /// which read marks also need, false for a shader that only reads.
     pub view_stores: bool,
+    /// Descriptor handles the program takes from the resource heap (each a
+    /// heap index; with a slot map one map load more), and how many of them
+    /// differ between lanes: a static count, for the host's census.
+    pub heap_fetches: u32,
+    pub nonuniform_fetches: u32,
 }
 
 impl HostShader {
@@ -821,6 +839,8 @@ fn emit_variant<const PARTIAL: bool>(
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         view_stores: l.view_stores,
+        heap_fetches: l.heap_handles,
+        nonuniform_fetches: l.nonuniform_handles,
     })
 }
 
@@ -1760,6 +1780,8 @@ mod tests {
             heap_writes: false,
             view_marks: false,
             view_stores: false,
+            heap_fetches: 0,
+            nonuniform_fetches: 0,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1779,6 +1801,8 @@ mod tests {
                 heap_writes: false,
                 view_marks: false,
                 view_stores: false,
+                heap_fetches: 0,
+                nonuniform_fetches: 0,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

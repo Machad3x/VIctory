@@ -971,6 +971,8 @@ impl HostTexture {
         });
         TEXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         TEXTURE_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        // Made now: used lately from here on.
+        NEWLY_RECENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
             state: state.into(),
@@ -997,7 +999,10 @@ impl HostTexture {
     /// Used at presented frame `frame`, `ms` milliseconds in.
     fn stamp_at(&self, frame: u64, ms: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.last[0].store(frame, Relaxed);
+        let old = self.last[0].swap(frame, Relaxed);
+        if frame != NEVER && (old == NEVER || old.saturating_add(1) < frame) {
+            NEWLY_RECENT.fetch_add(1, Relaxed);
+        }
         self.last[1].store(ms, Relaxed);
     }
 
@@ -1013,6 +1018,13 @@ impl HostTexture {
     #[cfg(test)]
     pub(crate) fn unstamp(&self) {
         self.stamp_at(NEVER, 0);
+    }
+
+    /// How many times a host texture was made or became used lately (see
+    /// [`HostTexture::used_recently`]) after it was not: what heap walks
+    /// found lately read may have changed (`crate::bindless::uploads`).
+    pub(crate) fn newly_recent() -> u64 {
+        NEWLY_RECENT.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the title used it in this presented frame or the last one
@@ -1750,6 +1762,9 @@ pub(crate) const IDLE_FRAMES: u64 = 300;
 /// A use stamp's frame for "never" (tests).
 #[cfg(windows)]
 const NEVER: u64 = u64::MAX;
+
+/// [`HostTexture::newly_recent`].
+static NEWLY_RECENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Past this share of the card's memory budget, host textures fed from
 /// title memory are given up least recently used first, until the card's
 /// use is back under [`BUDGET_LOW`].

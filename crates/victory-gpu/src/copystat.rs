@@ -218,9 +218,75 @@ pub(crate) enum C {
     /// changed, or unmade holding a view record), of the `SyncSlots`
     /// looked at.
     SyncChanged,
+    /// Prep study, nanoseconds per frame: waiting for the submission lock,
+    /// giving up unused textures, snapshots ahead, the lists' deferred
+    /// steps and preludes, the last batch flush, clearing forgotten reads;
+    /// and wall time between one submission's end and the next's start.
+    PrepLockNs,
+    PrepEvictNs,
+    PrepSnapshotsNs,
+    PrepListsNs,
+    PrepFlushNs,
+    PrepForgottenNs,
+    ExecuteGapNs,
+    /// Heap syncs: comparing records, and the mirrors of stale slots;
+    /// stale slots that were stale at the last sync of them too.
+    SyncCompareNs,
+    SyncMirrorNs,
+    SyncStaleRepeat,
+    /// All mirrors: preparing views (`prepare`), making them, and how many
+    /// were made and how many found no view.
+    MirrorPrepareNs,
+    MirrorMakeNs,
+    MirrorMade,
+    MirrorNull,
+    /// Draw recording on title threads: preparing draws, of it tables.
+    DrawPrepareNs,
+    DrawTablesNs,
+    /// Heap texture uploads: calls, textures walked, textures queued.
+    UploadsCalls,
+    UploadsWalked,
+    UploadsQueued,
+    /// Settle: texture reads made, copy-back marks, the pull, copy-backs,
+    /// late copies and deferred work after.
+    SettleReadsNs,
+    SettleMarksNs,
+    SettlePullNs,
+    SettleBackNs,
+    SettleAfterNs,
     /// Nanoseconds threads waited for a copy's stale page lock another
     /// held (a riding pull holds them over its submission's wait).
     StaleLockWaitNs,
+    /// Sampler heap slots heap syncs looked at (of `SyncSlots`).
+    SyncSamplerSlots,
+    /// View slots made from a record another live slot was already made
+    /// from (its descriptor could be copied or shared), and from a record
+    /// no other slot holds.
+    DescKeyHit,
+    DescKeyMiss,
+    /// Slots whose descriptor was copied from another slot of the same
+    /// record (`VICTORY_DESC_CACHE`).
+    DescCopied,
+    /// `VICTORY_DESC_MAP`: slots that took another slot's descriptor through
+    /// the slot map, and slots made to stand in for a slot others shared
+    /// when its record changed.
+    DescShared,
+    DescPromoted,
+    /// `VICTORY_DESC_MAP=on`: records made in a dynamic slot while their
+    /// own slot keeps its descriptor for work in flight.
+    DescMoved,
+    /// `VICTORY_DESC_MAP=check`: slots made from a record another slot holds
+    /// that view the same host resource as that slot, and that view another.
+    DescCheckSame,
+    DescCheckDiffer,
+    /// Indirect clamps after a title barrier group ordering indirect
+    /// arguments (access or sync) with no shader write recorded since.
+    ClampsArgsOrdered,
+    /// Descriptor handles the programs of draws and dispatches take from
+    /// the resource heap (static counts per program, summed per draw), and
+    /// those of them that differ between lanes.
+    DescFetches,
+    DescFetchesNonuniform,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
     /// Bytes of taken pages refreshed, by who wrote the page (a copy-back
@@ -367,6 +433,63 @@ pub(crate) static HANDLER_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
 /// (`VirtualProtect`), since the last line, nanoseconds.
 pub(crate) static HANDLER_SAVE_MAX: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HANDLER_OPEN_MAX: AtomicU64 = AtomicU64::new(0);
+/// The longest wait of a title descriptor write for the shader-visible
+/// heaps' lock since the last line, nanoseconds.
+pub(crate) static MIRROR_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
+/// Per view heap (by the host heap's number): the distinct records (view
+/// entry and generation) its slots hold now and at most, and its slots
+/// sharing another's descriptor now (`VICTORY_DESC_MAP`).
+static DESC_HEAPS: std::sync::Mutex<std::collections::BTreeMap<u32, [u64; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// View heap `heap` holds `records` distinct records and `sharing` slots
+/// share another's descriptor.
+pub(crate) fn desc_heap(heap: u32, records: u64, sharing: u64) {
+    let mut heaps = DESC_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let g = heaps.entry(heap).or_default();
+    *g = [records, g[1].max(records), sharing];
+}
+
+/// View heap `heap` is gone.
+pub(crate) fn desc_heap_gone(heap: u32) {
+    DESC_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&heap);
+}
+
+/// The view heaps' gauges, for the stat line: `#n records now/most, sharing`.
+fn desc_heaps() -> String {
+    let heaps = DESC_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if heaps.is_empty() {
+        return "none".into();
+    }
+    heaps
+        .iter()
+        .map(|(n, [now, most, sharing])| format!("#{n} {now}/{most}, {sharing} sharing"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Nanoseconds since the first call.
+fn epoch_ns() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// When the last host submission ended (0: none yet).
+static LAST_END: AtomicU64 = AtomicU64::new(0);
+
+/// A host submission took the submission lock: the time since the last
+/// one ended counts as the gap between them.
+pub(crate) fn execute_start() {
+    let (now, last) = (epoch_ns(), LAST_END.load(Relaxed));
+    if last != 0 {
+        add(C::ExecuteGapNs, now.saturating_sub(last));
+    }
+}
+
+/// A host submission ended.
+pub(crate) fn execute_end() {
+    LAST_END.store(epoch_ns(), Relaxed);
+}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -431,7 +554,10 @@ static FLIGHT_HEAP_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// What last wrote each bottom-of-pipe word (0 a value, 1 a query result,
 /// 2 a timestamp), the frame it did and the value (0 unless known ahead);
 /// words not written for two frames are dropped at each line.
-static LABELS: Mutex<Option<HashMap<u64, (u8, u64, u64)>>> = Mutex::new(None);
+static LABELS: Mutex<Option<HashMap<u64, Label>>> = Mutex::new(None);
+
+/// A bottom-of-pipe word's writer kind, frame and value ([`LABELS`]).
+type Label = (u8, u64, u64);
 
 /// Why a title submission would drain the one before (fence, sync
 /// executes, present); `None` for our own executes.
@@ -798,11 +924,27 @@ pub(crate) fn log(frames: f64) {
     );
     if c[C::SyncChanged as usize] != 0.0 {
         tracing::info!(
-            "  heap sync per frame: {:.0} slots mirrored of {:.0} looked at",
+            "  heap sync per frame: {:.0} slots mirrored of {:.0} looked at ({:.0} sampler slots)",
             c[C::SyncChanged as usize],
             c[C::SyncSlots as usize],
+            c[C::SyncSamplerSlots as usize],
         );
     }
+    tracing::info!(
+        "  view slots by record per frame: {:.0} made from a record another slot holds, {:.0} from one no other holds; {:.0} copied, {:.0} shared, {:.0} stand-ins, {:.0} kept from work in flight; check {:.0} same, {:.0} other; heaps (records now/most): {}; heap descriptor fetches {:.0} ({:.0} per lane); clamps after an argument barrier {:.0}",
+        c[C::DescKeyHit as usize],
+        c[C::DescKeyMiss as usize],
+        c[C::DescCopied as usize],
+        c[C::DescShared as usize],
+        c[C::DescPromoted as usize],
+        c[C::DescMoved as usize],
+        c[C::DescCheckSame as usize],
+        c[C::DescCheckDiffer as usize],
+        desc_heaps(),
+        c[C::DescFetches as usize],
+        c[C::DescFetchesNonuniform as usize],
+        c[C::ClampsArgsOrdered as usize],
+    );
     tracing::info!(
         "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans; {:.0} pulls run under their submission's wait; {:.2} ms waited on stale page locks",
         ms(c[C::MarkedPullUs as usize]),
@@ -865,6 +1007,35 @@ pub(crate) fn log(frames: f64) {
             c[C::ClosingTable as usize],
         );
     }
+    let n = |k: C| c[k as usize] / 1e6;
+    tracing::info!(
+        "  prep study per frame (ms): lock wait {:.2}, evict {:.2}, snapshots {:.2}, lists {:.2}, last flush {:.2}, forgotten reads {:.2}; gap between submissions {:.2}; sync heaps: compare {:.2}, mirror {:.2}, {:.0} stale again; mirrors: prepare {:.2}, make {:.2}, {:.0} made, {:.0} null; title writes' longest heap lock wait {:.2}; draws: prepare {:.2} (tables {:.2}); uploads: {:.1} calls, {:.0} textures walked, {:.1} queued; settle: reads {:.2}, marks {:.2}, pull {:.2}, copy-backs {:.2}, after {:.2}",
+        n(C::PrepLockNs),
+        n(C::PrepEvictNs),
+        n(C::PrepSnapshotsNs),
+        n(C::PrepListsNs),
+        n(C::PrepFlushNs),
+        n(C::PrepForgottenNs),
+        n(C::ExecuteGapNs),
+        n(C::SyncCompareNs),
+        n(C::SyncMirrorNs),
+        c[C::SyncStaleRepeat as usize],
+        n(C::MirrorPrepareNs),
+        n(C::MirrorMakeNs),
+        c[C::MirrorMade as usize],
+        c[C::MirrorNull as usize],
+        MIRROR_WAIT_MAX.swap(0, Relaxed) as f64 / 1e6,
+        n(C::DrawPrepareNs),
+        n(C::DrawTablesNs),
+        c[C::UploadsCalls as usize],
+        c[C::UploadsWalked as usize],
+        c[C::UploadsQueued as usize],
+        n(C::SettleReadsNs),
+        n(C::SettleMarksNs),
+        n(C::SettlePullNs),
+        n(C::SettleBackNs),
+        n(C::SettleAfterNs),
+    );
     tracing::info!(
         "flight study per frame: prep {:.2} ms (sync heaps {:.2}), gpu wait {:.2} ms, settle {:.2} ms; next would drain: range {:.1}, fence {:.1}, sync exec {:.1}, present {:.1}, free {:.1}; fence polls {:.1}; pipelining: real drains {:.1}; taken while the one before wrote them: clean refreshes {:.1}, changed same copy {:.1}, changed alias {:.1}, stagings {:.1}, copies {:.1}, shader writes {:.1}, heap pages {:.1}; value waits by writer: value {:.1}, query {:.1}, timestamp {:.1}, cpu or unknown {:.1}; queue fence waits {:.1}; unmet fence events {:.1}; null views made {:.1} in {:.1} submissions; submissions using a copy the one before wrote {:.1}; title in ExecuteCommandLists {:.2} ms; overlap hazards: submissions {:.1}, changed copies in use {:.1}, heap pages {:.1}, marked after marked {:.1}, snapshots of written copies {:.1}, marks on written copies {:.1}",
         c[C::FlightPrepNs as usize] / 1e6,

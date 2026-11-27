@@ -446,6 +446,11 @@ fn probe_view_heap(device: &ID3D12Device) {
     } else if takes != HEAP_VIEWS {
         tracing::info!(views = takes, "the host caps view heaps: shader heap indices clamped below it");
     }
+    let map = crate::descriptor::host::share_mode() == crate::descriptor::host::Share::On;
+    if victory_shader::emit::set_slot_map(map) != map {
+        // Shaders and heaps would disagree on what a heap index names.
+        tracing::error!(map, "shaders translated before the slot map was set: VICTORY_DESC_MAP ignored");
+    }
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -1701,6 +1706,10 @@ struct Deferred {
     /// An indirect clamp was recorded and no shader write since.
     #[cfg(feature = "diagnostics")]
     clamp_clean: bool,
+    /// A title barrier group ordering indirect arguments was recorded and
+    /// no shader write since.
+    #[cfg(feature = "diagnostics")]
+    args_ordered: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -1929,8 +1938,15 @@ impl Host {
     fn lock_idle(&self) -> std::sync::MutexGuard<'_, u64> {
         // It would wait for itself.
         debug_assert!(!RETIRE_THREAD.get(), "a host submission from the retire thread");
+        #[cfg(feature = "diagnostics")]
+        let locking = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepLockNs);
         let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         drop(IDLE.wait_while(flight(), |f| f.is_some()).unwrap_or_else(|e| e.into_inner()));
+        #[cfg(feature = "diagnostics")]
+        {
+            drop(locking);
+            crate::copystat::execute_start();
+        }
         submitted
     }
 
@@ -2006,7 +2022,11 @@ impl Host {
         let flight = crate::copystat::flight_begin();
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
-        crate::resource::evict_unused();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepEvictNs);
+            crate::resource::evict_unused();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -2102,7 +2122,11 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
-        crate::shadow::snapshots_ahead(&snapshots);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepSnapshotsNs);
+            crate::shadow::snapshots_ahead(&snapshots);
+        }
         let mut batch = Batch::reused();
         #[cfg(feature = "diagnostics")]
         {
@@ -2113,6 +2137,8 @@ impl Host {
                 batch.touch(at, len, crate::copystat::C::RangeStaging);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let listing = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepListsNs);
         for (i, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -2124,7 +2150,13 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
+        #[cfg(feature = "diagnostics")]
+        drop(listing);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepFlushNs);
+            batch.flush();
+        }
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::flight_prepared();
@@ -2155,7 +2187,11 @@ impl Host {
         let groups = std::iter::once(0..lists.len());
         // Clear read marks of slots forgotten before this submission (placed
         // textures written or evicted) so reads in it are not wiped after it.
-        crate::shadow::clear_forgotten_reads();
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::PrepForgottenNs);
+            crate::shadow::clear_forgotten_reads();
+        }
         // What shaders write into copies in video memory comes back into
         // their mirrors (`crate::shadow::pull`, for the copy-backs) in an
         // ExecuteCommandLists of its own right after the lists': its end
@@ -2204,6 +2240,9 @@ impl Host {
             *submitted += 1;
             crate::memsys::submission_sent(*submitted);
             t.value = *submitted;
+            // Before the lists go: what reads view heap slots from here on
+            // is covered by this value ([`sent`]).
+            SENT.fetch_max(t.value, Ordering::SeqCst);
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::SUBMITTED, t.value, 0);
@@ -2486,12 +2525,18 @@ impl Host {
             .filter(|b| !b.3)
             .map(|(s, a, n, ..)| (s.clone(), *a, *n))
             .collect();
-        // Not waited for, its marks may not be in the ring yet: the bitmap.
-        crate::shadow::copy_back_marks_of(&withheld, withholding, marks.as_ref().filter(|_| !unwaited));
+        {
+            #[cfg(feature = "diagnostics")]
+            let _timed = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleMarksNs);
+            // Not waited for, its marks may not be in the ring yet: the bitmap.
+            crate::shadow::copy_back_marks_of(&withheld, withholding, marks.as_ref().filter(|_| !unwaited));
+        }
         if let Some(snap) = marks {
             crate::memsys::marks::done(snap);
         }
         // Texture views left null that shaders read: made for what follows.
+        #[cfg(feature = "diagnostics")]
+        let reading = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleReadsNs);
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
             #[cfg(feature = "diagnostics")]
@@ -2501,12 +2546,16 @@ impl Host {
             }
             crate::descriptor::make_read(&read);
         }
+        #[cfg(feature = "diagnostics")]
+        drop(reading);
         // What shaders wrote into copies in video memory, for the copy-backs
         // below to read from their mirrors: in the ranges with snapshots
         // (marked ones compare nothing; `copy_back_marks` pulled their pages).
         // Done with the lists when it rode them (`riding`): what ran on the
         // CPU since keeps video memory and the mirrors alike, or marks the
         // pages stale.
+        #[cfg(feature = "diagnostics")]
+        let pulling = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettlePullNs);
         if !pulled {
             crate::shadow::pull(&snapshots);
             if let Some(Some(r)) = &mut riding {
@@ -2518,6 +2567,8 @@ impl Host {
                 r.pull().busy &= unsafe { self.fence.GetCompletedValue() } < value;
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(pulling);
         /// Held only to be dropped with the submission's buffers.
         struct Kept {
             _regions: Regions,
@@ -2531,6 +2582,8 @@ impl Host {
         };
         static RETAKE_ALL: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var_os("VICTORY_RETAKE_ALL").is_some_and(|v| v != "0"));
+        #[cfg(feature = "diagnostics")]
+        let backing = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleBackNs);
         for (shadow, address, len, goes_back, marked) in &back {
             let (address, len) = (*address, *len);
             if *goes_back {
@@ -2547,7 +2600,11 @@ impl Host {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(backing);
         crate::shadow::snapshots_done(&snapshots);
+        #[cfg(feature = "diagnostics")]
+        let after = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::SettleAfterNs);
         // Copies kept past the lists' run: what the shaders wrote reached
         // title memory in the copy-backs above, so a deferred copy's source
         // is new now (and its destination is not overwritten by them).
@@ -2560,6 +2617,8 @@ impl Host {
                 work();
             }
         }
+        #[cfg(feature = "diagnostics")]
+        drop(after);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsBack, crate::copystat::page_faults().saturating_sub(faults));
@@ -2611,6 +2670,8 @@ impl Host {
         // copies the title gave up meanwhile may have their last holder here.
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps, kept)));
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::execute_end();
         self.log_messages();
     }
 
@@ -3298,7 +3359,15 @@ impl HostList {
     /// A draw or dispatch that may write through views is being recorded.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_shader_write(&self) {
-        self.deferred().clamp_clean = false;
+        let mut deferred = self.deferred();
+        deferred.clamp_clean = false;
+        deferred.args_ordered = false;
+    }
+
+    /// A title barrier group ordering indirect arguments is being recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_args_barrier(&self) {
+        self.deferred().args_ordered = true;
     }
 
     /// An indirect clamp is being recorded.
@@ -3306,8 +3375,13 @@ impl HostList {
     pub(crate) fn note_clamp(&self) {
         use crate::copystat::{C, add};
         add(C::Clamps, 1);
-        if std::mem::replace(&mut self.deferred().clamp_clean, true) {
+        let mut deferred = self.deferred();
+        if std::mem::replace(&mut deferred.clamp_clean, true) {
             add(C::ClampsNoWrite, 1);
+        }
+        // Left set: the clamp writes no title data the next one reads.
+        if deferred.args_ordered {
+            add(C::ClampsArgsOrdered, 1);
         }
     }
 
@@ -5782,6 +5856,40 @@ static RETIRED: Mutex<Vec<(ID3D12Resource, Option<std::sync::Arc<crate::shadow::
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource, copy: Option<std::sync::Arc<crate::shadow::Shadow>>) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((resource, copy));
+}
+
+/// The host fence value of the last group sent to the GPU (stored before its
+/// lists go, so work that reads memory written before this call is covered
+/// by the value returned): with [`completed`], what view heaps wait for
+/// before they rewrite a slot work in flight may read (`crate::descriptor`).
+// `Host::submit` stores it where it sets `t.value`, for each group; a
+// pipelined retire changes nothing here: [`completed`] reads the fence.
+static SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn sent() -> u64 {
+    #[cfg(test)]
+    if let Some((sent, _)) = FENCE.get() {
+        return sent;
+    }
+    SENT.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: this thread's [`sent`] and [`completed`] values, not the host's
+    /// (work in flight without a submission).
+    pub(crate) static FENCE: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The host fence's completed value: every group up to it has run (all of
+/// them without a device: nothing runs).
+pub(crate) fn completed() -> u64 {
+    #[cfg(test)]
+    if let Some((_, completed)) = FENCE.get() {
+        return completed;
+    }
+    // SAFETY: a live fence.
+    host().map_or(u64::MAX, |h| unsafe { h.fence.GetCompletedValue() })
 }
 
 /// After a submission has run, with none running: the retired resources go.

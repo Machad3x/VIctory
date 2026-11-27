@@ -79,10 +79,8 @@ pub(crate) struct Lowered {
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
-    #[cfg(test)]
     pub nonuniform_handles: u32,
     /// Heap handles written.
-    #[cfg(test)]
     pub heap_handles: u32,
     #[cfg(test)]
     barrier_modes: Vec<Option<i64>>,
@@ -1830,10 +1828,8 @@ impl<'a> Lower<'a> {
             heap_writes: self.heap[1],
             view_marks: self.s.view_writes.is_some(),
             view_stores: self.s.view_stores,
-            #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
-            #[cfg(test)]
-            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap").count() as u32,
+            heap_handles: self.s.heap_handles,
             #[cfg(test)]
             barrier_modes: self
                 .s
@@ -6138,7 +6134,36 @@ impl<'a> Lower<'a> {
         let k = self.s.m.i32(offset.wrapping_add(4 * u32::from(first)));
         let addr = self.s.m.bin(entry, Bin::Add, base, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        self.s.m.bin(entry, Bin::LShr, addr, shift)
+        let index = self.s.m.bin(entry, Bin::LShr, addr, shift);
+        let here = std::mem::replace(&mut self.cur, entry);
+        let index = self.host_slot(index, sampler);
+        self.cur = here;
+        index
+    }
+
+    /// The host slot of title heap index `index` (module notes, "Slot
+    /// map"), in the current block: its entry in the slot map (a raw view
+    /// in the resource heap, of the table the view strides start); `index`
+    /// itself without a slot map and for samplers.
+    fn host_slot(&mut self, index: V, sampler: bool) -> V {
+        if sampler || !super::slot_map() {
+            return index;
+        }
+        let index = self.clamp_view_index(index);
+        let c = self.cur;
+        let base = self.s.m.i32(super::heap_views());
+        let at = self.s.m.bin(c, Bin::Add, index, base);
+        let four = self.s.m.i32(4);
+        let at = self.s.m.bin(c, Bin::Mul, at, four);
+        let table = self.s.slot_map_handle();
+        // Entries hold the host slot + 1; 0 (also what a null view reads) is
+        // the index itself.
+        let entry = self.raw_dword(table, at);
+        let c = self.cur;
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let own = self.s.m.cmp(c, pred::EQ, entry, zero);
+        let slot = self.s.m.bin(c, Bin::Sub, entry, one);
+        self.s.m.select(c, own, index, slot)
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -6250,7 +6275,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.host_slot(index, sampler))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -6290,7 +6316,8 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(self.host_slot(index, sampler))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

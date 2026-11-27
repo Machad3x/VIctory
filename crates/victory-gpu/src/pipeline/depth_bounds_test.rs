@@ -73,6 +73,8 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             heap_writes: false,
             view_marks: false,
             view_stores: false,
+            heap_fetches: 0,
+            nonuniform_fetches: 0,
         },
         used: Vec::new(),
         threads: None,
