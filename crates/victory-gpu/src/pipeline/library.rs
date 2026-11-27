@@ -418,26 +418,43 @@ pub(crate) fn save(why: Save) {
         *last = Some(std::time::Instant::now());
         UNSAVED.store(0, Ordering::Relaxed);
     }
-    let (blob, prebuilt) = {
+    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let staged = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         library.store(&mut l, None);
-        if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        if l.added == 0 && !l.prebuilt_changed {
+            drop(l);
+            // Only first uses changed: the early list alone. Serialising the
+            // whole library for it wrote 2 GB every 20 s for nothing (gpu313:
+            // 4.3 s a save, made=0).
+            if used_changed {
+                let used = used().as_ref().map(Used::list).unwrap_or_default();
+                let written = std::fs::create_dir_all(dir)
+                    .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+                match written {
+                    Ok(()) => tracing::debug!(early = used.len(), "early pipeline list saved"),
+                    Err(e) => tracing::warn!(error = %e, "early pipeline list not saved"),
+                }
+            }
             return;
         }
         // SAFETY: a plain size query on a live library.
         let size = unsafe { l.library.GetSerializedSize() };
-        let Some(mut bytes) = zeroed(size) else {
-            // Left for a later save: the pipelines stay counted as added.
-            tracing::warn!(bytes = size, "no memory to serialise the host pipeline library; saved later");
-            return;
+        let staged = std::fs::create_dir_all(dir).and_then(|()| Staged::new(&dir.join(LIBRARY_FILE), size));
+        let mut staged = match staged {
+            Ok(s) => s,
+            Err(e) => {
+                // Left for a later save: the pipelines stay counted as added.
+                tracing::warn!(bytes = size, error = %e, "no file to serialise the host pipeline library into; saved later");
+                return;
+            }
         };
-        // SAFETY: a buffer of the size the library asks for.
-        let bytes = unsafe { l.library.Serialize(&mut bytes) }.map(|()| bytes);
-        match bytes {
-            Ok(bytes) => {
+        // SAFETY: a mapped view of the size the library asks for.
+        match unsafe { l.library.Serialize(staged.bytes_mut()) } {
+            Ok(()) => {
                 l.added = 0;
                 l.prebuilt_changed = false;
-                (bytes, (!l.prebuilt.is_empty()).then(|| l.prebuilt.clone()))
+                (staged, (!l.prebuilt.is_empty()).then(|| l.prebuilt.clone()))
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
@@ -445,13 +462,15 @@ pub(crate) fn save(why: Save) {
             }
         }
     };
+    let (staged, prebuilt) = staged;
+    let bytes = staged.bytes().len();
     // Hashed outside the lock: the blob is the whole library (1.7 GB on
     // NVIDIA). Kept beside the bytes it holds for (also when a run adds
     // pipelines).
-    let prebuilt = prebuilt.map(|keys| list(&tag(&blob), &keys));
+    let prebuilt = prebuilt.map(|keys| list(&tag(staged.bytes()), &keys));
     let used = used().as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
+    let written = staged
+        .finish()
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
         .and_then(|()| match &prebuilt {
             Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
@@ -461,7 +480,7 @@ pub(crate) fn save(why: Save) {
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
     match written {
         Ok(()) => tracing::info!(
-            bytes = blob.len(),
+            bytes,
             early = used.len(),
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
@@ -476,34 +495,121 @@ pub(crate) fn save(why: Save) {
     }
 }
 
-/// `n` zero bytes, or `None` when the host has no memory for them. The
-/// library is about 1.7 GB on NVIDIA (each pipeline's machine code), and an
-/// infallible allocation of that size aborted the whole process mid-run
-/// ("memory allocation of 2650101862 bytes failed", RTX 4050 Laptop).
-fn zeroed(n: usize) -> Option<Vec<u8>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n).ok()?;
-    v.resize(n, 0);
-    Some(v)
+/// Renames over targets one at a time (worker and shutdown saves).
+static WRITING: Mutex<()> = Mutex::new(());
+
+/// A staging file's name beside `path`, never the same twice.
+fn staging(path: &std::path::Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp-{}-{n}", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part. Serialised so concurrent worker and
-/// shutdown saves do not race on the same staging file or target rename.
+/// shutdown saves do not race on the same target rename.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::AtomicU64;
-    static WRITING: Mutex<()> = Mutex::new(());
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let tmp = staging(path);
     let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp-{}-{n}", std::process::id()));
-    let tmp = path.with_file_name(name);
     let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// A new staging file of `len` bytes beside `path`, mapped for writing: the
+/// host serialises the library straight into it, renamed over `path` by
+/// [`Staged::finish`]. No buffer of ours is zeroed or copied: the library is
+/// about 2 GB on NVIDIA, and a zeroed buffer of that size took most of a
+/// 3.6 s save (gpu313), and an infallible one aborted a run ("memory
+/// allocation of 2650101862 bytes failed", RTX 4050 Laptop). Idea from
+/// fxceless 6fa814fb (in the tn1 fork), which maps the library file.
+struct Staged {
+    file: Option<std::fs::File>,
+    mapping: windows_sys::Win32::Foundation::HANDLE,
+    at: *mut u8,
+    len: usize,
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl Staged {
+    fn new(path: &std::path::Path, len: usize) -> std::io::Result<Staged> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
+        if len == 0 {
+            return Err(std::io::Error::other("an empty library"));
+        }
+        let tmp = staging(path);
+        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+        let mut staged = Staged {
+            file: Some(file),
+            mapping: std::ptr::null_mut(),
+            at: std::ptr::null_mut(),
+            len,
+            tmp,
+            path: path.to_owned(),
+        };
+        let file = staged.file.as_ref().expect("just opened");
+        file.set_len(len as u64)?;
+        let size = len as u64;
+        // SAFETY: a file handle of ours; closed in `drop`.
+        staged.mapping = unsafe {
+            CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READWRITE, (size >> 32) as u32, size as u32, std::ptr::null())
+        };
+        if staged.mapping.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a mapping of ours, `len` bytes; unmapped in `drop`.
+        staged.at = unsafe { MapViewOfFile(staged.mapping, FILE_MAP_WRITE, 0, 0, len) }.Value.cast();
+        if staged.at.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(staged)
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: a live view of `len` bytes (a new file reads zeros).
+        unsafe { std::slice::from_raw_parts(self.at, self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; only this staging file's.
+        unsafe { std::slice::from_raw_parts_mut(self.at, self.len) }
+    }
+
+    /// Unmaps and closes the file, then renames it over the target.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.close();
+        let _guard = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        std::fs::rename(&self.tmp, &self.path)
+    }
+
+    fn close(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        if !self.at.is_null() {
+            // SAFETY: our view, unmapped once.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.at.cast() }) };
+            self.at = std::ptr::null_mut();
+        }
+        if !self.mapping.is_null() {
+            // SAFETY: our mapping handle, closed once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.mapping) };
+            self.mapping = std::ptr::null_mut();
+        }
+        self.file = None;
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        self.close();
+        // Not finished: the staging file goes (a renamed one is not there).
+        let _ = std::fs::remove_file(&self.tmp);
+    }
 }
 
 /// Title pipelines created, and their distinct keys.
@@ -609,11 +715,27 @@ pub(crate) fn note_used(key: &str) {
 mod tests {
     use super::*;
 
-    /// A size the host cannot give is refused, not fatal; others are zeros.
+    /// The library is serialised into a mapped staging file renamed over
+    /// the target when done; one not finished leaves the target as it was
+    /// and no staging file behind. A size no disk can hold is refused.
     #[test]
-    fn a_save_buffer_the_host_cannot_give_is_refused() {
-        assert!(zeroed(usize::MAX / 2).is_none());
-        assert_eq!(zeroed(100).as_deref(), Some(&[0u8; 100][..]));
+    fn a_staged_save_is_whole_or_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(LIBRARY_FILE);
+        std::fs::write(&target, b"old").unwrap();
+        let mut staged = Staged::new(&target, 3 * 4096 + 5).unwrap();
+        assert!(staged.bytes().iter().all(|&b| b == 0), "a new file reads zeros");
+        staged.bytes_mut().fill(7);
+        drop(staged);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        let mut staged = Staged::new(&target, 4096 + 1).unwrap();
+        staged.bytes_mut().fill(9);
+        staged.finish().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), vec![9u8; 4097]);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no staging file left");
+        assert!(Staged::new(&target, 0).is_err());
+        assert!(Staged::new(&target, usize::MAX / 4).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     /// Saves come after `SAVE_AFTER` pipelines, when the workers run out
