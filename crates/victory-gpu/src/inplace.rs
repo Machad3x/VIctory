@@ -513,6 +513,8 @@ pub(crate) fn private_open(at: usize, len: usize) -> bool {
     if len == 0 || !PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).range(..=at).next_back().is_some_and(|(_, &e)| e >= end) {
         return false;
     }
+    // One allocation throughout: a heap is opened on one (the host refuses
+    // a range across two with E_INVALIDARG, gpu308).
     let mut p = at;
     while p < end {
         let (next, opens) = region(p);
@@ -521,7 +523,14 @@ pub(crate) fn private_open(at: usize, len: usize) -> bool {
         }
         p = next;
     }
-    true
+    allocation_end(at) >= end
+}
+
+/// Pages of private memory to name in place (in page order, at their own
+/// addresses) cut into runs: at most [`CHUNK`] pages, ending where a chunk
+/// does, and each within one allocation.
+pub(crate) fn private_runs(pages: &[(usize, usize)]) -> Vec<&[(usize, usize)]> {
+    runs(pages, CHUNK).into_iter().flat_map(|run| per_view(run, allocation_end)).collect()
 }
 
 /// The open run holding `[at, at + len)` in `open`, and where the range
@@ -595,7 +604,7 @@ pub(crate) fn wait_private() -> bool {
     }
     let started = std::time::Instant::now();
     let left = PRIVATE_WAIT_US.saturating_sub(WAITED_US.load(Ordering::Relaxed));
-    let done = wait_pending(Some(std::time::Duration::from_micros(left)));
+    let done = wait_pending(std::time::Duration::from_micros(left));
     let waited = started.elapsed().as_micros() as u64;
     WAITED_US.fetch_add(waited, Ordering::Relaxed);
     RT[5].fetch_add(1, Ordering::Relaxed);
@@ -621,18 +630,14 @@ fn asked_done() {
 }
 
 /// Waits until no private run is left asked of the worker, for `limit` at
-/// most (None: as long as that takes); woken by [`asked_done`], no polling.
+/// most; woken by [`asked_done`], no polling.
 /// True if none is left.
-fn wait_pending(limit: Option<std::time::Duration>) -> bool {
+fn wait_pending(limit: std::time::Duration) -> bool {
     let pending = |_: &mut ()| PRIVATE_PENDING.load(Ordering::Relaxed) != 0;
     let settled = SETTLED_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut settled = match limit {
-        Some(limit) => SETTLED.wait_timeout_while(settled, limit, pending).unwrap_or_else(|e| e.into_inner()).0,
-        None => SETTLED.wait_while(settled, pending).unwrap_or_else(|e| e.into_inner()),
-    };
+    let (mut settled, _) = SETTLED.wait_timeout_while(settled, limit, pending).unwrap_or_else(|e| e.into_inner());
     !pending(&mut settled)
 }
-
 /// Sends `[at, at + len)` to the opening thread.
 fn worker(at: usize, len: usize, private: bool) {
     type Work = (usize, usize, bool);
@@ -711,7 +716,18 @@ fn open_run(at: usize, len: usize, private: bool) {
         let pin = crate::pinned::pin(start, bytes, Box::new(move || release_private(start, id)));
         PINS.lock().unwrap_or_else(|e| e.into_inner()).insert(id, pin);
         #[cfg(test)]
-        stall::opening(start);
+        stall::opening(start, bytes);
+        // Checked again under the registration: the title may have changed
+        // the memory between the check above and it (nothing to let go
+        // then). From here on its changes through the runtime wait for this
+        // open and let the run go.
+        if !private_open(start, bytes) {
+            locked_ranges().remove(&(start, id));
+            LOCKED.fetch_sub(1, Ordering::Relaxed);
+            unpin(id);
+            with_runs(|r| finish(r, at, len, None));
+            return;
+        }
     }
     let opened = crate::host::host().ok_or_else(|| "no host".to_owned()).and_then(|host| {
         // SAFETY: our own view of sections whose pages the title's views
@@ -719,7 +735,14 @@ fn open_run(at: usize, len: usize, private: bool) {
         if !private && unsafe { VirtualAlloc(start as *const c_void, bytes, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        open_at(&host.device, start, bytes).map_err(|e| e.to_string())
+        let opened = open_at(&host.device, start, bytes).map_err(|e| e.to_string())?;
+        // And once open, when nothing can change it any more: a commit with
+        // another protection (`XMemVirtualAlloc` tries the host first) may
+        // have come before the heap. Dropped here, before the run lets go.
+        if private && !private_open(start, bytes) {
+            return Err("the title changed it while it was opened".to_owned());
+        }
+        Ok(opened)
     });
     let run = match opened {
         Ok((heap, buffer)) => {
@@ -798,28 +821,31 @@ fn finish(r: &mut Runs, at: usize, len: usize, opened: Option<(usize, Arc<Run>, 
 mod stall {
     use std::sync::{Condvar, Mutex};
 
-    /// The armed address (0: none), whether its open is stopped, whether
-    /// its release has begun.
-    static STATE: Mutex<(usize, bool, bool)> = Mutex::new((0, false, false));
+    /// The armed address (0: none), whether an open over it is stopped,
+    /// whether its release has begun, and the stopped run's start (a join
+    /// may start it below the address).
+    static STATE: Mutex<(usize, bool, bool, usize)> = Mutex::new((0, false, false, 0));
     static MOVED: Condvar = Condvar::new();
-    /// Far past any step's time: a test that never releases fails, not hangs.
-    const MOST: std::time::Duration = std::time::Duration::from_secs(30);
+    /// Far past any step's time: a test that never releases fails, and the
+    /// worker goes on, instead of both hanging.
+    const MOST: std::time::Duration = std::time::Duration::from_secs(10);
 
-    fn state() -> std::sync::MutexGuard<'static, (usize, bool, bool)> {
+    fn state() -> std::sync::MutexGuard<'static, (usize, bool, bool, usize)> {
         STATE.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     pub(super) fn arm(at: usize) {
-        *state() = (at, false, false);
+        *state() = (at, false, false, 0);
     }
 
-    /// On the opening thread, the run registered and not opened.
-    pub(super) fn opening(start: usize) {
+    /// On the opening thread, the run `[start, start + bytes)` registered
+    /// and not opened.
+    pub(super) fn opening(start: usize, bytes: usize) {
         let mut s = state();
-        if s.0 == 0 || s.0 != start {
+        if s.0 == 0 || !(start..start + bytes).contains(&s.0) {
             return;
         }
-        s.1 = true;
+        (s.1, s.3) = (true, start);
         MOVED.notify_all();
         drop(MOVED.wait_timeout_while(s, MOST, |s| !s.2).unwrap_or_else(|e| e.into_inner()));
     }
@@ -827,7 +853,7 @@ mod stall {
     /// A release of the run at `start` begins.
     pub(super) fn releasing(start: usize) {
         let mut s = state();
-        if s.0 != 0 && s.0 == start {
+        if s.1 && s.3 == start {
             s.2 = true;
             MOVED.notify_all();
         }
@@ -838,7 +864,6 @@ mod stall {
         MOVED.wait_timeout_while(state(), MOST, |s| !s.1).unwrap_or_else(|e| e.into_inner()).0.1
     }
 }
-
 /// The private run `id` is no longer registered with `crate::pinned`.
 fn unpin(id: u64) {
     let pin = PINS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -1176,10 +1201,12 @@ pub(crate) fn dead() -> Vec<u64> {
 /// next frame's end; after [`FRAMES_KEPT`] a view is left mapped.
 pub(crate) fn settle() {
     use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, GetLastError};
-    // Private runs let go or replaced stay [`dead`] while their heaps live
-    // (until the tables dropped them).
-    let alive: Vec<u64> = locked_ranges().keys().map(|&(_, id)| id).collect();
     let ready = with_runs(|r| {
+        // Private runs let go or replaced stay [`dead`] while their heaps
+        // live (until the tables dropped them). Read under the runs' lock
+        // (RUNS before LOCKED_RANGES, as a run's drop under it takes them):
+        // a run forgotten after a read outside it would be lost from `dead`.
+        let alive: Vec<u64> = locked_ranges().keys().map(|&(_, id)| id).collect();
         let mut ready = Vec::new();
         let mut i = 0;
         while i < r.gone.len() {
@@ -1468,12 +1495,70 @@ mod tests {
         assert!(!in_ranges(&BTreeMap::new(), base));
     }
 
+    /// Two private allocations side by side: runs over both are cut where
+    /// the first ends, and a range across both is not opened (gpu308: the
+    /// host refused one with E_INVALIDARG); each alone is.
+    #[test]
+    fn private_runs_stay_within_one_allocation() {
+        let _one = worker_tests();
+        use windows_sys::Win32::System::Memory as mem;
+        let len = 4 * PAGE;
+        // SAFETY: a reservation to find room, released at once; then two
+        // allocations in it, released below.
+        let (at, ok) = unsafe {
+            let at = mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE, mem::PAGE_NOACCESS) as usize;
+            assert_ne!(at, 0);
+            mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
+            let a = mem::VirtualAlloc(at as *const c_void, 2 * PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            let b = mem::VirtualAlloc((at + 2 * PAGE) as *const c_void, 2 * PAGE, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            (at, a as usize == at && b as usize == at + 2 * PAGE)
+        };
+        if ok {
+            let pages: Vec<(usize, usize)> = (0..4).map(|k| (at / PAGE + k, at + k * PAGE)).collect();
+            let cut = private_runs(&pages);
+            assert_eq!(cut.iter().map(|r| r.len()).sum::<usize>(), 4);
+            assert!(cut.iter().all(|r| r[0].1 >= at + 2 * PAGE || r[r.len() - 1].1 < at + 2 * PAGE), "none across: {cut:?}");
+            merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+            let _unreport = Unreport(at, len);
+            assert!(!private_open(at, len), "across two allocations");
+            assert!(private_open(at, 2 * PAGE) && private_open(at + 2 * PAGE, 2 * PAGE));
+        }
+        // SAFETY: ours (a release of what is not there fails harmlessly).
+        unsafe {
+            mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
+            mem::VirtualFree((at + 2 * PAGE) as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+        assert!(ok, "the two allocations went where asked");
+    }
+    /// The tests that use the opening thread and its pending count, one at
+    /// a time: a stalled open holds the one worker.
+    fn worker_tests() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The reported private memory over `[at, at + len)` is forgotten (on
+    /// drop, however the test ends), so
+    /// that a later test given the same addresses finds it unreported (the
+    /// tests reporting memory hold [`worker_tests`]).
+    struct Unreport(usize, usize);
+
+    impl Drop for Unreport {
+        fn drop(&mut self) {
+            let (at, end) = (self.0, self.0 + self.1);
+            PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&s, &mut e| e <= at || s >= end);
+        }
+    }
+
+    /// How long a test waits for the worker: far past an open's time.
+    const WORKER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
     /// The title protects, then frees, private memory open in place: the
     /// plain calls fail while the run's heap locks the pages, and through
     /// the runtime's path (`crate::pinned`, as the title's `VirtualProtect`
     /// and `VirtualFree` go) the run is let go first and both work.
     #[test]
     fn a_title_protect_over_an_open_private_run_lets_it_go_first() {
+        let _one = worker_tests();
         use windows_sys::Win32::System::Memory as mem;
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let Some(host) = crate::host::host() else {
@@ -1500,10 +1585,11 @@ mod tests {
         // reported (as `VICTORY_RT_MEMORY` does), and only that.
         assert!(!private_open(at, len), "not reported: refused");
         merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+        let _unreport = Unreport(at, len);
         assert!(private_open(at, len) && !private_open(at, len + PAGE));
         // Opened as the worker opens a run a page table asked for.
         assert!(run_for(at, len, true).is_none(), "asked of the worker");
-        assert!(wait_pending(None), "the worker opened it or was refused");
+        assert!(wait_pending(WORKER_WAIT), "the worker opened it or was refused");
         let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) else {
             // Not open: only if the host itself refuses such a heap (a
             // driver or Windows without `ID3D12Device13`), said out loud.
@@ -1534,7 +1620,7 @@ mod tests {
         // protection (`XMemVirtualAlloc` at an address): let go if the host
         // refuses that as locked, and done either way.
         assert!(run_for(at, len, true).is_none());
-        assert!(wait_pending(None));
+        assert!(wait_pending(WORKER_WAIT));
         let reopened = with_runs(|r| holding(&r.open, at, len)).is_some();
         let commit = || {
             // SAFETY: our allocation's first page, committed already.
@@ -1553,7 +1639,7 @@ mod tests {
         // still holds its heap: the pages stay locked, and the title's free
         // still lets the heap go first.
         assert!(run_for(at, len, true).is_none());
-        assert!(wait_pending(None));
+        assert!(wait_pending(WORKER_WAIT));
         if let Some((run, 0)) = with_runs(|r| holding(&r.open, at, len)) {
             let id = run.id;
             crate::memory::ran_with(key, run);
@@ -1573,6 +1659,7 @@ mod tests {
     /// lets the run go and works; nothing is left open, locked or pinned.
     #[test]
     fn a_title_free_during_an_open_waits_for_it_and_works() {
+        let _one = worker_tests();
         use windows_sys::Win32::System::Memory as mem;
         let len = 4 * PAGE;
         // SAFETY: plain allocation, freed below.
@@ -1580,6 +1667,7 @@ mod tests {
         assert_ne!(at, 0);
         // Reported, as the runtime reports the title's private heaps.
         merge(&mut PRIVATE.lock().unwrap(), at, at + len);
+        let _unreport = Unreport(at, len);
         stall::arm(at);
         assert!(run_for(at, len, true).is_none(), "asked of the worker");
         assert!(stall::stopped(), "the open stopped, registered");
@@ -1592,26 +1680,24 @@ mod tests {
         let freed = freer.join().unwrap();
         stall::arm(0);
         assert_ne!(freed, 0, "freed after the open let go");
-        assert!(wait_pending(None));
+        assert!(wait_pending(WORKER_WAIT));
         assert!(with_runs(|r| holding(&r.open, at, len)).is_none(), "nothing open there");
         assert!(!locked(at / PAGE), "nothing locks it");
         assert!(locked_ranges().keys().all(|&(s, _)| s != at), "unregistered");
-        // SAFETY: plain data filled in by the query.
-        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of::<mem::MEMORY_BASIC_INFORMATION>()) };
-        assert_eq!(info.State, mem::MEM_FREE);
+        // The free's own answer says it was freed: a query here could find
+        // the addresses taken again by another test's allocation.
     }
 
     /// The wait for the worker ends when the last asked run is done, woken
     /// rather than polled, and a bounded wait with one left says so.
     #[test]
     fn the_wait_for_the_worker_ends_with_the_last_asked_run() {
+        let _one = worker_tests();
         PRIVATE_PENDING.fetch_add(1, Ordering::Relaxed);
         let asked = Asked(true);
-        assert!(!wait_pending(Some(std::time::Duration::ZERO)), "one left");
+        assert!(!wait_pending(std::time::Duration::ZERO), "one left");
         let done = std::thread::spawn(move || drop(asked));
-        assert!(wait_pending(None));
+        assert!(wait_pending(WORKER_WAIT));
         done.join().unwrap();
     }
 

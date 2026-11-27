@@ -728,7 +728,7 @@ impl Shared {
             })
             .collect();
         let mut asked = false;
-        for run in private.iter().flat_map(|pages| crate::inplace::runs(pages, crate::inplace::CHUNK)) {
+        for run in private.iter().flat_map(|pages| crate::inplace::private_runs(pages)) {
             asked |= crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE, true).is_none();
         }
         if asked {
@@ -744,7 +744,7 @@ impl Shared {
                 .into_iter()
                 .flat_map(|run| crate::inplace::per_view(run, crate::inplace::allocation_end))
                 .map(|run| (run, false));
-            let own = crate::inplace::runs(&private[b], crate::inplace::CHUNK).into_iter().map(|run| (run, true));
+            let own = crate::inplace::private_runs(&private[b]).into_iter().map(|run| (run, true));
             for (run, private) in mapped.chain(own) {
                 let Some((placed, offset)) = crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE, private) else {
                     continue;
