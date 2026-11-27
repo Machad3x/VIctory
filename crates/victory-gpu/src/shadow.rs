@@ -2254,7 +2254,10 @@ static HOMES: Mutex<Homes> = Mutex::new(Homes { copies: Copies::new(), sharing: 
 struct Copies<T> {
     small: BTreeMap<(u64, usize), (u64, T)>,
     big: BTreeMap<(u64, usize), (u64, T)>,
-    /// The longest copy ever kept in each (they stay after it goes).
+    /// The longest copy kept in each: ever, for the short ones (below
+    /// [`BIG_LEN`] whatever goes), and now, for the long ones (worked out
+    /// again when the longest goes), so that one copy gone does not leave
+    /// every lookup scanning as far below.
     small_longest: u64,
     big_longest: u64,
 }
@@ -2281,12 +2284,23 @@ impl<T> Copies<T> {
 
     fn remove(&mut self, at: u64, id: usize) {
         self.small.remove(&(at, id));
-        self.big.remove(&(at, id));
+        if self.big.remove(&(at, id)).is_some_and(|(n, _)| n == self.big_longest) {
+            self.big_shrunk();
+        }
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         self.small.retain(|_, (_, c)| keep(c));
+        let before = self.big.len();
         self.big.retain(|_, (_, c)| keep(c));
+        if self.big.len() != before {
+            self.big_shrunk();
+        }
+    }
+
+    /// The long copies' longest, worked out again (they are few).
+    fn big_shrunk(&mut self) {
+        self.big_longest = self.big.values().map(|&(n, _)| n).max().unwrap_or(0);
     }
 
     /// The copies holding the byte at `own`, as (first byte, id, bytes):
@@ -3272,6 +3286,14 @@ pub(crate) mod tests {
         assert_eq!(c.holding(at).iter().map(|&(_, id, _)| id).collect::<Vec<_>>(), [5, 3, 1]);
         assert_eq!(c.len(), 5);
         assert!(c.get(o, 1).is_some() && c.get(o + 43 * P, 4).is_none());
+        // The long one gone: lookups no longer scan as far below for it.
+        assert_eq!(c.big_longest, 64 * BIG_LEN);
+        c.insert(o + 100 * BIG_LEN, 7, 2 * BIG_LEN, ());
+        c.remove(o, 1);
+        assert_eq!(c.big_longest, 2 * BIG_LEN, "the next longest");
+        assert_eq!(c.holding(at).iter().map(|&(_, id, _)| id).collect::<Vec<_>>(), [5, 3]);
+        c.retain(|_| false);
+        assert_eq!((c.big_longest, c.len()), (0, 0));
     }
 
     /// Stale bits pinned on one thread are released by another: a lock
