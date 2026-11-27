@@ -296,6 +296,19 @@ pub(crate) fn after_retired(then: Box<dyn FnOnce() + Send>) {
     }
 }
 
+/// Runs `then` on the retire thread after the retire in flight, before any
+/// other submission prepares (no submission runs then); gives it back if
+/// none is in flight.
+pub(crate) fn after_retire_in_flight(then: Box<dyn FnOnce() + Send>) -> Result<(), Box<dyn FnOnce() + Send>> {
+    match flight().as_mut() {
+        Some(later) => {
+            later.push(then);
+            Ok(())
+        }
+        None => Err(then),
+    }
+}
+
 /// The retire thread's queue.
 fn retirer() -> &'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>> {
     static TX: OnceLock<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> = OnceLock::new();
@@ -1915,6 +1928,8 @@ impl Host {
         let traced = ticket.0.as_ref().is_some_and(|t| t.traced);
         // The upload list and snapshots go in it, before the lock.
         self.retire(ticket);
+        // Idle, the lock held: runs the title's changes wait for are dropped.
+        crate::memory::serve_drops();
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
@@ -1975,6 +1990,8 @@ impl Host {
             let here = Submitting::enter();
             self.retire(retiring.into_ticket());
             drop(here);
+            // Idle, no submission preparing: as at `execute`'s end.
+            crate::memory::serve_drops();
             then();
             // Work queued behind it, then idle.
             loop {
@@ -2008,8 +2025,11 @@ impl Host {
     pub(crate) fn submit<'h, L: std::ops::Deref<Target = HostList>>(&'h self, submitted: &mut u64, runs: Vec<L>) -> Ticket<'h, L> {
         let given = runs;
         let runs: Vec<&HostList> = given.iter().map(|l| &**l).collect();
+        // What follows clears what lists last ran with: none may be running.
+        debug_assert!(flight().is_none(), "a submission prepared while a retire is in flight");
         // Before anything is prepared: page tables let go of title memory in
-        // place whose views went, if a frame's end could not.
+        // place whose views went, if a frame's end could not, and runs the
+        // title's changes wait for.
         crate::memory::drop_dead_runs_put_off();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]

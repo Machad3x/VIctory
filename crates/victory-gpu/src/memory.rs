@@ -314,33 +314,38 @@ pub(crate) fn want(regions: &[usize]) {
 /// of and none holds whole. A page table gives such a page to one copy
 /// ([`table`]), and the bytes of the others there read 0 and drop writes
 /// with no miss marked.
-fn split_pages(copies: &[(u64, u64)]) -> u64 {
-    let mut by_start: Vec<(u64, u64)> = copies.iter().filter(|c| c.1 != 0).map(|&(s, n)| (s, s + n)).collect();
+/// `ranges` as the table names them (copies and the addresses buffers
+/// sharing a copy name it from, `of` the copy each is): pages held in part
+/// by ranges of two or more copies and whole by none.
+fn split_pages(ranges: &[(u64, u64)], of: &[usize]) -> u64 {
+    let mut by_start: Vec<(u64, u64, usize)> =
+        ranges.iter().zip(of).filter(|(c, _)| c.1 != 0).map(|(&(s, n), &k)| (s, s + n, k)).collect();
     by_start.sort_unstable();
-    // The furthest end among the copies starting at or before each.
+    // The furthest end among the ranges starting at or before each.
     let mut reach = Vec::with_capacity(by_start.len());
     let mut far = 0;
-    for &(_, end) in &by_start {
+    for &(_, end, _) in &by_start {
         far = far.max(end);
         reach.push(far);
     }
-    // Only a copy's first and last page can be held in part.
-    let mut parts: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
-    for &(start, end) in &by_start {
+    // Only a range's first and last page can be held in part.
+    let mut parts: std::collections::BTreeMap<u64, Vec<usize>> = std::collections::BTreeMap::new();
+    for &(start, end, k) in &by_start {
         let (first, last) = (start >> 16, (end - 1) >> 16);
         if start & 0xFFFF != 0 || end < (first + 1) << 16 {
-            *parts.entry(first).or_default() += 1;
+            parts.entry(first).or_default().push(k);
         }
         if last != first && end & 0xFFFF != 0 {
-            *parts.entry(last).or_default() += 1;
+            parts.entry(last).or_default().push(k);
         }
     }
     parts
         .into_iter()
-        .filter(|&(page, n)| {
-            // Whole in some copy: one starting at or before it reaches its end.
-            let before = by_start.partition_point(|&(s, _)| s <= page << 16);
-            n >= 2 && !(before > 0 && reach[before - 1] >= (page + 1) << 16)
+        .filter(|(page, owners)| {
+            // Whole in some range: one starting at or before it reaches its end.
+            let before = by_start.partition_point(|&(s, ..)| s <= page << 16);
+            let copies = owners.iter().collect::<std::collections::BTreeSet<_>>().len();
+            copies >= 2 && !(before > 0 && reach[before - 1] >= (page + 1) << 16)
         })
         .count() as u64
 }
@@ -673,15 +678,6 @@ impl Shared {
         let wanted: Vec<usize> = if counting() { wanted().iter().copied().collect() } else { Vec::new() };
         self.wanted = wanted.len();
         let mut weak: Vec<bool> = named.iter().map(|c| c.demanded()).collect();
-        if counting() {
-            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let split = split_pages(&ranges);
-            if LAST.swap(split, std::sync::atomic::Ordering::Relaxed) != split {
-                tracing::info!(
-                    "title memory page table: {split} pages held in part by two or more copies and whole by none: the bytes of all but one read 0 with no miss"
-                );
-            }
-        }
         let mut starts: Vec<u32> = ranges.iter().map(|r| r.0 as u32).collect();
         // The addresses of buffers that share a copy name it too: the
         // same pair, read from where the copy would start for them.
@@ -693,6 +689,17 @@ impl Shared {
                 slots.push(slots[k]);
                 weak.push(weak[k]);
                 of.push(k);
+            }
+        }
+        // Counted on every range the table names, shared ones too: a page
+        // split between a shared range and another copy reads 0 on one side.
+        if counting() {
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let split = split_pages(&ranges, &of);
+            if LAST.swap(split, std::sync::atomic::Ordering::Relaxed) != split {
+                tracing::info!(
+                    "title memory page table: {split} pages held in part by two or more copies and whole by none: the bytes of all but one read 0 with no miss"
+                );
             }
         }
         let (mut dwords, blocks, owner) = table_at(&ranges, &starts, &slots, self.null, &wanted, &weak);
@@ -867,10 +874,12 @@ impl Shared {
 
 /// The page tables drop the runs `dead` names now, so that their heaps go
 /// and the title can change the memory under them
-/// (`crate::inplace::release_private`): once no submission runs, waited
-/// for up to 2 s (a thread that is itself submitting never gets there, and
-/// the tables drop them at their next rewrite instead). False if they
-/// still name one.
+/// (`crate::inplace::release_private`): at once when no submission runs,
+/// else asked of the submission under way, which drops them once idle (at
+/// its retire, or the next submission's start), and waited for, blocked,
+/// not spinning. False only on a thread that is itself submitting (it
+/// would wait for itself: the tables drop them at their next rewrite), or
+/// past [`DROP_MOST`].
 pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     // The tables, and the layouts their lists last ran with ([`RAN`]): a
     // table rewritten since no longer names a run its lists ran with, and
@@ -880,33 +889,75 @@ pub(crate) fn drop_runs_wait(dead: &[u64]) -> bool {
     let Some(host) = crate::host::host() else {
         return true;
     };
+    // What lists ran with is dropped on this thread, the title's: the runs'
+    // heaps go before its change is tried.
+    if !named() || host.between_submissions(|| drop(drop_runs_taking(dead))).is_some() {
+        return true;
+    }
+    if crate::host::submitting_here() {
+        return false;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    DROPS.lock().unwrap_or_else(|e| e.into_inner()).push((dead.to_vec(), tx));
+    // A retire in flight serves it before the next submission prepares.
+    let _ = crate::host::after_retire_in_flight(Box::new(serve_drops));
     let started = std::time::Instant::now();
-    while named() {
-        let dropped = host.between_submissions(|| {
-            for (_, s) in shared().iter_mut() {
-                s.drop_runs(dead);
-            }
-            // What lists ran with: all of them ran.
-            with_ran(|m| m.clear());
-        });
-        if dropped.is_some() {
+    loop {
+        // What the server took from the lists' layouts: dropped here.
+        if let Ok(ran) = rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            drop(ran);
             return true;
         }
-        // Layouts of tables that are gone (their heap released): no list
-        // of theirs is left to read its marks against them.
-        let live: Vec<usize> = shared().iter().map(|(k, _)| *k).collect();
-        with_ran(|m| m.retain(|key, l| live.contains(key) || !names(l)));
-        if started.elapsed() > std::time::Duration::from_secs(2) {
+        // No submission came to serve it: nothing runs now, maybe.
+        if host.between_submissions(serve_drops).is_some()
+            && let Ok(ran) = rx.try_recv()
+        {
+            drop(ran);
+            return true;
+        }
+        if started.elapsed() > DROP_MOST {
+            tracing::warn!(?dead, "page tables did not drop runs over title memory in time");
             return false;
         }
-        std::thread::yield_now();
     }
-    true
+}
+
+/// The longest a change of the title's waits for the tables to drop runs:
+/// a submission's retire, never seconds unless the GPU hangs.
+const DROP_MOST: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What lists last ran with, as taken from [`RAN`].
+type Ran = fx::Map<usize, Arc<Layout>>;
+
+/// Runs the title's changes wait for ([`drop_runs_wait`]), and who waits.
+type Asked = Vec<(Vec<u64>, std::sync::mpsc::Sender<Ran>)>;
+static DROPS: Mutex<Asked> = Mutex::new(Vec::new());
+
+/// With no submission running or preparing (a retire's end, a submission's
+/// start): drops the runs asked of the tables, and tells who waits, handing
+/// it what the lists ran with to drop on its own thread (the runs' heaps go
+/// with it, not on this one).
+pub(crate) fn serve_drops() {
+    let asked = std::mem::take(&mut *DROPS.lock().unwrap_or_else(|e| e.into_inner()));
+    if asked.is_empty() {
+        return;
+    }
+    let dead: Vec<u64> = asked.iter().flat_map(|(d, _)| d.iter().copied()).collect();
+    let mut ran = Some(drop_runs_taking(&dead));
+    for (_, waiting) in asked {
+        if let Err(left) = waiting.send(ran.take().unwrap_or_default()) {
+            // Gone (past its wait): released off this thread.
+            crate::host::release_later(Box::new(left.0));
+        }
+    }
 }
 
 /// At a frame's end, with the backstop on: the page tables drop the runs
 /// over views the runtime let go, with no submission running, so that
-/// those views can be unmapped ([`crate::inplace::settle`]).
+/// those views can be unmapped ([`crate::inplace::settle`]). With a retire
+/// in flight (`VICTORY_PIPELINE`, most frame ends) they are dropped after it
+/// on the retire thread and unmapped at the next frame's end: one frame
+/// late, counted in [`crate::inplace`]'s frame line as views kept mapped.
 fn drop_dead_runs() {
     if !crate::inplace::backstop() {
         return;
@@ -915,9 +966,10 @@ fn drop_dead_runs() {
     if !dead.is_empty()
         && let Some(host) = crate::host::host()
         && host.between_submissions(|| drop_runs_now(&dead)).is_none()
+        && crate::host::after_retire_in_flight(Box::new(move || drop_runs_now(&dead))).is_err()
     {
-        // A submission under way: the next one drops them before it
-        // prepares anything ([`drop_dead_runs_put_off`]).
+        // A submission under way and no retire in flight: the next one
+        // drops them before it prepares anything ([`drop_dead_runs_put_off`]).
         DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     crate::inplace::settle();
@@ -929,27 +981,33 @@ static DROP_PUT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// At a submission's start, holding the submission lock (none runs, none
 /// prepared yet): the dead runs a frame's end put off are dropped, so that
 /// their views are unmapped at the next frame's end whatever submissions
-/// overlap frame ends.
+/// overlap frame ends; and the runs the title's changes wait for.
 pub(crate) fn drop_dead_runs_put_off() {
     if DROP_PUT_OFF.swap(false, std::sync::atomic::Ordering::Relaxed) {
         drop_runs_now(&crate::inplace::dead());
     }
+    serve_drops();
 }
 
 /// [`Shared::drop_runs`] for every table; with no submission running.
 fn drop_runs_now(dead: &[u64]) {
+    // Released off this thread: a layout may hold copies' last references.
+    let ran = drop_runs_taking(dead);
+    if !ran.is_empty() {
+        crate::host::release_later(Box::new(ran));
+    }
+}
+
+/// [`drop_runs_now`], what lists ran with given back to be dropped.
+fn drop_runs_taking(dead: &[u64]) -> Ran {
     if dead.is_empty() {
-        return;
+        return Ran::default();
     }
     for (_, s) in shared().iter_mut() {
         s.drop_runs(dead);
     }
-    // What lists ran with: all of them ran. Released off this thread: a
-    // layout may hold copies' last references.
-    let ran = with_ran(std::mem::take);
-    if !ran.is_empty() {
-        crate::host::release_later(Box::new(ran));
-    }
+    // What lists ran with: all of them ran.
+    with_ran(std::mem::take)
 }
 
 /// The layout each view heap's lists last ran with ([`prepare`]): what
@@ -1524,9 +1582,35 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 
 #[cfg(test)]
 mod split_tests {
-    use super::split_pages;
-
     const K64: u64 = 64 << 10;
+
+    /// Each range its own copy.
+    fn split_pages(ranges: &[(u64, u64)]) -> u64 {
+        super::split_pages(ranges, &(0..ranges.len()).collect::<Vec<_>>())
+    }
+
+    /// Runs a title's change waits for are dropped where no submission runs
+    /// ([`super::serve_drops`]: a retire's end, a submission's start) and
+    /// whoever waits is told, blocked on a channel, not spinning.
+    #[test]
+    fn asked_drops_are_served_and_told() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        super::DROPS.lock().unwrap().push((vec![u64::MAX - 7], tx));
+        super::serve_drops();
+        assert!(rx.try_recv().is_ok());
+        assert!(super::DROPS.lock().unwrap().is_empty());
+        super::serve_drops(); // nothing asked: nothing done
+    }
+
+    /// A shared range (another buffer's address of a copy) splitting a page
+    /// with another copy counts; with its own copy, it does not.
+    #[test]
+    fn shared_ranges_split_pages_too() {
+        let a = (K64, 2 * K64 + 0x1000);
+        let shared = (3 * K64 + 0x1000, K64);
+        assert_eq!(super::split_pages(&[a, (8 * K64, K64), shared], &[0, 1, 1]), 1);
+        assert_eq!(super::split_pages(&[a, shared], &[0, 0]), 0, "one copy");
+    }
 
     /// A page two copies each hold part of is counted; not one that a
     /// third copy holds whole, nor a page only one copy ends in.
