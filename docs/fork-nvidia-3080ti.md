@@ -1228,7 +1228,15 @@ unmapping, and a commit with another protection fail with
   last ran with, once no submission runs (waited for up to 2 s).
 - The backstop opens only views of ours. Private runs are the one exception:
   asked as such, wholly in private memory the runtime reported, committed
-  read-write throughout. Anything else is refused.
+  read-write throughout, within one allocation (a range across two was
+  refused by the host with `E_INVALIDARG`, `gpu308`). Anything else is
+  refused. The check runs again once the run is registered and once its heap
+  is open.
+- The builder's dispatches are never held back. A builder dispatch first
+  waits for every pipeline the builder has created, queued ahead of all
+  others, up to 20 s a frame. Holding them back while pipelines were still
+  being made left a cross-queue wait after them unmet, and the title's 30 s
+  watchdog ended the run (`gpu307`, `gpu308`).
 - A run is locked and registered before its heap is opened. A change of the
   title's that comes during the open waits for it to end, then lets the run
   go (a test stops an open there and frees the memory every time). A change
