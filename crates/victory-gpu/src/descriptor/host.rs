@@ -66,6 +66,82 @@ pub(crate) struct HostHeap {
     /// Prep study: a bit per slot found stale at its last heap sync.
     #[cfg(feature = "diagnostics")]
     stale_seen: Mutex<Vec<u64>>,
+    /// View heaps: the title slots by the record they hold ([`Canon`]),
+    /// where something reads it; taken inside `made`, never the other way.
+    canon: Option<Mutex<Canon>>,
+}
+
+/// Title slots of a view heap by the record (view entry and generation)
+/// each was made from, kept where slots copy or share descriptors and in
+/// diagnostics builds: the title copies records as bytes (rings, tables), so
+/// many slots hold the same view, and one slot made from each record is
+/// enough to make or show the others.
+#[derive(Default)]
+struct Canon {
+    keys: std::collections::HashMap<u64, Entry>,
+}
+
+/// A record held by title slots ([`Canon`]).
+#[derive(Clone, Copy)]
+struct Entry {
+    /// The slot made from it that others copy or share; [`NONE`] for none.
+    slot: u32,
+    /// The slots holding it.
+    holders: u32,
+    /// The view-mark entry and the skip the slot was made with.
+    mark: Option<(u32, u32)>,
+    skip: u32,
+}
+
+/// No slot.
+const NONE: u32 = u32::MAX;
+
+impl Canon {
+    /// Slot `index` holds record `key` now (0: none) instead of `old`.
+    fn moved(&mut self, index: u32, old: u64, key: u64) {
+        if old == key {
+            return;
+        }
+        if old != 0
+            && let Some(e) = self.keys.get_mut(&old)
+        {
+            e.holders = e.holders.saturating_sub(1);
+            if e.slot == index {
+                e.slot = NONE;
+            }
+            if e.holders == 0 {
+                self.keys.remove(&old);
+            }
+        }
+        if key != 0 {
+            let e = self.keys.entry(key).or_insert(Entry { slot: NONE, holders: 0, mark: None, skip: 0 });
+            e.holders += 1;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = self.keys.len() as u64;
+            crate::copystat::DESC_KEYS.store(n, Relaxed);
+            crate::copystat::DESC_KEYS_PEAK.fetch_max(n, Relaxed);
+        }
+    }
+
+    /// The slot other than `index` made from `key` that slots holding it
+    /// may copy or share, if one is (`made`: the slots' records).
+    fn other(&self, made: &[u64], index: u32, key: u64) -> Option<u32> {
+        let slot = self.keys.get(&key)?.slot;
+        (slot != NONE && slot != index && made.get(slot as usize) == Some(&key)).then_some(slot)
+    }
+
+    /// Slot `index` was made from `key` with view-mark entry `mark` and
+    /// skip `skip`: the record's slot if it has none yet.
+    fn made(&mut self, index: u32, key: u64, mark: Option<(u32, u32)>, skip: u32) {
+        if let Some(e) = self.keys.get_mut(&key)
+            && (e.slot == NONE || e.slot == index)
+        {
+            (e.slot, e.mark, e.skip) = (index, mark, skip);
+        }
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -221,6 +297,7 @@ impl HostHeap {
             viewed: Default::default(),
             #[cfg(feature = "diagnostics")]
             stale_seen: Default::default(),
+            canon: (!sampler && cfg!(feature = "diagnostics")).then(Default::default),
         };
         if !sampler {
             crate::bindless::register(&h.viewed);
@@ -905,6 +982,9 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
+                if let Some(canon) = &self.canon {
+                    canon.lock().unwrap_or_else(|e| e.into_inner()).moved(index, made[index as usize], 0);
+                }
                 made[index as usize] = 0;
                 self.make_null(index);
                 self.note_address(index, None);
@@ -1008,7 +1088,20 @@ impl HostHeap {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
             }
-            made[index as usize] = key;
+            let old = std::mem::replace(&mut made[index as usize], key);
+            let mut canon = self.canon.as_ref().map(|c| c.lock().unwrap_or_else(|e| e.into_inner()));
+            if let Some(canon) = canon.as_deref_mut() {
+                canon.moved(index, old, key);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(
+                    if canon.other(&made, index, key).is_some() {
+                        crate::copystat::C::DescKeyHit
+                    } else {
+                        crate::copystat::C::DescKeyMiss
+                    },
+                    1,
+                );
+            }
             #[cfg(feature = "diagnostics")]
             let making = crate::copystat::TimedNs(std::time::Instant::now(), crate::copystat::C::MirrorMakeNs);
             let (kept, mark, skip) = if later {
@@ -1021,6 +1114,10 @@ impl HostHeap {
                 drop(making);
                 crate::copystat::add(crate::copystat::C::MirrorMade, 1);
             }
+            if let Some(canon) = canon.as_deref_mut() {
+                canon.made(index, key, mark, skip);
+            }
+            drop(canon);
             self.set_stride(index, Some(&view), skip);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {

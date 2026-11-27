@@ -257,6 +257,28 @@ pub(crate) enum C {
     /// Nanoseconds threads waited for a copy's stale page lock another
     /// held (a riding pull holds them over its submission's wait).
     StaleLockWaitNs,
+    /// Sampler heap slots heap syncs looked at (of `SyncSlots`).
+    SyncSamplerSlots,
+    /// View slots made from a record another live slot was already made
+    /// from (its descriptor could be copied or shared), and from a record
+    /// no other slot holds.
+    DescKeyHit,
+    DescKeyMiss,
+    /// Slots whose descriptor was copied from another slot of the same
+    /// record (`VICTORY_DESC_CACHE`).
+    DescCopied,
+    /// `VICTORY_DESC_MAP`: slots that took another slot's descriptor through
+    /// the slot map, and slots made to stand in for a slot others shared
+    /// when its record changed.
+    DescShared,
+    DescPromoted,
+    /// `VICTORY_DESC_MAP=check`: slots made from a record another slot holds
+    /// that view the same host resource as that slot, and that view another.
+    DescCheckSame,
+    DescCheckDiffer,
+    /// Indirect clamps after a title barrier group ordering indirect
+    /// arguments (access or sync) with no shader write recorded since.
+    ClampsArgsOrdered,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -273,6 +295,13 @@ pub(crate) static HANDLER_OPEN_MAX: AtomicU64 = AtomicU64::new(0);
 /// The longest wait of a title descriptor write for the shader-visible
 /// heaps' lock since the last line, nanoseconds.
 pub(crate) static MIRROR_WAIT_MAX: AtomicU64 = AtomicU64::new(0);
+/// Distinct records (view entry and generation) held by the slots of the
+/// view heap that changed last, and the most seen; slots sharing another's
+/// descriptor now (`VICTORY_DESC_MAP`).
+// shortcut: one gauge for every view heap (the title has one large one).
+pub(crate) static DESC_KEYS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DESC_KEYS_PEAK: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DESC_SHARING: AtomicU64 = AtomicU64::new(0);
 
 /// Nanoseconds since the first call.
 fn epoch_ns() -> u64 {
@@ -618,11 +647,26 @@ pub(crate) fn log(frames: f64) {
     );
     if c[C::SyncChanged as usize] != 0.0 {
         tracing::info!(
-            "  heap sync per frame: {:.0} slots mirrored of {:.0} looked at",
+            "  heap sync per frame: {:.0} slots mirrored of {:.0} looked at ({:.0} sampler slots)",
             c[C::SyncChanged as usize],
             c[C::SyncSlots as usize],
+            c[C::SyncSamplerSlots as usize],
         );
     }
+    tracing::info!(
+        "  view slots by record per frame: {:.0} made from a record another slot holds, {:.0} from one no other holds; {:.0} copied, {:.0} shared, {:.0} stand-ins; check {:.0} same, {:.0} other; records held now {}, most {}; sharing now {}; clamps after an argument barrier {:.0}",
+        c[C::DescKeyHit as usize],
+        c[C::DescKeyMiss as usize],
+        c[C::DescCopied as usize],
+        c[C::DescShared as usize],
+        c[C::DescPromoted as usize],
+        c[C::DescCheckSame as usize],
+        c[C::DescCheckDiffer as usize],
+        DESC_KEYS.load(Relaxed),
+        DESC_KEYS_PEAK.load(Relaxed),
+        DESC_SHARING.load(Relaxed),
+        c[C::ClampsArgsOrdered as usize],
+    );
     tracing::info!(
         "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans; {:.0} pulls run under their submission's wait; {:.2} ms waited on stale page locks",
         ms(c[C::MarkedPullUs as usize]),

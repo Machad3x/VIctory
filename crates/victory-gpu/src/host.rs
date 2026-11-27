@@ -1402,6 +1402,10 @@ struct Deferred {
     /// An indirect clamp was recorded and no shader write since.
     #[cfg(feature = "diagnostics")]
     clamp_clean: bool,
+    /// A title barrier group ordering indirect arguments was recorded and
+    /// no shader write since.
+    #[cfg(feature = "diagnostics")]
+    args_ordered: bool,
     /// Work done once the list has run, before the bottom-of-pipe writes
     /// (title memory shaders wrote at addresses they computed goes back).
     after: Vec<Box<dyn Fn() + Send>>,
@@ -2840,7 +2844,15 @@ impl HostList {
     /// A draw or dispatch that may write through views is being recorded.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_shader_write(&self) {
-        self.deferred().clamp_clean = false;
+        let mut deferred = self.deferred();
+        deferred.clamp_clean = false;
+        deferred.args_ordered = false;
+    }
+
+    /// A title barrier group ordering indirect arguments is being recorded.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_args_barrier(&self) {
+        self.deferred().args_ordered = true;
     }
 
     /// An indirect clamp is being recorded.
@@ -2848,8 +2860,13 @@ impl HostList {
     pub(crate) fn note_clamp(&self) {
         use crate::copystat::{C, add};
         add(C::Clamps, 1);
-        if std::mem::replace(&mut self.deferred().clamp_clean, true) {
+        let mut deferred = self.deferred();
+        if std::mem::replace(&mut deferred.clamp_clean, true) {
             add(C::ClampsNoWrite, 1);
+        }
+        // Left set: the clamp writes no title data the next one reads.
+        if deferred.args_ordered {
+            add(C::ClampsArgsOrdered, 1);
         }
     }
 
