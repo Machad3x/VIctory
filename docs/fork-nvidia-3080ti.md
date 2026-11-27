@@ -1226,11 +1226,20 @@ unmapping, and a commit with another protection fail with
   the title names run first and let go only if refused as locked.
 - Letting go drops the run from the page tables and from the layouts lists
   last ran with, once no submission runs (waited for up to 2 s).
+- A run is locked and registered before its heap is opened. A change of the
+  title's that comes during the open waits for it to end, then lets the run
+  go.
 - A tracker made over such memory lets the runs there go without waiting. A
-  page a live run still locks gets no guard and stays changed.
+  page a live run still locks gets no guard and stays changed. The run stays
+  registered until its heap is gone, so the title's `VirtualFree` there
+  still drops it from the tables first.
 - Runs are opened on a worker thread when the runtime reports the memory
-  (`XMemVirtualAlloc`, or a miss in committed private memory). A page table
-  that still finds one pending waits, at most 100 ms a frame for all tables.
+  (`XMemVirtualAlloc`, or a miss in committed private memory not reported
+  yet). A page table that still finds one pending waits, at most 100 ms a
+  frame for all tables.
+- A miss in memory reported already costs one lookup. It rewrites the page
+  tables at most once a frame. What the host refused stays refused until the
+  title commits there again (`XMemVirtualAlloc` or its own `VirtualAlloc`).
 - Debug builds assert the lock order: the guard lock is never taken while
   holding the locked ranges, and the opening thread never takes the page
   tables' lock.
