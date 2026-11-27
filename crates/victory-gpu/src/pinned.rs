@@ -149,6 +149,10 @@ pub fn title_memory_held() -> bool {
 /// the runtime's unmapping of physical pages): whatever holds part of the
 /// range in place lets it go first. `change`'s answer, with its last error.
 pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
+    // One deadline for the whole settle, its releases included (a release
+    // may wait for a submission's retire): the loop below looks no more
+    // once it has passed.
+    let start = Instant::now();
     let released = release(at, len);
     let mut worked = change();
     if worked != 0 {
@@ -173,7 +177,6 @@ pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i3
             return worked;
         }
     }
-    let start = Instant::now();
     let mut tries = 1;
     // SAFETY: plain reads of this thread's last error.
     while unsafe { GetLastError() } == ERROR_INVALID_PARAMETER && start.elapsed() < SETTLE {
@@ -244,12 +247,19 @@ pub fn title_memory_change_from(at: usize, len: impl FnOnce() -> usize, mut chan
 }
 
 /// Whether a holder forgot a pin overlapping `[at, at + len)` within
-/// [`SETTLE`]: its heap may still lock the pages.
+/// [`UNLOCK`]: its heap may still lock the pages, and a refusal is ours.
+/// Past it the refusal is the title's own (bad flags or size): not tried
+/// again (it was for [`SETTLE`], 100 ms, before).
 fn let_go_lately(at: usize, len: usize) -> bool {
     let end = at.saturating_add(len);
     let now = Instant::now();
-    pins().let_go.iter().any(|&(s, e, when)| s < end && e > at && now.duration_since(when) < SETTLE)
+    pins().let_go.iter().any(|&(s, e, when)| s < end && e > at && now.duration_since(when) < UNLOCK)
 }
+
+/// How long the system may keep pages locked after a holder lets go: its
+/// heap goes right after (`Pin::forget`), and released pages were unlocked
+/// within 5.9 ms at the slowest (RTX 5070 Ti).
+const UNLOCK: Duration = Duration::from_millis(20);
 
 /// Lets every holder of part of `[at, at + len)` go, after waiting for
 /// other threads' releases there to return; how many holders there were,
