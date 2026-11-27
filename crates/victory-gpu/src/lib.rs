@@ -48,6 +48,7 @@ mod lightlog;
 pub mod list;
 #[cfg(windows)]
 mod memory;
+mod memsys;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

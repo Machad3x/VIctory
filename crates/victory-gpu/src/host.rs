@@ -2897,6 +2897,8 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
+        crate::memsys::add(crate::memsys::N::ListUploads, 1);
+        crate::memsys::add(crate::memsys::N::ListUploadBytes, size);
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
@@ -2906,6 +2908,8 @@ impl HostList {
     /// reset.
     pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.mapped_buffer(size, true)?;
+        crate::memsys::add(crate::memsys::N::ListReadbacks, 1);
+        crate::memsys::add(crate::memsys::N::ListReadbackBytes, size);
         name(&buffer, || format!("list readback {size:#x}"));
         self.deferred().uploads.push(buffer.clone());
         Some((buffer, data))
@@ -3642,7 +3646,9 @@ impl Host {
                 &mut buffer,
             )
         };
-        made.ok().and(buffer)
+        let buffer = made.ok().and(buffer)?;
+        crate::memsys::made(crate::memsys::Class::Vram, size);
+        Some(buffer)
     }
 
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -3688,7 +3694,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                use crate::memsys::Class;
+                crate::memsys::made(if readback { Class::Readback } else { Class::Upload }, size);
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, readback, "no mapped buffer");
                 None
@@ -3765,7 +3775,12 @@ impl Host {
             )
         };
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                use crate::memsys::Class;
+                let class = if heap.Type == D3D12_HEAP_TYPE_READBACK { Class::Readback } else { Class::Vram };
+                crate::memsys::made(class, size);
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, heap = heap.Type.0, "no buffer");
                 None
@@ -5071,7 +5086,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                use crate::memsys::Class;
+                crate::memsys::made(if upload { Class::Bar } else { Class::Shared }, size);
+                Some((buffer?, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, upload, "no shared buffer");
                 None

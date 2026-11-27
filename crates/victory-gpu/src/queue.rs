@@ -534,6 +534,7 @@ extern "system" fn present(
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
+    crate::memsys::frame(frame);
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
     if frame.is_power_of_two() {
