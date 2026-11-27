@@ -646,6 +646,15 @@ impl Shadow {
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
+    /// The offset in the copy's buffer in video memory of the title page
+    /// at `page`, for a mirrored copy that holds all of the page (at a
+    /// dword, as a shader's root view needs).
+    pub(crate) fn video_page(&self, page: usize) -> Option<u64> {
+        self.vram.as_ref()?;
+        let (from, to) = self.inside(page, PAGE);
+        (to == from + PAGE && from.is_multiple_of(4)).then_some(from as u64)
+    }
+
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
@@ -1670,16 +1679,6 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     let held_by: std::collections::HashSet<(usize, usize)> =
         held.iter().map(|(copy, page)| (Arc::as_ptr(copy) as usize, *page)).collect();
     let pages: Vec<(Arc<Shadow>, usize)> = pages_of(marked);
-    #[cfg(feature = "diagnostics")]
-    let pulling = std::time::Instant::now();
-    pull(
-        &pages
-            .iter()
-            .map(|(copy, page)| (copy.clone(), *page, PAGE))
-            .collect::<Vec<_>>(),
-    );
-    #[cfg(feature = "diagnostics")]
-    let pulled = pulling.elapsed().as_micros() as u64;
     // What does not go back: a copy's page held back, or in a range of the
     // copy withheld.
     let kept = |copy: &Arc<Shadow>, page: usize| {
@@ -1688,6 +1687,30 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
                 .iter()
                 .any(|(c, a, n)| Arc::ptr_eq(c, copy) && *a < page + PAGE && page < a + n)
     };
+    // Pages that hold what they held when they last went back
+    // (`crate::memsys::diff`, compared on the GPU; none with it off):
+    // nothing of them needs to come back. While verifying they go the
+    // old way all the same, apart, to see whether any writes bytes.
+    let same = crate::memsys::diff::unchanged(&pages, |copy, page| !kept(copy, page));
+    let skipping = crate::memsys::diff::mode() == crate::memsys::diff::Mode::On;
+    let same: std::collections::HashSet<(usize, usize)> = pages
+        .iter()
+        .zip(&same)
+        .filter(|&(_, &same)| same)
+        .map(|((copy, page), _)| (Arc::as_ptr(copy) as usize, *page))
+        .collect();
+    let is_same = |copy: &Arc<Shadow>, page: usize| same.contains(&(Arc::as_ptr(copy) as usize, page));
+    #[cfg(feature = "diagnostics")]
+    let pulling = std::time::Instant::now();
+    pull(
+        &pages
+            .iter()
+            .filter(|(copy, page)| !(skipping && is_same(copy, *page)))
+            .map(|(copy, page)| (copy.clone(), *page, PAGE))
+            .collect::<Vec<_>>(),
+    );
+    #[cfg(feature = "diagnostics")]
+    let pulled = pulling.elapsed().as_micros() as u64;
     let mut dropped: Vec<usize> = held
         .iter()
         .chain(pages.iter().filter(|(copy, page)| kept(copy, *page)))
@@ -1698,8 +1721,18 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     #[cfg(feature = "diagnostics")]
     let backing = std::time::Instant::now();
     for_each_by_page(pages, |copy, run| {
-        let run: Vec<usize> = run.iter().copied().filter(|&page| !kept(copy, page)).collect();
-        let written = copy.copy_back_run(&run);
+        let (equal, run): (Vec<usize>, Vec<usize>) =
+            run.iter().copied().filter(|&page| !kept(copy, page)).partition(|&page| is_same(copy, page));
+        let mut written = copy.copy_back_run(&run);
+        if !skipping {
+            for page in equal {
+                let lost = copy.copy_back_run(&[page]);
+                if lost > 0 {
+                    crate::memsys::add(crate::memsys::N::DiffLost, 1);
+                }
+                written += lost;
+            }
+        }
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, run.len() as u64);

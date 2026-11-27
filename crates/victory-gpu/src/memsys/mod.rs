@@ -17,6 +17,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(windows)]
+pub(crate) mod diff;
 pub(crate) mod dirty;
 pub(crate) mod gate;
 #[cfg(windows)]
@@ -173,9 +175,22 @@ pub(crate) enum N {
     PooledBytes,
     /// Buffers a pool had no room for (made committed).
     PoolFull,
+    /// Marked pages a submission handed to the compare with twins
+    /// (`diff`), those that had a twin to compare with, and those equal
+    /// to it: not pulled or copied back.
+    DiffPages,
+    DiffCompared,
+    DiffSame,
+    /// Blocks of 256 bytes that differed in the pages compared.
+    DiffBlocks,
+    /// Pages equal to their twins that wrote bytes to title memory all
+    /// the same (counted while verifying only): skipped, they were lost.
+    DiffLost,
+    /// Microseconds in the compare's list, its wait included.
+    DiffUs,
 }
 
-const NS: usize = 7;
+const NS: usize = 13;
 /// Per class a count and bytes, then the [`N`]s.
 const TOTAL: usize = 2 * Class::COUNT + NS;
 
@@ -222,7 +237,9 @@ pub(crate) fn frame(frame: u64) {
         on = on(),
         "memory system per frame over the last {EVERY} (count, MiB): committed buffers made in video memory \
          {:.2?}, BAR {:.2?}, upload {:.2?}, read-back {:.2?}, shared {:.2?}; list uploads {:.2} {:.2}, list \
-         read-backs {:.2} {:.2}; pooled {:.2} {:.2}, no room in a pool {:.2}",
+         read-backs {:.2} {:.2}; pooled {:.2} {:.2}, no room in a pool {:.2}; marked pages {:.1}, compared with a twin {:.1}, \
+         equal to it {:.1}, of them written to title memory all the same {:.2}, blocks of 256 bytes that differed \
+         {:.1}, in the compare {:.2} ms",
         class(Class::Vram),
         class(Class::Bar),
         class(Class::Upload),
@@ -235,6 +252,12 @@ pub(crate) fn frame(frame: u64) {
         n(N::Pooled),
         n(N::PooledBytes) / MIB,
         n(N::PoolFull),
+        n(N::DiffPages),
+        n(N::DiffCompared),
+        n(N::DiffSame),
+        n(N::DiffLost),
+        n(N::DiffBlocks),
+        n(N::DiffUs) / 1e3,
     );
 }
 
@@ -288,7 +311,8 @@ mod tests {
         // pool may be full meanwhile only with the pools switched on.
         assert_eq!(after[2 * Class::InPlace as usize] - before[2 * Class::InPlace as usize], 1);
         assert_eq!(after[2 * Class::InPlace as usize + 1] - before[2 * Class::InPlace as usize + 1], 7);
-        assert!(after[TOTAL - 1] - before[TOTAL - 1] >= 5);
-        assert_eq!(N::PoolFull as usize, NS - 1, "NS counts every N");
+        let full = 2 * Class::COUNT + N::PoolFull as usize;
+        assert!(after[full] - before[full] >= 5);
+        assert_eq!(N::DiffUs as usize, NS - 1, "NS counts every N");
     }
 }
