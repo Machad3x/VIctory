@@ -880,6 +880,28 @@ pub(crate) mod tests {
         super::host().map(|h| h.lock_idle())
     }
 
+    /// Work between submissions is put off while one runs, also when the
+    /// thread asking holds the lock itself: never a deadlock.
+    #[test]
+    fn work_between_submissions_waits_for_none() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let held = no_submissions();
+        assert!(host.between_submissions(|| ()).is_none(), "put off, not waited for");
+        drop(held);
+        // Other tests may be submitting meanwhile.
+        let mut got = None;
+        for _ in 0..2000 {
+            got = host.between_submissions(|| 7);
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(got, Some(7));
+    }
+
     thread_local! {
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
@@ -1856,6 +1878,23 @@ impl Host {
         }
     }
 
+    /// Runs `f` with no submission running, and none starting meanwhile;
+    /// None, without running it, if a submission is under way (on this
+    /// thread too: the lock is not reentrant, so it is never waited for),
+    /// for the caller to try again later.
+    pub(crate) fn between_submissions<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let _one = match self.submitted.try_lock() {
+            Ok(one) => one,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        // A retire in flight: its lists may still run on the GPU.
+        if flight().is_some() {
+            return None;
+        }
+        Some(f())
+    }
+
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
@@ -1953,6 +1992,9 @@ impl Host {
     pub(crate) fn submit<'h, L: std::ops::Deref<Target = HostList>>(&'h self, submitted: &mut u64, runs: Vec<L>) -> Ticket<'h, L> {
         let given = runs;
         let runs: Vec<&HostList> = given.iter().map(|l| &**l).collect();
+        // Before anything is prepared: page tables let go of title memory in
+        // place whose views went, if a frame's end could not.
+        crate::memory::drop_dead_runs_put_off();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -2476,12 +2518,15 @@ impl Host {
                 r.pull().busy &= unsafe { self.fence.GetCompletedValue() } < value;
             }
         }
-        struct Kept(#[allow(dead_code)] Regions); // held until released, never read
+        /// Held only to be dropped with the submission's buffers.
+        struct Kept {
+            _regions: Regions,
+        }
         // SAFETY: D3D12 resources are free-threaded; only released there.
         unsafe impl Send for Kept {}
         // Not waited for: its buffers go with the submission's (`back`).
         let kept = match riding.take() {
-            Some(Some(r)) if unwaited => Some(Kept(r._regions)),
+            Some(Some(r)) if unwaited => Some(Kept { _regions: r._regions }),
             _ => None,
         };
         static RETAKE_ALL: std::sync::LazyLock<bool> =

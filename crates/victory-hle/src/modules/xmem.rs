@@ -339,7 +339,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // The GPU side lets go of what it holds in place there first.
+            super::memoryapi::change(address, 0, || VirtualFree(address, 0, MEM_RELEASE));
             return;
         }
         let user = address.cast::<u8>();
@@ -363,7 +364,9 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE, std::sync::OnceLock<usize>);
+/// A section's handle, our own view of it (mapped at first use) and its
+/// bytes.
+struct Section(HANDLE, std::sync::OnceLock<usize>, usize);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -397,11 +400,20 @@ impl Drop for Section {
         // Every title view of the section is gone (each holds it), and the
         // GPU layer forgot their addresses here when they went.
         if let Some(&at) = self.1.get().filter(|&&at| at != 0) {
-            // SAFETY: our view, with no write of the GPU layer's under way
-            // in it.
-            victory_gpu::with_own_views_idle(|| unsafe {
-                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void })
-            });
+            // The GPU side unmaps it now, or once no page table names what
+            // it holds in place there; the unmap itself with no write of
+            // its own under way in the view.
+            victory_gpu::title_memory_own_gone(
+                at,
+                self.2,
+                Box::new(move || {
+                    // SAFETY: our view, with no write of the GPU layer's
+                    // under way in it.
+                    victory_gpu::with_own_views_idle(|| unsafe {
+                        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void })
+                    })
+                }),
+            );
         }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
@@ -546,7 +558,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle, Default::default()));
+    let section = Arc::new(Section(handle, Default::default(), size));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -1010,8 +1022,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        // What the GPU side holds in place at the title's address would make
+        // the unmap fail: it lets go first. (Title memory in place opens our
+        // own view of the section, which this unmap leaves alone, so today
+        // nothing is held here: one atomic load.)
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        victory_gpu::title_memory_change(at, size, || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1019,7 +1035,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        });
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

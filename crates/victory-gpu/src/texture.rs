@@ -1541,6 +1541,9 @@ mod tests {
             .collect();
         staging.memory = memory.as_ptr();
         let (footprint, rows) = (staging.footprints[0], staging.rows[0]);
+        // A test submitting alongside recycles the staging chunks
+        // (`recycle`): its uploads would overwrite ours before the read.
+        let _held = crate::host::tests::no_submissions();
         let (_, upload) = staging.refresh_now();
         let (buffer, at, list) = upload.expect("staged");
         assert_eq!(list, [0]);

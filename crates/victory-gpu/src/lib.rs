@@ -43,6 +43,8 @@ mod gpumeasure;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod lightlog;
 pub mod list;
@@ -51,6 +53,8 @@ mod memory;
 mod memsys;
 pub mod object;
 pub mod pipeline;
+#[cfg(windows)]
+mod pinned;
 #[cfg(windows)]
 mod placement;
 #[cfg(windows)]
@@ -82,6 +86,10 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use inplace::title_memory_own_gone;
+#[cfg(windows)]
+pub use pinned::{title_memory_change, title_memory_held};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_own, title_memory_remapped,

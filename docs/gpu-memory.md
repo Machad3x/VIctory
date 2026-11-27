@@ -247,6 +247,67 @@ may write the buffer; textures and memory outside buffer objects keep
 copies of their own. The per-frame memory system line counts buffers
 sharing, the bytes not copied twice, and those parted again.
 
+## Title memory in place (`VICTORY_INPLACE_BACKSTOP=1`, off)
+
+Shaders reach title memory with no host copy through the page table
+(`crate::memory`). Without a copy such a page reads as zeros, its writes
+are dropped, and the miss withholds every title-memory program's writes
+for that frame and the next. The backstop (`crate::inplace`) names such
+pages in place instead: the title's own bytes, opened as a host heap with
+`ID3D12Device13::OpenExistingHeapFromAddress1` and one buffer placed over
+it. Nothing is copied either way and it is no miss, but a discrete card
+reads it over the bus, so it is a stand-in for missing copies, not a home
+for hot data.
+
+- **What is covered.** Only physical pages (`xmem`'s sections), through
+  the view of each section the runtime maps for itself
+  (`victory_gpu::title_memory_own`). A heap locks the view it is opened on
+  (protect, free and unmap fail with `ERROR_INVALID_PARAMETER` while it
+  lives), so the title's views stay free to be guarded and remapped.
+  Private memory (`MEM_PRIVATE`: `xmem`'s heaps, the title's own
+  `VirtualAlloc`s) is out of scope: its pages with no copy stay misses,
+  as without the switch. A heap there would lock the title's addresses,
+  so its `VirtualProtect`/`VirtualFree` and the write guards would fail
+  (`crate::pinned` is how such a holder would let go first). The opening
+  thread refuses any range that is not one mapped view. The
+  misses-by-kind frame line says how much private memory misses.
+- **Runs.** A page-table rewrite cuts the uncovered pages into runs of
+  pages our view shows one after another, one per section view, at most
+  256 MiB. A run not open yet is asked of the `victory-in-place` thread
+  and named by a later table; the thread checks the run is still a view
+  of ours, joins it with the open runs it overlaps (up to 512 MiB), and
+  bumps the in-place generation. `VICTORY_INPLACE_MB` (1024) caps the
+  bytes open, since opening locks pages into the PC's memory; a run the
+  host refuses is not asked again.
+- **Writes.** Pages shaders wrote in place mark every tracker over them
+  (host copies, texture stagings, heaps, aliases), as a title write
+  would; nothing is copied back for them.
+- **Going.** When a section goes, its view's runs are forgotten
+  (`victory_gpu::title_memory_own_gone`) and the view stays mapped until
+  no page table names them: at a frame's end, with no submission running,
+  the tables drop them (when a submission runs then, the next submission
+  does, before it prepares anything), their heaps are released on the
+  release thread, and the view is unmapped at a later frame's end (tried
+  once a frame for up to 600 frames, as the system unlocks late). Nothing
+  waits: a section going while a run over its view is being opened keeps
+  the view mapped until the open ends, instead of waiting for it.
+- **Title memory changes.** The title's `VirtualFree(Ex)`,
+  `VirtualProtect(Ex)` and `UnmapViewOfFile(Ex/2)` (HLE module
+  `memoryapi`), and `xmem`'s own unmapping and frees, go through
+  `victory_gpu::title_memory_change`: whatever is registered as holding
+  the range in place (`crate::pinned`) lets go first. Nothing registers
+  there today (the backstop holds our own views only), so the cost is one
+  atomic load per call.
+
+A frame line (`title memory in place`) counts runs, megabytes open, pages
+named and written, runs opened and the time they took, and refusals.
+Whether it pays off needs a run of the title: compare the miss and
+withholding counters with and without the switch.
+
+The probe `cargo test -p victory-gpu --lib inplace -- --ignored
+--nocapture` tells what the host's driver allows (alignment, sections
+opened through another view, protection and unmapping while open).
+
 ## Measuring a title
 
 The tests show the mechanism. Whether it pays off in a title depends on

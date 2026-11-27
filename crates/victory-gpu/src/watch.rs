@@ -321,6 +321,9 @@ struct Guards {
     /// Where each title page shows in a view of our own, never guarded, as
     /// the runtime told when it mapped it ([`title_memory_own`]).
     own: BTreeMap<usize, usize>,
+    /// `own` the other way: each address of our views shown, and how many
+    /// title pages show it (aliases share one).
+    own_shown: BTreeMap<usize, u32>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -334,6 +337,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
     own: BTreeMap::new(),
+    own_shown: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -1215,8 +1219,35 @@ pub fn title_memory_own(at: usize, len: usize, own: usize) {
     }
     let mut g = guards();
     for k in 0..len / PAGE {
-        g.own.insert(at / PAGE + k, own + k * PAGE);
+        if let Some(old) = g.own.insert(at / PAGE + k, own + k * PAGE) {
+            unshow(&mut g, old);
+        }
+        *g.own_shown.entry(own + k * PAGE).or_default() += 1;
     }
+    crate::inplace::views_changed();
+}
+
+/// A title page no longer shows our view's address `own`.
+fn unshow(g: &mut Guards, own: usize) {
+    if let std::collections::btree_map::Entry::Occupied(mut e) = g.own_shown.entry(own) {
+        *e.get_mut() -= 1;
+        if *e.get() == 0 {
+            e.remove();
+        }
+    }
+}
+
+/// The views of our own showing title pages `first..last` (page numbers),
+/// as (page, our view's address) in page order ([`title_memory_own`]).
+pub(crate) fn own_views_in(first: usize, last: usize) -> Vec<(usize, usize)> {
+    guards().own.range(first..last).map(|(&page, &own)| (page, own)).collect()
+}
+
+/// Whether every page of `[at, at + len)` (whole pages) is a view of our
+/// own showing some title page now ([`title_memory_own`]).
+pub(crate) fn own_views_show(at: usize, len: usize) -> bool {
+    // Bounded by the range's pages, not by every view of ours.
+    guards().own_shown.range(at..at.saturating_add(len)).count() == len.div_ceil(PAGE)
 }
 
 /// A write through views of our own into pages one tracker's copy writes
@@ -1311,8 +1342,16 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         open(&mut g, page);
     }
     let gone: Vec<usize> = g.own.range(first..last).map(|(&p, _)| p).collect();
-    for page in gone {
-        g.own.remove(&page);
+    for page in &gone {
+        if let Some(own) = g.own.remove(page) {
+            unshow(&mut g, own);
+        }
+    }
+    // Page tables naming it in place name it anew: after its views of our
+    // own are forgotten, so that a rewrite meanwhile sees them gone. Only
+    // when it had some: each bump rewrites every table.
+    if !gone.is_empty() {
+        crate::inplace::views_changed();
     }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
@@ -1351,6 +1390,20 @@ pub(crate) fn retake(at: usize, len: usize) {
     mark_copies(&g, first, last);
     for page in others {
         mark_copies(&g, page, page + 1);
+    }
+}
+
+/// Shaders wrote `[at, at + len)` of title memory itself (in place,
+/// `crate::inplace`): every tracker holding it, of every kind (host copies,
+/// textures' staging, heaps), aliases too, counts it changed, as after a
+/// write of the title's. Guards stay: the title did not write.
+pub(crate) fn landed(at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    mark(&mut g, first, last, false, None);
+    for page in others {
+        mark(&mut g, page, page + 1, false, None);
     }
 }
 
@@ -2176,6 +2229,36 @@ pub(crate) mod tests {
         assert!(writer.changed(page), "a title write is still seen");
         title_memory_remapped(title, PAGE);
         assert!(writer.write_unseen(title, title + PAGE).is_none(), "mapped anew: the view is forgotten");
+    }
+
+    /// What the in-place backstop opens is checked against the views of our
+    /// own shown now: a view the title mapped anew shows nothing.
+    #[test]
+    fn own_views_show_only_pages_shown_now() {
+        let (title, own) = (0x7a00_0000_0000usize, 0x7b00_0000_0000usize);
+        title_memory_own(title, 2 * PAGE, own);
+        assert!(own_views_show(own, 2 * PAGE) && own_views_show(own + PAGE, PAGE));
+        assert!(!own_views_show(own, 3 * PAGE), "the third page is no view of ours");
+        title_memory_remapped(title + PAGE, PAGE);
+        assert!(own_views_show(own, PAGE) && !own_views_show(own, 2 * PAGE));
+        title_memory_remapped(title, PAGE);
+        assert!(!own_views_show(own, PAGE));
+    }
+
+    /// Two title views of one section show our view's same pages: those
+    /// stay shown until both go; a title page mapped over shows only the new.
+    #[test]
+    fn own_views_shown_by_aliases_stay_until_both_go() {
+        let (a, b, own) = (0x7c00_0000_0000usize, 0x7c10_0000_0000usize, 0x7d00_0000_0000usize);
+        title_memory_own(a, PAGE, own);
+        title_memory_own(b, PAGE, own);
+        title_memory_remapped(a, PAGE);
+        assert!(own_views_show(own, PAGE), "the other alias shows it still");
+        // The same title page mapped over another view of ours.
+        title_memory_own(b, PAGE, own + 4 * PAGE);
+        assert!(!own_views_show(own, PAGE) && own_views_show(own + 4 * PAGE, PAGE));
+        title_memory_remapped(b, PAGE);
+        assert!(!own_views_show(own + 4 * PAGE, PAGE));
     }
 
     /// A write through another mapping of the same pages marks the tracker

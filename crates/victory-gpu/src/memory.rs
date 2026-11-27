@@ -42,6 +42,10 @@
 //! their own at the frame's end, one for each contiguous run up to
 //! [`DEMAND_RUN`] pages ([`crate::shadow::demand`]), up to
 //! `VICTORY_DEMAND_COPIES_MB` MiB (512) made in all.
+//! With `VICTORY_INPLACE_BACKSTOP=1` (off by default) a page no copy holds
+//! that shows physical pages through a view of our own is named in place
+//! instead ([`crate::inplace`]): shaders read and write the title's bytes,
+//! nothing is copied, and it is no miss.
 //! shortcut: a page two copies share without either holding all of it is
 //! the larger one's.
 //! shortcut: a table names copies in at most [`CAPACITY`] 256 MiB regions;
@@ -137,6 +141,11 @@ struct Layout {
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
     owner: Vec<Option<usize>>,
+    /// Per entry no copy holds that names title memory in place, its run's
+    /// index in `runs` plus 1, else 0 ([`crate::inplace::backstop`]; empty
+    /// without it); the runs, kept while the table may run.
+    backstopped: Vec<u32>,
+    runs: Vec<Arc<crate::inplace::Run>>,
 }
 
 /// A view heap's page table, shared by every list using title memory with
@@ -154,6 +163,10 @@ struct Shared {
     pairs: fx::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
+    /// The view pair of each run in place it names, by run id, and the
+    /// generation of what is in place it names ([`crate::inplace::generation`]).
+    run_pairs: fx::Map<u64, u32>,
+    in_place: u64,
     /// The number of [`WANTED`] regions it was written with.
     wanted: usize,
     layout: Arc<Layout>,
@@ -176,6 +189,9 @@ fn shared() -> std::sync::MutexGuard<'static, Vec<(usize, Shared)>> {
 #[cfg(windows)]
 pub(crate) fn release(key: usize) {
     shared().retain(|(k, _)| *k != key);
+    if let Some(old) = with_ran(|m| m.remove(&key)) {
+        crate::host::release_later(Box::new(old));
+    }
 }
 
 /// Whether view heap `key` has a page table.
@@ -327,6 +343,8 @@ pub(crate) fn log_frame() {
     }
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
+    crate::inplace::log_frame();
+    drop_dead_runs();
     let s = stats(std::mem::take);
     if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
         return;
@@ -358,6 +376,19 @@ pub(crate) fn log_frame() {
             m.committed,
             m.pages.len() as u64 - m.committed,
             m.persistent
+        );
+        let now = std::mem::take(&mut m.kinds_now);
+        let named = |k: &[u64; 4]| -> String {
+            KIND_NAMES.iter().zip(k).map(|(name, n)| format!("{n} {name}")).collect::<Vec<_>>().join(", ")
+        };
+        let in_place = m.kinds[PRIVATE as usize] + m.kinds[MAPPED as usize];
+        let in_place_now = now[PRIVATE as usize] + now[MAPPED as usize];
+        tracing::info!(
+            "title memory misses by kind: so far {} pages, this frame {} pages; in place would cover {:.1} MB so far ({:.1} MB of this frame's)",
+            named(&m.kinds),
+            named(&now),
+            (in_place << 16) as f64 / 1e6,
+            (in_place_now << 16) as f64 / 1e6
         );
         if demand_budget().is_some() {
             tracing::info!(
@@ -533,6 +564,8 @@ impl Shared {
             null,
             pairs: fx::Map::default(),
             generation: u64::MAX,
+            run_pairs: fx::Map::default(),
+            in_place: u64::MAX,
             wanted: 0,
             layout: Arc::default(),
         })
@@ -543,6 +576,8 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
+        // Read first: a change while writing is named at the next rewrite.
+        let in_place = crate::inplace::generation();
         let copies = crate::shadow::all();
         let live: fx::Set<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|copy, &mut slot| {
@@ -589,8 +624,14 @@ impl Shared {
                 of.push(k);
             }
         }
-        let (dwords, blocks, owner) = table_at(&ranges, &starts, &slots, self.null, &wanted, &weak);
+        let (mut dwords, blocks, owner) = table_at(&ranges, &starts, &slots, self.null, &wanted, &weak);
         let owner: Vec<Option<usize>> = owner.into_iter().map(|o| o.map(|k| of[k])).collect();
+        let (backstopped, runs) = if crate::inplace::backstop() {
+            self.backstop(heap, &mut dwords, &blocks, &owner)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.in_place = in_place;
         // SAFETY: the mapping has room for `CAPACITY` blocks, which `table`
         // keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(dwords.as_ptr(), self.data as *mut u32, dwords.len()) };
@@ -600,6 +641,8 @@ impl Shared {
             copies: named,
             blocks,
             owner,
+            backstopped,
+            runs,
         });
         // The old one may hold copies' last references: releasing those here
         // would be on the submitting thread, with the heaps locked.
@@ -607,6 +650,173 @@ impl Shared {
         self.generation = now;
         stats(|s| s.tables += 1);
     }
+
+    /// Entries of the table's blocks that no copy holds and that show
+    /// physical pages through a view of our own: named in place
+    /// ([`crate::inplace`]) in `dwords`, those of runs no longer named given
+    /// back. The entries named, and the runs.
+    fn backstop(
+        &mut self,
+        heap: &HostHeap,
+        dwords: &mut [u32],
+        blocks: &[usize],
+        owner: &[Option<usize>],
+    ) -> (Vec<u32>, Vec<Arc<crate::inplace::Run>>) {
+        let mut backstopped = vec![0u32; owner.len()];
+        let mut runs: Vec<Arc<crate::inplace::Run>> = Vec::new();
+        let mut named = 0u64;
+        // Block 0 is the null one.
+        for (b, &l1) in blocks.iter().enumerate().skip(1) {
+            let first = l1 * BLOCK;
+            let free: Vec<(usize, usize)> = crate::watch::own_views_in(first, first + BLOCK)
+                .into_iter()
+                .filter(|&(page, _)| owner.get(b * BLOCK + (page - first)).is_some_and(|o| o.is_none()))
+                .collect();
+            // One run per section's view: a heap is opened on one.
+            let pieces = crate::inplace::runs(&free)
+                .into_iter()
+                .flat_map(|run| crate::inplace::per_view(run, crate::inplace::allocation_end));
+            for run in pieces {
+                let Some((placed, offset)) = crate::inplace::run_for(run[0].1, run.len() * crate::watch::PAGE) else {
+                    continue;
+                };
+                let pair = match self.run_pairs.get(&placed.id) {
+                    Some(&pair) => pair,
+                    None => {
+                        let Some(pair) = heap.pair() else {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| tracing::warn!("no descriptor slots for title memory in place: it reads as missing"));
+                            continue;
+                        };
+                        heap.raw_pair_at(pair, Some(&placed.buffer), placed.len as u64);
+                        self.run_pairs.insert(placed.id, pair);
+                        pair
+                    }
+                };
+                let index = match runs.iter().position(|r| r.id == placed.id) {
+                    Some(i) => i,
+                    None => {
+                        runs.push(placed);
+                        runs.len() - 1
+                    }
+                };
+                for (k, &(page, _)) in run.iter().enumerate() {
+                    let entry = b * BLOCK + (page - first);
+                    dwords[LEVEL1 + 2 * entry] = pair;
+                    dwords[LEVEL1 + 2 * entry + 1] = crate::inplace::entry_base((page << 16) as u64, offset + k * crate::watch::PAGE);
+                    backstopped[entry] = index as u32 + 1;
+                }
+                named += run.len() as u64;
+            }
+        }
+        self.run_pairs.retain(|id, &mut pair| {
+            let keep = runs.iter().any(|r| r.id == *id);
+            if !keep {
+                heap.raw_pair_at(pair, None, 0);
+                heap.free_pair(pair);
+            }
+            keep
+        });
+        crate::inplace::named(named);
+        (backstopped, runs)
+    }
+
+    /// Drops the runs `dead` names from the table: their entries become
+    /// null (missing) in the mapped table and in a new layout. Only while no
+    /// submission runs (the GPU reads the table).
+    fn drop_runs(&mut self, dead: &[u64]) {
+        let l = &self.layout;
+        if !l.runs.iter().any(|r| dead.contains(&r.id)) {
+            return;
+        }
+        let kept: Vec<Arc<crate::inplace::Run>> = l.runs.iter().filter(|r| !dead.contains(&r.id)).cloned().collect();
+        let index_of = |old: u32| -> u32 {
+            let id = l.runs[old as usize - 1].id;
+            kept.iter().position(|r| r.id == id).map_or(0, |i| i as u32 + 1)
+        };
+        let mut backstopped = l.backstopped.clone();
+        let table = self.data as *mut u32;
+        for (entry, run) in backstopped.iter_mut().enumerate() {
+            if *run == 0 {
+                continue;
+            }
+            *run = index_of(*run);
+            if *run == 0 {
+                // SAFETY: an entry of the mapped table, which has room for
+                // every entry a layout names; no submission runs.
+                unsafe {
+                    table.add(LEVEL1 + 2 * entry).write(self.null);
+                    table.add(LEVEL1 + 2 * entry + 1).write(0);
+                }
+            }
+        }
+        let layout = Arc::new(Layout {
+            copies: l.copies.clone(),
+            bits: l.bits.clone(),
+            blocks: l.blocks.clone(),
+            owner: l.owner.clone(),
+            backstopped,
+            runs: kept,
+        });
+        crate::host::release_later(Box::new(std::mem::replace(&mut self.layout, layout)));
+    }
+}
+
+/// At a frame's end, with the backstop on: the page tables drop the runs
+/// over views the runtime let go, with no submission running, so that
+/// those views can be unmapped ([`crate::inplace::settle`]).
+fn drop_dead_runs() {
+    if !crate::inplace::backstop() {
+        return;
+    }
+    let dead = crate::inplace::dead();
+    if !dead.is_empty()
+        && let Some(host) = crate::host::host()
+        && host.between_submissions(|| drop_runs_now(&dead)).is_none()
+    {
+        // A submission under way: the next one drops them before it
+        // prepares anything ([`drop_dead_runs_put_off`]).
+        DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    crate::inplace::settle();
+}
+
+/// Runs a frame's end could not drop, a submission running then.
+static DROP_PUT_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// At a submission's start, holding the submission lock (none runs, none
+/// prepared yet): the dead runs a frame's end put off are dropped, so that
+/// their views are unmapped at the next frame's end whatever submissions
+/// overlap frame ends.
+pub(crate) fn drop_dead_runs_put_off() {
+    if DROP_PUT_OFF.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        drop_runs_now(&crate::inplace::dead());
+    }
+}
+
+/// [`Shared::drop_runs`] for every table; with no submission running.
+fn drop_runs_now(dead: &[u64]) {
+    if dead.is_empty() {
+        return;
+    }
+    for (_, s) in shared().iter_mut() {
+        s.drop_runs(dead);
+    }
+    // What lists ran with: all of them ran. Released off this thread: a
+    // layout may hold copies' last references.
+    let ran = with_ran(std::mem::take);
+    if !ran.is_empty() {
+        crate::host::release_later(Box::new(ran));
+    }
+}
+
+/// The layout each view heap's lists last ran with ([`prepare`]): what
+/// their marks are read against after the run, even if the table changed
+/// or went since.
+static RAN: Mutex<Option<fx::Map<usize, Arc<Layout>>>> = Mutex::new(None);
+
+fn with_ran<R>(f: impl FnOnce(&mut fx::Map<usize, Arc<Layout>>) -> R) -> R {
+    f(RAN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
 }
 
 /// The bytes of copies persistent misses may get in all
@@ -622,7 +832,7 @@ fn demand_budget() -> Option<u64> {
 
 /// Whether missed pages are counted, and missed regions get blocks.
 fn counting() -> bool {
-    cfg!(feature = "diagnostics") || demand_budget().is_some()
+    cfg!(feature = "diagnostics") || demand_budget().is_some() || crate::inplace::backstop()
 }
 
 /// Level-1 indices of the 256 MiB regions with no copy that shaders marked.
@@ -653,7 +863,18 @@ struct Missed {
     tried: bool,
     /// The frame of the last copy asked for and not made.
     failed: Option<u64>,
+    /// What was there when first missed ([`memory_kind`]).
+    kind: u8,
 }
+
+/// What a missed page is ([`memory_kind`]): nothing committed, private
+/// memory, a mapped view (physical pages), an image. Indexes
+/// [`Misses::kinds`].
+const EMPTY: u8 = 0;
+const PRIVATE: u8 = 1;
+const MAPPED: u8 = 2;
+const IMAGE: u8 = 3;
+const KIND_NAMES: [&str; 4] = ["empty", "private", "mapped", "image"];
 
 /// Every page missed so far. `new` and `persistent_now` count since the last
 /// report, the rest since the start.
@@ -663,6 +884,11 @@ struct Misses {
     pages: fx::Map<u64, Missed>,
     new: u64,
     committed: u64,
+    /// Distinct pages by kind since the start, and pages missed this frame
+    /// by kind (each once a frame): committed ones are what title memory
+    /// in place would cover.
+    kinds: [u64; 4],
+    kinds_now: [u64; 4],
     persistent: u64,
     persistent_now: u64,
     /// Bytes of demand copies, since the start (less those of copies
@@ -683,14 +909,17 @@ struct Misses {
 }
 
 impl Misses {
-    /// The page at `at` was missed in `frame`; `committed` is asked only the
+    /// The page at `at` was missed in `frame`; its `kind` is asked only the
     /// first time. True once per frame for a persistent page.
-    fn note(&mut self, at: u64, frame: u64, committed: impl FnOnce() -> bool) -> bool {
+    fn note(&mut self, at: u64, frame: u64, kind: impl FnOnce() -> u8) -> bool {
         let page = match self.pages.entry(at) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 self.new += 1;
-                self.committed += u64::from(committed());
-                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false, failed: None });
+                let kind = kind().min(IMAGE);
+                self.committed += u64::from(kind != EMPTY);
+                self.kinds[usize::from(kind)] += 1;
+                self.kinds_now[usize::from(kind)] += 1;
+                e.insert(Missed { last: frame, recent: 1, persisted: false, tried: false, failed: None, kind });
                 return false;
             }
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -698,6 +927,7 @@ impl Misses {
         if frame <= page.last {
             return false;
         }
+        self.kinds_now[usize::from(page.kind)] += 1;
         let since = u32::try_from(frame.wrapping_sub(page.last)).unwrap_or(u32::MAX);
         let kept = page.recent.checked_shl(since).unwrap_or(0);
         page.tried &= kept != 0;
@@ -814,6 +1044,30 @@ static MISSES_SEEN: Mutex<Option<Misses>> = Mutex::new(None);
 /// budget.
 pub(crate) static DEMAND_FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// What the 64 KiB at `at` hold: the type of their first committed part
+/// ([`PRIVATE`], [`MAPPED`], [`IMAGE`]), or [`EMPTY`].
+fn memory_kind(at: u64) -> u8 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (mut p, end) = (at, at + (1 << 16));
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+            break;
+        }
+        if info.State == MEM_COMMIT {
+            return match info.Type {
+                MEM_PRIVATE => PRIVATE,
+                MEM_MAPPED => MAPPED,
+                _ => IMAGE,
+            };
+        }
+        p = (info.BaseAddress as u64 + info.RegionSize as u64).max(p + 0x1000);
+    }
+    EMPTY
+}
+
 /// Whether any of the 64 KiB at `at` is committed (private or mapped).
 fn committed(at: u64) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -843,7 +1097,7 @@ fn measure_misses(pages: &[u64], regions: &[usize]) {
         let mut misses = MISSES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let misses = misses.get_or_insert_default();
         for &at in pages {
-            if misses.note(at, frame, || committed(at)) && demand_budget().is_some() {
+            if misses.note(at, frame, || memory_kind(at)) && demand_budget().is_some() {
                 misses.eligible.push(at);
             }
         }
@@ -875,9 +1129,12 @@ fn name_missing(pages: &[u64], regions: &[usize], programs: &std::collections::B
     }
 }
 
-/// The page table of view heap `key`, as the last submission using it
-/// left it.
+/// The page table of view heap `key` its lists last ran with ([`RAN`]),
+/// else as the last submission using it left it.
 fn layout(key: usize) -> Arc<Layout> {
+    if let Some(l) = with_ran(|m| m.get(&key).cloned()) {
+        return l;
+    }
     shared()
         .iter()
         .find(|(k, _)| *k == key)
@@ -897,12 +1154,21 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let now = crate::shadow::generation();
         let stale = s.generation != now;
         let stale = stale || counting() && s.wanted != wanted().len();
+        let stale = stale || crate::inplace::backstop() && s.in_place != crate::inplace::generation();
         if stale {
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
     })
     .flatten();
+    // The layout replaced may hold copies' last references: released off
+    // the submitting thread, as in `rewrite`.
+    if let Some(l) = &layout
+        && let Some(old) = with_ran(|m| m.insert(key, l.clone()))
+        && !Arc::ptr_eq(&old, l)
+    {
+        crate::host::release_later(Box::new(old));
+    }
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
@@ -977,7 +1243,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             while bits != 0 {
                 let entry = w * 32 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                if entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || l.owner.get(entry).is_none_or(|o| o.is_none()) {
+                let held = l.owner.get(entry).is_some_and(|o| o.is_some()) || l.backstopped.get(entry).is_some_and(|&r| r != 0);
+                if entry / BLOCK == 0 || l.blocks.get(entry / BLOCK).is_none() || !held {
                     return true;
                 }
             }
@@ -985,7 +1252,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         })
     });
     list.defer_after(move || {
-        let Layout { copies, blocks, owner, .. } = &*layout(key);
+        let Layout { copies, blocks, owner, backstopped, .. } = &*layout(key);
+        // Pages shaders wrote in place: there already.
+        let mut landed: Vec<usize> = Vec::new();
         let precise = byte_for_byte.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the read-back bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(data as *const u32, words) };
@@ -1017,6 +1286,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     // A page no copy holds is a miss, byte for byte or not.
                     Some(Some(_)) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(Some(k)) => writes.push((*k, at)),
+                    _ if backstopped.get(entry).is_some_and(|&r| r != 0) => landed.push(at as usize),
                     _ => {
                         pages += 1;
                         #[cfg(feature = "diagnostics")]
@@ -1031,6 +1301,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         }
         if counting() {
             measure_misses(&missed_at, &missed_in);
+        }
+        if !landed.is_empty() {
+            // In place, writes land whether or not the list's others are
+            // withheld: counted apart.
+            let n = landed.len() as u64;
+            crate::inplace::written(n, if pages + regions > 0 || withholding() { n } else { 0 });
+            // Every tracker over them (texture stagings among them) takes
+            // title memory again.
+            for at in landed {
+                crate::watch::landed(at, crate::watch::PAGE);
+            }
         }
         #[cfg(feature = "diagnostics")]
         name_missing(&missed_at, &missed_in, &users.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1111,19 +1392,22 @@ mod tests {
     #[test]
     fn a_page_persists_when_missed_twice_in_sixteen_frames() {
         let mut m = Misses::default();
-        assert!(!m.note(0x10000, 0, || true));
+        assert!(!m.note(0x10000, 0, || PRIVATE));
         assert!(!m.note(0x10000, 0, || panic!("asked once")), "one frame, once");
         assert_eq!((m.new, m.committed, m.persistent), (1, 1, 0));
-        assert!(m.note(0x10000, 15, || false), "the oldest frame still counted");
-        assert!(!m.note(0x10000, 15, || false));
-        assert!(!m.note(0x10000, 14, || false), "an older frame, as the same one");
+        assert!(m.note(0x10000, 15, || EMPTY), "the oldest frame still counted");
+        assert!(!m.note(0x10000, 15, || EMPTY));
+        assert!(!m.note(0x10000, 14, || EMPTY), "an older frame, as the same one");
         assert_eq!((m.persistent, m.persistent_now), (1, 1));
-        assert!(!m.note(0x10000, 31, || false), "sixteen frames on");
-        assert!(m.note(0x10000, 32, || false));
+        assert!(!m.note(0x10000, 31, || EMPTY), "sixteen frames on");
+        assert!(m.note(0x10000, 32, || EMPTY));
         assert_eq!((m.persistent, m.persistent_now), (1, 2));
-        assert!(!m.note(0x10000, 1000, || false));
-        m.note(0x20000, 1000, || false);
+        assert!(!m.note(0x10000, 1000, || EMPTY));
+        m.note(0x20000, 1000, || EMPTY);
         assert_eq!((m.pages.len(), m.new, m.committed), (2, 2, 1));
+        assert_eq!(m.kinds, [1, 1, 0, 0]);
+        // Each page once a frame, by the kind it had when first missed.
+        assert_eq!(m.kinds_now, [1, 5, 0, 0]);
     }
 
     /// A persistent committed page asks for a copy until it gets one, with
@@ -1132,10 +1416,10 @@ mod tests {
     fn persistent_committed_pages_ask_for_a_copy_once() {
         let mut m = Misses::default();
         let miss = |m: &mut Misses, frame| {
-            assert!(m.note(0x10000, frame, || true));
+            assert!(m.note(0x10000, frame, || PRIVATE));
             m.eligible.push(0x10000);
         };
-        assert!(!m.note(0x10000, 0, || true));
+        assert!(!m.note(0x10000, 0, || PRIVATE));
         miss(&mut m, 8);
         m.heal(100, |_| false, |_, _, _| panic!("nothing there"));
         m.eligible.push(0x10000);
@@ -1144,7 +1428,7 @@ mod tests {
         m.heal(100, |_| panic!("not queried"), |_, _, _| panic!("asked already"));
         assert_eq!((m.bytes, m.healed, m.left_committed, m.left_empty), (60, 1, 1, 1));
         // After sixteen frames unmissed it asks again, with the rest.
-        m.note(0x10000, 40, || true);
+        m.note(0x10000, 40, || PRIVATE);
         miss(&mut m, 48);
         m.heal(100, |_| true, |_, _, room| {
             assert_eq!(room, 40);
@@ -1166,8 +1450,8 @@ mod tests {
         let mut m = Misses::default();
         let pages: Vec<u64> = (1..=70u64).chain([80, 82, 83]).map(|p| p << 16).collect();
         for &at in pages.iter().rev() {
-            m.note(at, 0, || true);
-            assert!(m.note(at, 1, || true));
+            m.note(at, 0, || PRIVATE);
+            assert!(m.note(at, 1, || PRIVATE));
             m.eligible.push(at);
         }
         let mut asked = Vec::new();
@@ -1278,6 +1562,20 @@ mod tests {
         assert_eq!(look_up(&dwords, 0).0, 4, "the smallest copy is left out");
         let (weak, ..) = table(&copies, &pairs, 4, &[], &[true]);
         assert_eq!(weak, dwords, "a weak copy gets no block ahead of a larger one");
+    }
+
+    /// Dead runs a frame's end could not drop (a submission running) are
+    /// dropped by the next submission, before it prepares anything.
+    #[test]
+    fn dead_runs_put_off_are_dropped_at_the_next_submission() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        DROP_PUT_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        let list = host.new_list().unwrap();
+        list.close();
+        host.execute(&[&list]);
+        assert!(!DROP_PUT_OFF.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     /// Reads 4 dwords of title memory at (`lo`, `hi`) through the page
