@@ -72,10 +72,11 @@ fn build() -> &'static [u8; 32] {
 const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
 
 /// The view heap size translations are made for, once the device has said
-/// what it takes.
+/// what it takes, with bit 31 set where they read the slot map
+/// (`VICTORY_DESC_MAP=on`; heap sizes stay below 2^22).
 pub(crate) fn view_limit() -> u32 {
     crate::host::heap_views();
-    victory_shader::emit::heap_views()
+    victory_shader::emit::heap_views() | u32::from(victory_shader::emit::slot_map()) << 31
 }
 
 fn key(translator: &str, encoding: &[u8], limit: u32, views: u32) -> [u8; 32] {
@@ -267,6 +268,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         heap_writes,
         view_marks,
         view_stores,
+        heap_fetches,
+        nonuniform_fetches,
     } = s;
     let mut out = MAGIC.to_vec();
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
@@ -321,6 +324,8 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     );
     word(&mut out, written_root_uavs.len() as u32);
     out.extend(written_root_uavs);
+    word(&mut out, *heap_fetches);
+    word(&mut out, *nonuniform_fetches);
     out
 }
 
@@ -383,6 +388,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_uavs = r.list()?;
     let memory = r.word()?;
     let written_root_uavs = r.list()?;
+    let (heap_fetches, nonuniform_fetches) = (r.word()?, r.word()?);
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -400,6 +406,8 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         heap_writes: memory & 16 != 0,
         view_marks: memory & 32 != 0,
         view_stores: memory & 64 != 0,
+        heap_fetches,
+        nonuniform_fetches,
     }))
 }
 
@@ -435,6 +443,8 @@ mod tests {
             heap_writes: true,
             view_marks: true,
             view_stores: true,
+            heap_fetches: 5,
+            nonuniform_fetches: 2,
         }
     }
 

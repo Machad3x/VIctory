@@ -173,6 +173,8 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
         view_stores: lowered.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1806,6 +1808,8 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
         view_stores: lowered.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let (true, Ok(mut v)) = (
         validate,
@@ -2424,6 +2428,8 @@ fn packed_fmac_dpp_reads_the_swizzled_lane() {
         heap_writes: false,
         view_marks: false,
         view_stores: false,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut vs.dxil.clone())

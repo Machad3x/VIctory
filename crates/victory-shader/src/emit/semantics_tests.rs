@@ -315,6 +315,8 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
         view_stores: lowered.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     })
 }
 

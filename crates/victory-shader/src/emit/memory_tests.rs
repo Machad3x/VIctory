@@ -219,6 +219,8 @@ fn program() -> HostShader {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         view_stores: l.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -650,7 +652,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -664,9 +666,16 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         console_cf: false,
         per_lane_only: false,
         view_marks: false,
-    })
-    .expect("lower");
+    };
+    let l = lower::lower(&parts).expect("lower");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
+    // With a slot map, the table's heap index is looked up in it, through
+    // one more heap handle and no root parameter: a root signature already
+    // at 64 DWORDs takes the program as it is.
+    let mapped = super::shader::with_slot_map(|| lower::lower(&parts)).expect("lower");
+    assert!(mapped.root_srvs.is_empty() && mapped.root_uavs.is_empty() && mapped.root_cbvs.is_empty());
+    assert_eq!(mapped.user_data.len(), l.user_data.len(), "the same root arguments");
+    assert_eq!(mapped.heap_handles, l.heap_handles + 1, "the slot map's view");
     let marks: Vec<(u32, u32)> = l
         .user_data
         .iter()
@@ -691,6 +700,8 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         view_stores: l.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -832,6 +843,8 @@ fn writes_through_views_mark_their_pages() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         view_stores: l.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -982,6 +995,8 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         view_stores: l.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -1094,6 +1109,8 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
         view_stores: l.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

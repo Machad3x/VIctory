@@ -2226,6 +2226,37 @@ pub(crate) fn take_counts() -> (u64, u64) {
 }
 
 
+/// Whether a title barrier group (kind, count, pointer to its barriers)
+/// holds a global or buffer barrier whose after scope is indirect argument
+/// reads (diagnostics). Every barrier kind starts with SyncBefore,
+/// SyncAfter, AccessBefore, AccessAfter, as on the PC.
+// shortcut: the PC's values (sync EXECUTE_INDIRECT 0x20000, access
+// INDIRECT_ARGUMENT 0x200), not yet confirmed to be the console's.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn orders_arguments(group: &[u32; 4]) -> bool {
+    const EXECUTE_INDIRECT: u32 = 0x2_0000;
+    const INDIRECT_ARGUMENT: u32 = 0x200;
+    // Global barriers 16 bytes each, buffer barriers 40; texture barriers
+    // order layouts, not arguments.
+    let size = match group[0] {
+        0 => 16,
+        2 => 40,
+        _ => return false,
+    };
+    let at = u64::from(group[2]) | u64::from(group[3]) << 32;
+    if at == 0 {
+        return false;
+    }
+    (0..u64::from(group[1].min(64))).any(|k| {
+        let mut words = [0u8; 16];
+        if !crate::host::read_into((at + k * size) as *const u8, &mut words) {
+            return false;
+        }
+        let word = |i: usize| u32::from_le_bytes([words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3]]);
+        word(1) & EXECUTE_INDIRECT != 0 || word(3) & INDIRECT_ARGUMENT != 0
+    })
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -2243,6 +2274,9 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
             // SAFETY: the title passes `count` groups of 16 bytes: kind, count, pointer.
             let groups = unsafe { std::slice::from_raw_parts(_groups.cast::<[u32; 4]>(), count as usize) };
             list.note_op(|| format!("barrier groups {:?}", groups.iter().map(|g| (g[0], g[1])).collect::<Vec<_>>()));
+            if groups.iter().any(orders_arguments) {
+                list.note_args_barrier();
+            }
         }
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };

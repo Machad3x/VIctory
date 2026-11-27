@@ -994,6 +994,8 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
         view_stores: lowered.view_stores,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     })
 }
 
@@ -1095,6 +1097,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         heap_writes: false,
         view_marks: false,
         view_stores: false,
+        heap_fetches: 0,
+        nonuniform_fetches: 0,
     }
 }
 

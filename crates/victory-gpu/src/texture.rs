@@ -101,8 +101,10 @@ pub(crate) fn copy_stand_in_to_67(
         return false;
     };
     // SAFETY: live textures.
-    let (d, to_desc) = unsafe { (from.GetDesc(), to.GetDesc()) };
-    if !stand_in_copy_fits(&d, &to_desc, b) {
+    let d = unsafe { from.GetDesc() };
+    // SAFETY: as above.
+    let e = unsafe { to.GetDesc() };
+    if !stand_in_copy_fits(&d, &e, b) {
         return false;
     }
     let mip = from_sub % u32::from(d.MipLevels.max(1));
