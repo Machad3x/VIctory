@@ -1692,7 +1692,7 @@ impl Host {
             })
             .collect();
         crate::shadow::snapshots_ahead(&snapshots);
-        let mut batch = Batch::default();
+        let mut batch = Batch::reused();
         #[cfg(feature = "diagnostics")]
         {
             batch.flight_prev = crate::copystat::flight_writes(&flight);
@@ -3257,7 +3257,69 @@ struct Batch {
     flight_touched: bool,
 }
 
+/// The lists and tables of a [`Batch`] that ended, emptied: the next
+/// batch takes them, so that a submission's refreshes allocate nothing
+/// once the lists have grown to a world submission's size (two tables of
+/// a few thousand copies and three lists were made and freed 29 times a
+/// frame).
+struct Spare {
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    pending: crate::fx::Map<usize, usize>,
+    current: crate::fx::Map<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    gpu_writes: Vec<(usize, usize)>,
+    late: Vec<(usize, usize, usize)>,
+}
+
+/// At most [`SPARES`] of them: a batch ends on the releasing thread, a
+/// little after the next began.
+static SPARE: Mutex<Vec<Spare>> = Mutex::new(Vec::new());
+const SPARES: usize = 4;
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        // The copies held go here, before the lock.
+        self.refreshes.clear();
+        self.pending.clear();
+        self.current.clear();
+        self.gpu_writes.clear();
+        self.late.clear();
+        if self.refreshes.capacity() == 0 && self.current.capacity() == 0 && self.gpu_writes.capacity() == 0 {
+            return;
+        }
+        let spare = Spare {
+            refreshes: std::mem::take(&mut self.refreshes),
+            pending: std::mem::take(&mut self.pending),
+            current: std::mem::take(&mut self.current),
+            gpu_writes: std::mem::take(&mut self.gpu_writes),
+            late: std::mem::take(&mut self.late),
+        };
+        let mut spares = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spares.len() < SPARES {
+            spares.push(spare);
+        }
+    }
+}
+
 impl Batch {
+    /// An empty batch, with the memory of one that ended if there is one.
+    fn reused() -> Self {
+        let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let Some(spare) = spare else {
+            return Self::default();
+        };
+        Self {
+            refreshes: spare.refreshes,
+            pending: spare.pending,
+            current: spare.current,
+            gpu_writes: spare.gpu_writes,
+            late: spare.late,
+            #[cfg(feature = "diagnostics")]
+            flight_prev: Vec::new(),
+            #[cfg(feature = "diagnostics")]
+            flight_touched: false,
+        }
+    }
+
     /// Flight study: title bytes the submission reads or writes.
     #[cfg(feature = "diagnostics")]
     fn touch(&mut self, at: usize, len: usize) {
@@ -5390,6 +5452,24 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
+    /// A batch that ended leaves its lists and tables, emptied, to the
+    /// next: nothing of the old one's copies or ranges is in it.
+    #[test]
+    fn a_batch_reuses_what_the_last_left_and_starts_empty() {
+        let mut batch = super::Batch::reused();
+        batch.gpu_write(0x1000, 0x100);
+        batch.late.push((1, 2, 3));
+        batch.pending.insert(7, 0);
+        assert!(batch.gpu_written(0x1000, 1));
+        drop(batch);
+        // Other tests' batches end meanwhile too: any of them is empty.
+        for _ in 0..8 {
+            let next = super::Batch::reused();
+            assert!(next.refreshes.is_empty() && next.pending.is_empty() && next.current.is_empty());
+            assert!(next.late.is_empty() && !next.gpu_written(0x1000, 1));
+        }
+    }
+
     use super::Batch;
 
     /// A host copy of tracked title memory: a submission whose lists all ask

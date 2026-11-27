@@ -24,12 +24,28 @@ pub(crate) type Piece = (usize, usize, usize, Option<Then>);
 
 thread_local! {
     static QUEUE: RefCell<Option<Vec<Piece>>> = const { RefCell::new(None) };
+    /// The list of a [`run`] that ended, emptied, for the next [`queued`]:
+    /// a submission queues and runs a few times, each with a list of
+    /// thousands of pieces.
+    static SPARE: RefCell<Vec<Piece>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps `pieces`, emptied, for this thread's next [`queued`].
+fn keep(mut pieces: Vec<Piece>) {
+    pieces.clear();
+    SPARE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.capacity() < pieces.capacity() {
+            *s = pieces;
+        }
+    });
 }
 
 /// Runs `f`; the copies [`copy`] is asked for on this thread meanwhile are
 /// not made but returned, for [`run`].
 pub(crate) fn queued<R>(f: impl FnOnce() -> R) -> (R, Vec<Piece>) {
-    let outer = QUEUE.with(|q| q.replace(Some(Vec::new())));
+    let spare = SPARE.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    let outer = QUEUE.with(|q| q.replace(Some(spare)));
     let result = f();
     let pieces = QUEUE.with(|q| q.replace(outer)).unwrap_or_default();
     (result, pieces)
@@ -108,18 +124,19 @@ fn caller_helps() -> bool {
 
 /// Makes the copies [`queued`] returned, on several threads where they are
 /// many bytes; returns once all are made.
-pub(crate) fn run(pieces: Vec<Piece>) {
+pub(crate) fn run(mut pieces: Vec<Piece>) {
     let total: usize = pieces.iter().map(|p| p.2).sum();
     let pool = (total >= PARALLEL_FROM && !serial()).then(pool).flatten();
     let Some(pool) = pool else {
-        for piece in pieces {
+        for piece in pieces.drain(..) {
             land(piece);
         }
+        keep(pieces);
         return;
     };
     let mut cut = Vec::with_capacity(pieces.len() + total / PIECE);
     let mut thens = Vec::new();
-    for (dst, src, len, then) in pieces {
+    for (dst, src, len, then) in pieces.drain(..) {
         if let Some(then) = then {
             thens.push((then, dst, len));
         }
@@ -130,6 +147,7 @@ pub(crate) fn run(pieces: Vec<Piece>) {
             at += n;
         }
     }
+    keep(pieces);
     pool.run(cut);
     // After the pool's run released it: a hook waiting on a lock holds up
     // only this caller, not the next run.
