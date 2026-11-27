@@ -356,6 +356,24 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// [`Shadow::spans`] of a copy of `[start, start + len)` with `windows`.
+/// Inside its own range first, its end excluded: a buffer showing the
+/// same pages right after it (a ring mapped twice) has its first byte
+/// there.
+fn spans_in(start: u64, len: u64, windows: &[(u64, u64, u64, bool)], address: u64) -> (u64, u64) {
+    let end = start + len;
+    if address.wrapping_sub(start) < len {
+        return (address, end);
+    }
+    // The newest first: a window made again at the same addresses. Ends
+    // only where no window holds the byte (another may start there).
+    let find = |end: bool| windows.iter().rev().find(|&&(at, n, ..)| address.wrapping_sub(at) < n + u64::from(end));
+    match find(false).or_else(|| find(true)) {
+        Some(&(at, len, home, _)) => (home + (address - at), home + len),
+        None => (address, end),
+    }
+}
+
 impl Shadow {
     /// A title address of the copy's bytes as the address in the copy's
     /// own range, and where the bytes it may be used with end there: its
@@ -363,16 +381,10 @@ impl Shadow {
     /// shares the copy ([`Shadow::windows`]). An address in neither is
     /// left as it is.
     fn spans(&self, address: u64) -> (u64, u64) {
-        let end = self.start + self.len;
-        if address.wrapping_sub(self.start) <= self.len {
-            return (address, end);
+        if address.wrapping_sub(self.start) < self.len {
+            return (address, self.start + self.len);
         }
-        let windows = self.windows.read().unwrap_or_else(|e| e.into_inner());
-        // The newest first: a window made again at the same addresses.
-        match windows.iter().rev().find(|&&(at, len, ..)| address.wrapping_sub(at) <= len) {
-            Some(&(at, len, home, _)) => (home + (address - at), home + len),
-            None => (address, end),
-        }
+        spans_in(self.start, self.len, &self.windows.read().unwrap_or_else(|e| e.into_inner()), address)
     }
 
     /// [`Shadow::spans`]'s address: every range a list keeps for its
@@ -3134,6 +3146,25 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A title address of a shared copy in its own addresses: its own
+    /// range wins over a window, and a window over the end of its own
+    /// range or of another window (buffers showing the pages right after).
+    #[test]
+    fn addresses_of_buffers_sharing_a_copy_are_taken_to_the_copy() {
+        const P: u64 = 64 << 10;
+        // The copy at 0x10_0000 + 2 pages; a ring mapping them again right
+        // after; a buffer showing the second page right after that.
+        let windows = [(0x12_0000, 2 * P, 0x10_0000, true), (0x14_0000, P, 0x11_0000, true)];
+        let at = |address| spans_in(0x10_0000, 2 * P, &windows, address);
+        assert_eq!(at(0x10_0010), (0x10_0010, 0x12_0000));
+        assert_eq!(at(0x12_0000), (0x10_0000, 0x12_0000), "the ring's first byte, not the copy's end");
+        assert_eq!(at(0x13_0010), (0x11_0010, 0x12_0000));
+        assert_eq!(at(0x14_0000), (0x11_0000, 0x12_0000), "the next window's, not the ring's end");
+        assert_eq!(at(0x15_0000), (0x12_0000, 0x12_0000), "its end");
+        assert_eq!(at(0x40_0000), (0x40_0000, 0x12_0000), "neither: as it is");
+        assert_eq!(spans_in(0x10_0000, 2 * P, &[], 0x12_0000), (0x12_0000, 0x12_0000));
+    }
 
     /// Stale bits pinned on one thread are released by another: a lock
     /// waits for that, and sees the bits as the pin's holder left them.
