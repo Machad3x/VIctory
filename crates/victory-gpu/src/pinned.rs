@@ -149,11 +149,13 @@ pub fn title_memory_held() -> bool {
 /// the runtime's unmapping of physical pages): whatever holds part of the
 /// range in place lets it go first. `change`'s answer, with its last error.
 pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i32) -> i32 {
-    // One deadline for the whole settle, its releases included (a release
-    // may wait for a submission's retire): the loop below looks no more
-    // once it has passed.
-    let start = Instant::now();
     let released = release(at, len);
+    // The settle runs from when the release returned (a release waits for
+    // a submission's retire, a frame or more: counted in, the settle could
+    // end before the system unlocked the pages, and a valid change got
+    // ERROR_INVALID_PARAMETER); one deadline then for all that follows,
+    // late pins let go in the loop included.
+    let mut start = Instant::now();
     let mut worked = change();
     if worked != 0 {
         return worked;
@@ -167,11 +169,14 @@ pub fn title_memory_change(at: usize, len: usize, mut change: impl FnMut() -> i3
         // A holder registered after the release looked, and opened its heap
         // before the change (a pin comes before its heap): let go now. Or
         // one let go just before, its heap going: tried again below.
-        if release(at, len) == 0 && !let_go_lately(at, len) {
+        let again = release(at, len);
+        if again == 0 && !let_go_lately(at, len) {
             // SAFETY: as above.
             unsafe { SetLastError(error) };
             return worked;
         }
+        // From this release's return, as above.
+        start = Instant::now();
         worked = change();
         if worked != 0 {
             return worked;
@@ -415,6 +420,26 @@ mod tests {
         assert_eq!(title_memory_change(base, 0x1000, denied), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(n.load(Ordering::Relaxed), 2);
+    }
+
+    /// A release that takes longer than the settle (it waits for a
+    /// submission's retire) still leaves the settle for the pages to unlock
+    /// after it: the change is tried again, not refused.
+    #[test]
+    fn a_slow_release_still_has_its_settle() {
+        use windows_sys::Win32::Foundation::SetLastError;
+        let base = 0x7900_0000_0000;
+        let _p = pin(base, 0x1_0000, Box::new(|| std::thread::sleep(SETTLE + Duration::from_millis(50))));
+        let calls = AtomicUsize::new(0);
+        // Refused once as locked after the release, then done.
+        let late = || {
+            let k = calls.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: plain write of this thread's last error.
+            unsafe { SetLastError(ERROR_INVALID_PARAMETER) };
+            i32::from(k >= 1)
+        };
+        assert_eq!(title_memory_change(base, 0x1000, late), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// A holder registers after the release looked and opens its heap
