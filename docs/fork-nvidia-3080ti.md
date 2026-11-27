@@ -1223,6 +1223,13 @@ overlap copies the one in flight uses. The queue-signal build ran 280 to
 ends the process after 30 s without a frame) follows a compute queue stuck on
 a label value; it is still open.
 
+Follow-ups on the same base: lost lists' label writes ride a host list so the
+memory-system gate and predicted labels see them; queues keep a reference to
+the fences they wait on; the crash stack dump matches stack words against the
+process's handle list and keeps its deadline; the long-copy reach shrinks when
+the longest copy goes. Run gpu311: medians prep/sync/GPU/settle
+174/33/75/53 ms, no hang, no regression.
+
 ## Title memory in place (off by default)
 
 Shaders that reach title memory through the page table read zeros where no
