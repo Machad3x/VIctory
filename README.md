@@ -267,7 +267,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | Variable | Effect |
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_STACKS=20,60,crash` | every thread's stack at those seconds, and at the first unhandled exception (`crash`) |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |

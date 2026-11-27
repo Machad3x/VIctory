@@ -1,8 +1,12 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
-//! [`dump_stacks_on_schedule`], to find what a title waits on.
+//! [`dump_stacks_on_schedule`], to find what a title waits on. An entry
+//! `crash` prints them once more at the first unhandled exception: a title
+//! watchdog that ends a hung run with a write to address 0 then shows who
+//! waited on what.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
@@ -28,6 +32,7 @@ pub fn dump_stacks_on_schedule() {
         return;
     };
     let times = schedule(&list);
+    ON_CRASH.store(asks_crash(&list), Ordering::Relaxed);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
         for at in times {
@@ -49,6 +54,21 @@ fn schedule(list: &str) -> Vec<std::time::Duration> {
         .collect();
     times.sort();
     times
+}
+
+/// Whether a `VICTORY_STACKS` list asks for the stacks at a crash too.
+fn asks_crash(list: &str) -> bool {
+    list.split(',').any(|t| t.trim() == "crash")
+}
+
+/// `VICTORY_STACKS` named `crash` and no crash has printed them yet.
+static ON_CRASH: AtomicBool = AtomicBool::new(false);
+
+/// At an unhandled exception: every other thread's stack, once, if asked.
+pub(crate) fn dump_stacks_on_crash() {
+    if ON_CRASH.swap(false, Ordering::Relaxed) {
+        dump_stacks();
+    }
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -109,9 +129,9 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, (priority, base), rcx) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) rcx {rcx:#x}",
             name_of(thread),
             locate(start_of(thread))
         );
@@ -123,8 +143,9 @@ pub fn dump_stacks() {
     }
 }
 
-/// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+/// The thread's frames, its current and base scheduling priority (0-31),
+/// and its `rcx`: for a thread waiting in the kernel, the handle it waits on.
+fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), u64) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -138,7 +159,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, (0, 0), 0);
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
@@ -153,7 +174,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     if status != 0 || info.teb.is_null() {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
+        return (frames, (0, 0), 0);
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
     // holds the stack base at +8 and the stack limit at +0x10.
@@ -170,7 +191,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, (info.priority, info.base_priority), context.0.Rcx)
 }
 
 fn start_of(thread: HANDLE) -> usize {
@@ -207,6 +228,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schedule_takes_times_and_crash() {
+        assert!(!asks_crash("60, 20"));
+        assert!(asks_crash("crash") && schedule("crash").is_empty());
+        assert!(asks_crash("30, crash") && schedule("30,crash").len() == 1);
+    }
+
+    #[test]
     fn another_threads_stack_unwinds_to_its_start() {
         let (tx, rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
@@ -225,7 +253,7 @@ mod tests {
             )
         };
         assert!(!thread.is_null());
-        let (frames, _) = frames_of(thread);
+        let (frames, _, _) = frames_of(thread);
         // Waiting in the kernel, several frames down from the thread start.
         assert!(frames.len() >= 3, "{frames:?}");
         assert!(start_of(thread) != 0);

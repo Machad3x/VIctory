@@ -692,6 +692,8 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         eprint!("{end}");
         text.push_str(&end);
         append_to_log(&text);
+        #[cfg(feature = "diagnostics")]
+        crate::stacks::dump_stacks_on_crash();
     }
     #[cfg(feature = "diagnostics")]
     for (address, len, file) in SAVE.get().into_iter().flatten() {
