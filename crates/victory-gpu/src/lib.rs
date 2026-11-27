@@ -53,6 +53,8 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod pinned;
+#[cfg(windows)]
 mod placement;
 #[cfg(windows)]
 mod primitive;
@@ -83,6 +85,8 @@ mod watch;
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use pinned::{title_memory_change, title_memory_held};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_own, title_memory_remapped,

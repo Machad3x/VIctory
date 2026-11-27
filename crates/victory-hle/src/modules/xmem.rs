@@ -339,7 +339,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // The GPU side lets go of what it holds in place there first.
+            super::memoryapi::change(address, 0, || VirtualFree(address, 0, MEM_RELEASE));
             return;
         }
         let user = address.cast::<u8>();
@@ -398,9 +399,11 @@ impl Drop for Section {
         // GPU layer forgot their addresses here when they went.
         if let Some(&at) = self.1.get().filter(|&&at| at != 0) {
             // SAFETY: our view, with no write of the GPU layer's under way
-            // in it.
-            victory_gpu::with_own_views_idle(|| unsafe {
-                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void })
+            // in it; what the GPU side holds in place in it lets go first.
+            victory_gpu::with_own_views_idle(|| {
+                super::memoryapi::change(at as *const c_void, 0, || unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void })
+                })
             });
         }
         // SAFETY: our handle; views keep the section alive on their own.
@@ -1010,8 +1013,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        // What the GPU side holds in place in the view would make the unmap
+        // fail: it lets go first.
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        victory_gpu::title_memory_change(at, size, || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1019,7 +1024,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        });
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
