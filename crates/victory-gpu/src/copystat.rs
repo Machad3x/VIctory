@@ -168,7 +168,8 @@ pub(crate) enum C {
     HandlerOpenNs,
     HandlerSaves,
     HandlerTrackerWaitNs,
-    /// Heap sync slots found stale: never made, or nulled earlier (unmade),
+    /// Heap sync slots found stale: never made, or nulled earlier (unmade;
+    /// also a made slot whose entry is newer than the sync's generations),
     /// from the same view entry of an older generation (recycled), from
     /// another view entry (rewritten), and made while the record is not
     /// current (released, non-view record, or out-of-range index).
@@ -213,6 +214,10 @@ pub(crate) enum C {
     /// Submissions whose pull ran right after their lists, under their
     /// fence wait (`VICTORY_PULL_SAME_EXECUTE`).
     PullsRiding,
+    /// Heap sync slots handed to `mirror` (record or view generation
+    /// changed, or unmade holding a view record), of the `SyncSlots`
+    /// looked at.
+    SyncChanged,
     /// Bytes refreshed into video memory only (mirrored copies).
     VideoBytes,
 }
@@ -546,6 +551,13 @@ pub(crate) fn log(frames: f64) {
         c[C::ApiViewWrites as usize],
         c[C::ForgetCalls as usize],
     );
+    if c[C::SyncChanged as usize] != 0.0 {
+        tracing::info!(
+            "  heap sync per frame: {:.0} slots mirrored of {:.0} looked at",
+            c[C::SyncChanged as usize],
+            c[C::SyncSlots as usize],
+        );
+    }
     tracing::info!(
         "  marked copy-back per frame: pull {:.1} ms, pages {:.1} ms wall (upper bound a future overlap of the two could save, not measured: {:.1} ms); thread time: freshening {:.1} ms, reading {:.1} ms, comparing {:.1} ms, taking others {:.1} ms, writing {:.1} ms, taking and reading again {:.1} ms; {:.0} spans; {:.0} pulls run under their submission's wait",
         ms(c[C::MarkedPullUs as usize]),

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at, views_current};
+use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 pub(crate) struct HostHeap {
@@ -724,47 +724,101 @@ impl HostHeap {
     /// A heap sync of slots `first..last`, whose records are at `start` +
     /// index × `step`: [`HostHeap::mirror`] of each slot whose record
     /// differs from what the slot holds, the rest passed by as `mirror`
-    /// would, with one lock of each kind for them all instead of two per slot
-    /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
-    pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+    /// would, with one lock for them all instead of two per slot (a world
+    /// frame looks at ~700,000 slots, run perf3: ~75 ms). Records are copied
+    /// out in one read and compared with the slot's key (what API writes and
+    /// `mirror` made it) and with each view entry's generation, under one
+    /// lock of the views for the range ([`super::with_generations`]).
+    /// Mirrors every slot the old lookup per page did, and unmade slots
+    /// holding any view record (`mirror` decides). Returns how many slots it
+    /// handed to `mirror`.
+    pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) -> usize {
+        self.sync_slots_with(first, last, start, step, None)
+    }
+
+    /// [`HostHeap::sync_slots`], with the view generations given (tests)
+    /// instead of the views' own.
+    fn sync_slots_with(&self, first: u32, last: u32, start: u64, step: u64, generations: Option<&[u32]>) -> usize {
         // Slots past the host heap have no host slot: `mirror` passes them by.
         let last = last.min(self.count);
         if first >= last {
-            return;
+            return 0;
         }
         let at = |i: u32| start + u64::from(i) * step;
-        // SAFETY: records in title heap memory the caller found mapped.
-        let records: Vec<[u32; 3]> =
-            (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
-        let current = views_current(&records);
         // Stale slots by reason: unmade, recycled, rewritten, released.
         #[cfg(feature = "diagnostics")]
         let mut reasons = [0u64; 4];
-        let stale: Vec<u32> = {
+        let mut stale = Vec::new();
+        // The records' bytes, copied by the kernel in one read: reading
+        // them in place faults on guarded pages (run gpu274: 63,602 faults
+        // and 30 ms more a frame).
+        thread_local! {
+            static RECORDS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        RECORDS.with_borrow_mut(|buf| {
+            let len = (u64::from(last - first - 1) * step) as usize + size_of::<[u32; 3]>();
+            if buf.len() < len {
+                buf.resize(len, 0);
+            }
+            let bytes = &mut buf[..len];
+            let bulk = crate::host::read_into(at(first) as *const u8, bytes);
+            // The views' lock is taken inside this one, as `view_at` in
+            // `mirror` takes it.
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            (first..last)
-                .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| {
-                    let stale = match made.get(i as usize) {
-                        Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                        Some(&m) => m != 0,
-                        None => true,
-                    };
-                    // Keys are generation << 32 | view index (see `mirror`).
-                    #[cfg(feature = "diagnostics")]
-                    if stale {
-                        reasons[match (current, made.get(i as usize).copied()) {
-                            (_, None) | (true, Some(0)) => 0,
-                            (true, Some(m)) if m as u32 == view => 1,
-                            (true, _) => 2,
-                            (false, _) => 3,
-                        }] += 1;
+            let mut compare = |generations: &[u32]| for i in first..last {
+                let mut record = [0u8; 12];
+                if bulk {
+                    let o = (u64::from(i - first) * step) as usize;
+                    record.copy_from_slice(&bytes[o..o + 12]);
+                } else if !crate::host::read_into(at(i) as *const u8, &mut record) {
+                    // A page of the range not mapped: nothing to read there.
+                    continue;
+                }
+                let word = |k: usize| u32::from_le_bytes([record[k], record[k + 1], record[k + 2], record[k + 3]]);
+                let [tag, view, generation] = [word(0), word(4), word(8)];
+                // Keys are generation << 32 | view index (see `mirror`).
+                let key = u64::from(generation) << 32 | u64::from(view);
+                let m = made.get(i as usize).copied();
+                // Whether the record names a current view; None: an entry
+                // past those there are (`mirror` decides).
+                let current = || {
+                    if tag == VIEW_TAG {
+                        generations.get(view as usize).map(|&g| g == generation)
+                    } else {
+                        Some(false)
                     }
-                    stale
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
+                };
+                let is_stale = match m {
+                    None => true,
+                    // Made from another record: stale, current or not.
+                    Some(m) if m != 0 && m != key => true,
+                    // Unmade: any view record, current or not.
+                    Some(0) => tag == VIEW_TAG,
+                    // Made from this record: stale unless its view is current.
+                    Some(_) => current() != Some(true),
+                };
+                if !is_stale {
+                    continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    // An entry past those there are counts as current.
+                    let released = current() == Some(false);
+                    reasons[match m {
+                        None | Some(0) => 0,
+                        Some(m) if m == key => if released { 3 } else { 0 },
+                        Some(_) if released => 3,
+                        Some(m) if m as u32 == view => 1,
+                        Some(_) => 2,
+                    }] += 1;
+                }
+                stale.push(i);
+            };
+            match generations {
+                Some(generations) => compare(generations),
+                None => super::with_generations(compare),
+            }
+        });
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
@@ -772,10 +826,12 @@ impl HostHeap {
             add(C::SyncStaleRecycled, reasons[1]);
             add(C::SyncStaleRewritten, reasons[2]);
             add(C::SyncStaleReleased, reasons[3]);
+            add(C::SyncChanged, stale.len() as u64);
         }
-        for i in stale {
+        for &i in &stale {
             self.mirror(i, at(i), false);
         }
+        stale.len()
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -2882,9 +2938,11 @@ mod tests {
         assert!(host.kept(read), "made for the read");
     }
 
-    /// A heap sync makes the slots whose records the title changed as bytes
-    /// (a copy of another slot's record, a record cleared) and passes the
-    /// others by.
+    /// A heap sync mirrors the slots whose records the title changed as bytes
+    /// (a copy of another slot's record, a record cleared, an older record
+    /// over one an API write made), whose view was released, and unmade
+    /// slots holding a view record whatever the generations say, and passes
+    /// the others by.
     #[test]
     fn heap_syncs_make_the_slots_whose_records_changed() {
         if host().is_none() {
@@ -2902,14 +2960,48 @@ mod tests {
         // heap guarded read-only hung the suite).
         crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start);
         let host = title_heap.host().expect("a host view heap");
+        let sync = |generations: &[u32]| host.sync_slots_with(0, 4, start, 32, Some(generations));
+        let now = || crate::descriptor::with_generations(<[u32]>::to_vec);
         // SAFETY: slots 0 and 1 of the heap's memory, 32 bytes each.
-        unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
+        let copy = || unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
+        copy();
         assert!(!host.made(1), "copied as bytes: not seen yet");
-        host.sync_slots(0, 4, start, 32);
+        assert_eq!(sync(&now()), 1);
         assert!(host.made(0) && host.made(1) && !host.made(2));
-        // SAFETY: as above.
+        assert_eq!(sync(&now()), 0, "unchanged records are passed by");
+        // An API write makes slot 1 another view; the title then copies the
+        // older record back over it as bytes.
+        crate::descriptor::create_cbv(null, &[0, 0, 512, 0], start + 32);
+        assert_eq!(sync(&now()), 0, "made by the write");
+        copy();
+        assert_eq!(sync(&now()), 1, "the older record is mirrored");
+        assert_eq!(sync(&now()), 0, "slot 1 holds it now");
+        // Its view released (a newer generation of its entry), the records
+        // unchanged: both slots are looked at again. (`mirror` finds the view
+        // current: the release is only in the generations given.)
+        // SAFETY: slot 0's record.
+        let [_, entry, _] = unsafe { (start as *const [u32; 3]).read_unaligned() };
+        let mut released = now();
+        released[entry as usize] += 1;
+        assert_eq!(sync(&released), 2, "slots of a released view are mirrored");
+        // An unmade slot naming the entry is mirrored whether the generation
+        // given is older or newer than its record's.
+        // SAFETY: slots 0 and 2.
+        unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 64) as *mut u8, 32) };
+        assert!(!host.made(2), "copied as bytes: not seen yet");
+        assert_eq!(sync(&released), 3, "unmade, its generation older than the one given");
+        assert!(host.made(2), "`mirror` finds its view current");
+        // SAFETY: slot 0's record.
+        let [tag, _, generation] = unsafe { (start as *const [u32; 3]).read_unaligned() };
+        // SAFETY: slot 3 of the heap's memory.
+        unsafe { ((start + 96) as *mut [u32; 3]).write_unaligned([tag, entry, generation + 1]) };
+        assert_eq!(sync(&now()), 1, "unmade, its generation newer than the one given");
+        assert!(!host.made(3), "not a current view");
+        // SAFETY: slot 1 of the heap's memory.
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
-        host.sync_slots(0, 4, start, 32);
+        // SAFETY: slot 3 of the heap's memory.
+        unsafe { std::ptr::write_bytes((start + 96) as *mut u8, 0, 32) };
+        assert_eq!(sync(&now()), 1);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
     }
 

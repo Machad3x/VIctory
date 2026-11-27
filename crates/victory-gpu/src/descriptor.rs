@@ -457,8 +457,10 @@ pub(crate) enum View {
 /// views, samplers) are kept for the run; they are bounded by the title's
 /// memory and sampler states.
 struct Views {
-    /// Each entry's view and generation.
-    list: Vec<(View, u32)>,
+    /// Each entry's view.
+    list: Vec<View>,
+    /// Each entry's generation (a column of its own: heap syncs copy it).
+    generations: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -467,6 +469,7 @@ struct Views {
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
     list: Vec::new(),
+    generations: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -496,11 +499,12 @@ fn record(handle: u64, view: View) {
         None => {
             let i = match views.free.pop() {
                 Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+                    views.list[i as usize] = view.clone();
                     i
                 }
                 None => {
-                    views.list.push((view.clone(), 1));
+                    views.list.push(view.clone());
+                    views.generations.push(1);
                     views.list.len() as u32 - 1
                 }
             };
@@ -511,7 +515,7 @@ fn record(handle: u64, view: View) {
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = views.generations[i as usize];
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -528,14 +532,14 @@ pub(crate) fn forget(resource: usize) {
         return;
     };
     for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
+        let (view, generation) = (views.list[i as usize].clone(), views.generations[i as usize]);
         // Entries freed through a view's other resource may hold another
         // view by now.
         if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        views.generations[i as usize] = generation.wrapping_add(1).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -548,8 +552,8 @@ pub(crate) fn forget(resource: usize) {
 #[cfg(windows)]
 pub(crate) fn view_at(i: u32, generation: u32) -> Option<(View, Option<crate::resource::Pin>)> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| {
+    let view = views.list.get(i as usize)?;
+    (views.generations[i as usize] == generation).then(|| {
         let pin = match *view {
             View::Shader(r, _) | View::Unordered(r, ..) if r != 0 => {
                 // SAFETY: a current view's resource, under the views' lock.
@@ -561,16 +565,13 @@ pub(crate) fn view_at(i: u32, generation: u32) -> Option<(View, Option<crate::re
     })
 }
 
-/// For each record (tag, index, generation): whether it names a view that
-/// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+/// Runs `f` on each view entry's generation, under the views' lock: a
+/// record (tag, index, generation) names a current view, as [`view_at`] would
+/// find it, if its generation is the one there. Not copied: the list holds
+/// millions of entries (a copy per heap sync, run gpu275: ~70,000 page faults
+/// and ~50 ms a frame). A host heap's slot lock may be held, as by `view_at`.
+pub(crate) fn with_generations<R>(f: impl FnOnce(&[u32]) -> R) -> R {
+    f(&VIEWS.lock().unwrap_or_else(|e| e.into_inner()).generations)
 }
 
 /// [`view_at`] of the record at `handle`.
@@ -593,8 +594,8 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    let view = views.list.get(i as usize)?;
+    (tag == VIEW_TAG && views.generations[i as usize] == generation).then(|| view.clone())
 }
 
 /// A description of `N` words, if the title passes one.
