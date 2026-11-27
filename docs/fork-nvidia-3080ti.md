@@ -1315,6 +1315,38 @@ made the per-submission heap sync three times slower (90 to 168 ms against
 sync takes the table alone again. Run gpu314 (map off): medians
 prep/sync/GPU/settle 136/54/89/55 ms, no regression.
 
+## The watchdog hang with a cold pipeline cache (`gpu88` to `gpu313`)
+
+Runs that made 650 to 1,600 host pipelines ended in the title's own
+watchdog (an access violation 30 s after the last completed frame). The
+crash-time stacks of `gpu312` and `gpu313`, symbolised with the run's PDB,
+put the title's submitting thread in the same place both times:
+`Shared::rewrite` > `backstop` > `inplace::private_runs` > `per_view` >
+`allocation_end`, in `VirtualQuery`. That walk went from each run (at most
+8 MiB) to the end of its allocation, and the title's private memory is one
+allocation of thousands of regions: per run, per page table, twice per
+rewrite, while the thread held the held-work lock and the heap. Title
+threads writing views (`descriptor::mirror`) and submitting
+(`copy_page_mappings`) waited behind it, so the list writing the
+frame-progress word the held compute work waited on (written by no list
+before, value 0) was never submitted. Before that, in `gpu313`, the same
+submission had waited 20.0 s for pipelines (15:13:01.9 to 21.9), since
+screen passes, compute and the builder each had 20 s, kept per title frame
+(which counts on while a submission waits). No draw or dispatch was
+dropped in that stall.
+
+Fixed: the walk stops at the run's end; all pipeline waits of a presented
+frame share one 10 s allowance (0.5 s for other draws, 3 s kept for screen
+passes); a waited pipeline goes to the front of its queue; one pipeline is
+waited for 10 s in all, not again every frame; screen passes have two
+workers of their own (tn1 `6563de95`). Library saves serialise into a
+mapped file (fxceless `6fa814fb`) and skip an unchanged library (`gpu313`
+wrote 2 GB in 4.3 s for an early-list change). Review fixes of the rt-fix
+merge: runs are dropped from the page tables where no submission runs,
+blocking, not spinning; one settle deadline per title change; a refusal is
+retried only within 20 ms of a let-go; a range the title changed during an
+open is not refused for good. Not run with the game yet.
+
 ## Open problems
 
 - About 1 frame per second.
