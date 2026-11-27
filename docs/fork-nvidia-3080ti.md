@@ -1347,6 +1347,26 @@ blocking, not spinning; one settle deadline per title change; a refusal is
 retried only within 20 ms of a let-go; a range the title changed during an
 open is not refused for good. Not run with the game yet.
 
+`gpu315` (those fixes, cold cache, 1,910 pipelines being made) still ended
+in the watchdog at 126 s: presents stopped between 18:36:33 and 18:36:38,
+and its stacks again had the submitting thread in `Shared::rewrite` >
+`backstop` > `per_view` > `VirtualQuery`, a title thread behind it on the
+held-work lock, and the opening thread in `private_open` > `VirtualQuery`.
+The bound had only shortened each walk: a rewrite still queried memory for
+every run of every block on each submission whose in-place generation
+moved (each run opened moves it). The builder's 28 pipelines, queued behind
+1,900 early starts, were still being made at its first frame; the
+allowance was gone, it waited 0 ms and its dispatches dropped (the `gpu307`
+shape). Now the submitting thread only looks pages up in the open runs;
+what no run holds is handed to the opening thread, which queries memory
+and opens it (private asks still waited for, 100 ms a frame). Builder
+pipelines go to the front of the screen passes' queue at creation, may use
+the whole allowance and are not held to the per-pipeline limit; waits on
+several threads at once count once. Second review: the settle starts when
+the release returns, a title change waits at most 2 s for the tables (not
+on the retire thread), library saves are flushed and summed and a library
+that does not match its sum is not loaded, stale staging files are removed.
+
 ## Open problems
 
 - About 1 frame per second.
