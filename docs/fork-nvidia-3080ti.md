@@ -1130,6 +1130,41 @@ branches. Bleached, near-white hair showed in `gpu277` and `gpu278` on
 different branches, cause not established; `gpu278` also showed blocky
 rectangles on a poster.
 
+## Audit fixes and dark runs, `gpu276` to `gpu280`
+
+Six fixes from the code audit:
+
+- Root views the title leaves unbound read a zeroed scratch buffer
+  (`VICTORY_UNBOUND_SCRATCH=0` leaves them as they are, with a warning
+  naming where they lie).
+- The pipeline library is saved every 20 s, not only at exit.
+- A riding pull's list is freed only after its fence.
+- A riding pull holds the locks of the pages it found stale until its wait,
+  and marks them stale again if it did not bring them back.
+- The save pool is allocated outside its lock.
+
+Medians of the last 15 frames:
+
+| Run | Build | Prep / sync heaps / GPU / settle ms | Frame ms | Picture |
+|---|---|---|---|---|
+| `gpu276` | audit fixes | 134.5 / 55.4 / 97.4 / 52.3 | 302 | Lit |
+| `gpu277` | audit fixes | 128.3 / 53.9 / 92.0 / 49.2 | 279 | Dark, bleached hair |
+| `gpu279` | audit fixes | 134.6 / 52.6 / 96.2 / 53.1 | 281 | Dark; no unbound root view warnings (the scratch was never bound) |
+| `gpu280` | main, control | 136.7 / 55.4 / 95.9 / 51.6 | 287 | Dark |
+
+Waits on stale page locks: 0 to 0.04 ms. The fixes neither cost nor save
+time. The dark interior is intermittent on both builds: 2 of the last 5 main
+runs and 2 of 3 audit runs.
+
+### Dark interior: what separates the runs
+
+In dark runs the title never binds 7 lighting compute pipelines, which are
+all translated and created. In runs with bleached hair it never binds 3 hair
+compute pipelines and 1 mesh pipeline. Under study, as what could make the
+title skip them: GPU writes the copy-back withholds that the title reads
+back, occlusion queries measured on a black first frame, and timestamps that
+report CPU time.
+
 ## Open problems
 
 - About 1 frame per second.
