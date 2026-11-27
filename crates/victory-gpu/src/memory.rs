@@ -173,11 +173,12 @@ struct Shared {
     pairs: fx::Map<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
-    /// The view pair of each run in place it names, by run id and whether
-    /// stores go through it, the generation of what is in place it names
-    /// ([`crate::inplace::generation`]), and whether it names runs
-    /// load-only ([`crate::inplace::table_load_only`]).
-    run_pairs: fx::Map<(u64, bool), u32>,
+    /// The view pair of each run in place it names, by run id, the
+    /// generation of what is in place it names
+    /// ([`crate::inplace::generation`]), and whether its pairs are
+    /// load-only ([`crate::inplace::table_load_only`]; one pair a run, its
+    /// unordered access view made anew when that changes).
+    run_pairs: fx::Map<u64, u32>,
     in_place: u64,
     load_only: bool,
     /// The number of [`WANTED`] regions it was written with.
@@ -276,6 +277,11 @@ static SUBMISSION_MISSED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 
 /// A submission's lists ran: whether one using title memory read or wrote
 /// memory with no copy.
+///
+/// Called at a submission's retire, before the next submission prepares
+/// anything (`Host::lock_idle` waits for the retire in flight; a retire not
+/// waited for, when its fence wait could not be set, is the exception): the
+/// next submission's tables see the window open, and are load-only.
 pub(crate) fn note_submission(missed: bool) {
     use std::sync::atomic::Ordering::Relaxed;
     SUBMISSION_MISSED.store(missed, Relaxed);
@@ -804,14 +810,17 @@ impl Shared {
         // Memory still being opened (a list may miss), or a miss withholds:
         // stores through the runs are dropped, as withheld.
         let writable = !crate::inplace::table_load_only();
-        self.load_only = !writable;
+        if self.load_only == writable {
+            // The pairs it names already take the new mode.
+            self.set_load_only(heap, !writable);
+        }
         for (b, w) in wanted.iter().enumerate() {
             let first = blocks[b] * BLOCK;
             for (&(page, _, private), held) in w.iter().zip(crate::inplace::cover(&addrs(w))) {
                 let Some((placed, offset)) = held else {
                     continue;
                 };
-                let pair = match self.run_pairs.get(&(placed.id, writable)) {
+                let pair = match self.run_pairs.get(&placed.id) {
                     Some(&pair) => pair,
                     None => {
                         let Some(pair) = heap.pair() else {
@@ -820,7 +829,7 @@ impl Shared {
                             continue;
                         };
                         heap.raw_pair_of(pair, Some(&placed.buffer), placed.len as u64, writable);
-                        self.run_pairs.insert((placed.id, writable), pair);
+                        self.run_pairs.insert(placed.id, pair);
                         pair
                     }
                 };
@@ -839,8 +848,8 @@ impl Shared {
                 named_private += u64::from(private);
             }
         }
-        self.run_pairs.retain(|&(id, _), &mut pair| {
-            let keep = runs.iter().any(|r| r.id == id);
+        self.run_pairs.retain(|id, &mut pair| {
+            let keep = runs.iter().any(|r| r.id == *id);
             if !keep {
                 heap.raw_pair_at(pair, None, 0);
                 heap.free_pair(pair);
@@ -849,6 +858,19 @@ impl Shared {
         });
         crate::inplace::named(named, named_private);
         (backstopped, runs)
+    }
+
+    /// Its runs' pairs become load-only (their unordered access views null:
+    /// stores dropped) or writable again, in place: the table and its
+    /// layout stay as they are. Only while no submission runs.
+    fn set_load_only(&mut self, heap: &HostHeap, load_only: bool) {
+        for (id, &pair) in &self.run_pairs {
+            if let Some(run) = self.layout.runs.iter().find(|r| r.id == *id) {
+                heap.raw_pair_of(pair, Some(&run.buffer), run.len as u64, !load_only);
+            }
+        }
+        self.load_only = load_only;
+        crate::inplace::flipped();
     }
 
     /// Drops the runs `dead` names from the table: their entries become
@@ -976,6 +998,7 @@ pub(crate) fn serve_drops() {
             crate::host::release_later(Box::new(left.0));
         }
     }
+    crate::pinned::run_queued_later();
 }
 
 /// At a frame's end, with the backstop on: the page tables drop the runs
@@ -1022,6 +1045,8 @@ fn drop_runs_now(dead: &[u64]) {
     if !ran.is_empty() {
         crate::host::release_later(Box::new(ran));
     }
+    // Title changes queued over runs the tables named may be done now.
+    crate::pinned::run_queued_later();
 }
 
 /// [`drop_runs_now`], what lists ran with given back to be dropped.
@@ -1371,8 +1396,11 @@ fn layout(key: usize) -> Arc<Layout> {
 /// At submission, for a list using title memory with view heap `key`
 /// bound: the heap's page table names every host copy there is, each
 /// brought up to date (`add` takes a copy's range, once per submission
-/// until a step writes title memory).
-pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+/// until a step writes title memory). Whether the table names title memory
+/// in place load-only: what the list stores there is dropped, so what it
+/// computed is partial and its copies are withheld as a miss's are
+/// (`crate::host`'s settle).
+pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) -> bool {
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
@@ -1381,15 +1409,23 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let stale = s.generation != now;
         let stale = stale || counting() && s.wanted != wanted().len();
         let stale = stale || crate::inplace::backstop() && s.in_place != crate::inplace::generation();
-        // Named load-only while memory is opened or a miss withholds, and
-        // writable again once neither holds.
-        let stale = stale || crate::inplace::backstop() && s.load_only != crate::inplace::table_load_only();
         if stale {
             s.rewrite(heap, now);
+        } else if crate::inplace::backstop() {
+            // Load-only while memory is opened or a miss withholds, and
+            // writable again once neither holds: the runs' pairs alone.
+            let load_only = crate::inplace::table_load_only();
+            if s.load_only != load_only {
+                s.set_load_only(heap, load_only);
+            }
         }
-        Some(s.layout.clone())
+        Some((s.layout.clone(), s.load_only && !s.layout.runs.is_empty()))
     })
     .flatten();
+    let (layout, load_only) = match layout {
+        Some((l, load_only)) => (Some(l), load_only),
+        None => (None, false),
+    };
     // The layout replaced may hold copies' last references: released off
     // the submitting thread, as in `rewrite`.
     if let Some(l) = &layout
@@ -1408,6 +1444,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
             }
         }
     }
+    load_only
 }
 
 /// `list` uses title memory with view heap `key` bound: the heap's page
@@ -1691,6 +1728,22 @@ pub(crate) fn without_a_miss() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A submission's miss is known before the next submission writes its
+    /// tables: submissions are serialised from preparation to retire
+    /// (`Host::lock_idle` waits for the retire in flight), and the retire
+    /// notes the miss. So the very next table is load-only: no submission
+    /// prepared in between keeps a writable one.
+    #[test]
+    fn a_miss_makes_the_next_table_load_only() {
+        let _alone = without_a_miss();
+        assert!(!withholding());
+        note_submission(true);
+        assert!(withholding() && crate::inplace::table_load_only(), "the next table");
+        note_submission(false);
+        assert!(withholding(), "the window stays this frame and the next");
+        MISSED_IN.store(MISS_NEVER, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.

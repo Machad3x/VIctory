@@ -289,8 +289,10 @@ fn locked_ranges() -> order::Ranges {
 /// * `crate::watch`'s guard lock is taken before [`LOCKED_RANGES`]
 ///   (`protect_noting` asks [`locked`] under it), never after: nothing
 ///   takes the guard lock while holding the ranges.
-/// * The page tables' lock is held while waiting for the opening thread
-///   ([`wait_private`]), so that thread never takes it.
+/// * The opening thread never takes the page tables' lock (nor the heaps'
+///   or the held work's): nothing holding them waits for it now (the title's
+///   submission waits in [`wait_private`] before it takes any), and the
+///   assertion keeps it that way.
 pub(crate) mod order {
     use std::collections::BTreeMap;
     use std::sync::MutexGuard;
@@ -595,8 +597,9 @@ fn joined(open: &BTreeMap<usize, Arc<Run>>, at: usize, len: usize) -> ((usize, u
 
 /// The run holding our view's `[at, at + len)`, and where the range starts
 /// in it; None while it is not open yet: it is asked of the worker, which
-/// opens it off the submitting thread (a later table names it, or this one
-/// after [`wait_private`]), unless the host refused it before. `private`:
+/// opens it off the submitting thread (a later table names it, the next
+/// submission's once [`wait_private`] waited for it before taking its
+/// locks), unless the host refused it before. `private`:
 /// the title's own memory at its own address.
 pub(crate) fn run_for(at: usize, len: usize, private: bool) -> Option<(Arc<Run>, usize)> {
     let ask = with_runs(|r| {
@@ -645,6 +648,15 @@ pub(crate) fn wait_private() -> bool {
         RT[3].fetch_add(1, Ordering::Relaxed);
     }
     done
+}
+
+/// Page tables whose runs turned load-only or writable since the last
+/// frame line (their pairs made anew, `crate::memory`).
+static FLIPS: AtomicU64 = AtomicU64::new(0);
+
+/// A page table's runs turned load-only or writable.
+pub(crate) fn flipped() {
+    FLIPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Whether a page table written now names in-place runs load-only (stores
@@ -1451,8 +1463,9 @@ pub(crate) fn log_frame() {
         return;
     }
     let (runs, waiting, gone) = with_runs(|r| (r.open.len(), r.pending.len(), r.gone.len()));
+    let flips = FLIPS.swap(0, Ordering::Relaxed);
     tracing::info!(
-        "title memory in place (VICTORY_INPLACE_BACKSTOP): {runs} runs, {:.1} MB open, {named} pages named by the last page table, {written} pages written this frame ({withheld} of them where writes are withheld), {opened} runs opened in {:.1} ms off the submitting thread, {waiting} waiting, {gone} views gone kept mapped; runs refused: {} past VICTORY_INPLACE_MB, {} by the host",
+        "title memory in place (VICTORY_INPLACE_BACKSTOP): {runs} runs, {:.1} MB open, {named} pages named by the last page table, {written} pages written this frame ({withheld} of them where writes are withheld), {opened} runs opened in {:.1} ms off the submitting thread, {waiting} waiting, {gone} views gone kept mapped; tables turned load-only or writable this frame: {flips}; runs refused: {} past VICTORY_INPLACE_MB, {} by the host",
         OPEN.load(Ordering::Relaxed) as f64 / 1e6,
         took as f64 / 1e3,
         STATS[0].load(Ordering::Relaxed),
@@ -1754,7 +1767,7 @@ mod tests {
         assert_ne!(at, 0);
         let free = || {
             // SAFETY: our allocation.
-            crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) })
+            crate::pinned::title_memory_change_scoped(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) })
         };
         let protect = |to: u32| {
             let mut old = 0;
@@ -1789,7 +1802,7 @@ mod tests {
         assert!(!locked(at / PAGE + 4));
         assert_eq!(protect(mem::PAGE_READONLY), 0, "locked while the heap lives");
         // The title's call, through the runtime.
-        let done = crate::pinned::title_memory_change(at, PAGE, || protect(mem::PAGE_READONLY));
+        let done = crate::pinned::title_memory_change_scoped(at, PAGE, || protect(mem::PAGE_READONLY));
         assert_ne!(done, 0, "let go first, then protected");
         assert!(with_runs(|r| holding(&r.open, at, len)).is_none(), "forgotten");
         assert!(with_runs(|r| r.open.values().all(|run| run.id != id)));
@@ -1814,7 +1827,7 @@ mod tests {
         unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of::<mem::MEMORY_BASIC_INFORMATION>()) };
         assert_eq!(info.Protect, mem::PAGE_READONLY);
         assert!(!locked(at / PAGE) || with_runs(|r| holding(&r.open, at, len)).is_some(), "locked only by an open run");
-        assert_ne!(crate::pinned::title_memory_change(at, PAGE, || protect(mem::PAGE_READWRITE)), 0);
+        assert_ne!(crate::pinned::title_memory_change_scoped(at, PAGE, || protect(mem::PAGE_READWRITE)), 0);
         // Open again and let go for a tracker while a layout lists ran with
         // still holds its heap: the pages stay locked, and the title's free
         // still lets the heap go first.
@@ -1855,7 +1868,7 @@ mod tests {
         assert!(crate::pinned::title_memory_held());
         let freer = std::thread::spawn(move || {
             // SAFETY: our allocation.
-            crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) })
+            crate::pinned::title_memory_change_scoped(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) })
         });
         let freed = freer.join().unwrap();
         stall::arm(0);
@@ -1918,7 +1931,7 @@ mod tests {
         // The heap goes with the last reference (a table's, here this one).
         drop(held);
         // SAFETY: our allocation.
-        assert_ne!(crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
+        assert_ne!(crate::pinned::title_memory_change_scoped(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
         assert!(!ask(Vec::new(), true), "no pages, no ask");
     }
 
@@ -1938,7 +1951,7 @@ mod tests {
         let protect = move |to: u32| {
             let mut old = 0;
             // SAFETY: our allocation.
-            crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualProtect(at as *const c_void, len, to, &mut old) })
+            crate::pinned::title_memory_change_scoped(at, len, || unsafe { mem::VirtualProtect(at as *const c_void, len, to, &mut old) })
         };
         stall::arm(at);
         assert!(run_for(at, len, true).is_none(), "asked of the worker");
@@ -1955,7 +1968,7 @@ mod tests {
         // Without a host GPU nothing opens; the range is still asked again.
         assert!(open || crate::host::host().is_none() || with_runs(|r| r.refused.contains(&(at, len))));
         // SAFETY: our allocation.
-        assert_ne!(crate::pinned::title_memory_change(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
+        assert_ne!(crate::pinned::title_memory_change_scoped(at, len, || unsafe { mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE) }), 0);
     }
 
     /// The wait for the worker ends when the last asked run is done, woken

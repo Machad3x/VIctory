@@ -1735,6 +1735,13 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// Its last run named title memory in place load-only
+    /// (`crate::memory::prepare`): its stores there were dropped, so its
+    /// copies are withheld as a miss's are, not counted as a miss.
+    ran_load_only: bool,
+    /// Tests: as if its table named title memory in place load-only.
+    #[cfg(test)]
+    load_only_test: bool,
     /// Buffers shaders wrote, copied at the list's end into read-back
     /// buffers (from, to, bytes; [`HostList::read_back_at_close`]).
     read_backs: Vec<(ID3D12Resource, ID3D12Resource, u64)>,
@@ -2492,7 +2499,13 @@ impl Host {
             .iter()
             .map(|list| crate::memory::withholds() && list.deferred().missed.iter().any(|check| check()))
             .collect();
+        // Only real misses open the window (a load-only table's would keep
+        // the tables load-only for good).
         crate::memory::note_submission(missed.contains(&true));
+        // A list that ran on a load-only table had its stores in place
+        // dropped (atomics read 0): what it computed is partial, so its
+        // copies stay out of title memory as a miss's do.
+        let missed: Vec<bool> = runs.iter().zip(missed).map(|(list, m)| m || list.deferred().ran_load_only).collect();
         let withholding = crate::memory::withholding();
         #[cfg(feature = "diagnostics")]
         {
@@ -3703,7 +3716,8 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        let deferred = self.deferred();
+        let mut deferred = self.deferred();
+        let mut ran_load_only = false;
         let mut steps = deferred.copies.iter().peekable();
         while let Some(step) = steps.next() {
             let mut started = std::time::Instant::now();
@@ -3819,13 +3833,18 @@ impl HostList {
                     continue;
                 }
                 &Step::Memory(heap) => {
-                    crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    let load_only = crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    ran_load_only |= load_only;
                     continue;
                 }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
+        drop(steps);
+        #[cfg(test)]
+        let ran_load_only = ran_load_only || deferred.load_only_test;
+        deferred.ran_load_only = ran_load_only;
     }
 }
 
@@ -6571,6 +6590,44 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+
+    /// A list that ran on a page table naming title memory in place
+    /// load-only had its stores there dropped (atomics read 0): what its
+    /// programs using title memory computed is partial, so their copies stay
+    /// out of title memory, though no miss was marked; and no miss window
+    /// opens (it would keep the tables load-only for good).
+    #[test]
+    fn a_list_on_a_load_only_table_is_withheld_as_a_miss() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let _alone = crate::memory::without_a_miss();
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: our pool, not guarded yet.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        {
+            let _writer = list.writer_uses_memory(true);
+            let (c, address) = (copy.clone(), (p + 16) as u64);
+            copy.refresh(&list, p as u64, 32);
+            copy.gpu_writes(&list, p as u64, 32, false);
+            list.defer_host(move || c.write_host(address, &[0x33]));
+        }
+        list.defer_missed(|| false);
+        list.deferred().load_only_test = true;
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: a byte of our pool.
+        let title = unsafe { ((p + 16) as *const u8).read_volatile() };
+        assert_eq!(title, 0x11, "withheld");
+        assert!(!crate::memory::withholding(), "no miss window");
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+        crate::watch::tests::free(p);
     }
 
     /// An ordinary marked range withheld because it overlaps a title-memory
