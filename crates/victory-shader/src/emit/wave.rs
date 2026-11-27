@@ -484,7 +484,25 @@ fn simulate(
                 Some(Operand::Scalar { code, .. }) => *code,
                 _ => NULL,
             };
+            // `s_bcnt1` of EXEC counts the lanes the section has on: a
+            // constant, as is SCC (whether any is).
+            let count = (matches!(name, "s_bcnt1_i32_b64" | "s_bcnt1_i32_b32")
+                && matches!(src.first(), Some(Operand::Scalar { code: EXEC, .. })))
+            .then(|| {
+                let on = if name == "s_bcnt1_i32_b64" {
+                    exec
+                } else {
+                    exec & 0xFFFF_FFFF
+                };
+                on.count_ones()
+            });
             for &(r, w) in &inst.writes {
+                if let Some(n) = count {
+                    let k = if r == Reg::Scc { u32::from(n != 0) } else { n };
+                    sconst.insert(w, k);
+                    uni.insert(w, Sym::K(k));
+                    continue;
+                }
                 // A copy of a constant keeps it (an `s_mov_b*` from an
                 // inline constant or from a scalar the section itself set
                 // to one); anything else drops what the scalar held. A
