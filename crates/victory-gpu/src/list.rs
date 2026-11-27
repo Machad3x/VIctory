@@ -2247,12 +2247,14 @@ fn orders_arguments(group: &[u32; 4]) -> bool {
     if at == 0 {
         return false;
     }
-    (0..u64::from(group[1].min(64))).any(|k| {
-        let mut words = [0u8; 16];
-        if !crate::host::read_into((at + k * size) as *const u8, &mut words) {
-            return false;
-        }
-        let word = |i: usize| u32::from_le_bytes([words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3]]);
+    // One kernel read for the group, not one per barrier (about 1,100 groups
+    // a frame in the world).
+    let mut bytes = vec![0u8; group[1].min(64) as usize * size];
+    if !crate::host::read_into(at as *const u8, &mut bytes) {
+        return false;
+    }
+    bytes.chunks_exact(size).any(|b| {
+        let word = |i: usize| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]);
         word(1) & EXECUTE_INDIRECT != 0 || word(3) & INDIRECT_ARGUMENT != 0
     })
 }

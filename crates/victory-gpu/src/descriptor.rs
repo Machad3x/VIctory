@@ -123,11 +123,10 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap. Read by everything that uses a heap through it (a
-/// heap is not dropped meanwhile), written only to add or drop one: title
-/// threads writing views do not wait for a heap sync (they waited about
-/// 200 ms a frame on the plain lock it held, run gpu280). The host heaps'
-/// own locks order what they do to one slot (draw threads mirror slots
-/// without this lock too).
+/// heap is not dropped meanwhile), written to add or drop one and by a heap
+/// sync ([`sync_heaps`]), which title threads writing views wait for. The
+/// host heaps' own locks order what they do to one slot (draw threads
+/// mirror slots without this lock too).
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
@@ -179,7 +178,11 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // Alone: title threads mirroring view writes meanwhile contend for every
+    // slot it makes, which tripled its time on the submitting thread (52 to
+    // 150 ms a frame, runs gpu309 and gpu310) for the 220 ms a frame the title
+    // threads waited, off that thread.
+    let heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
