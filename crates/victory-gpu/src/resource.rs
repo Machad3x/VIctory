@@ -1917,7 +1917,10 @@ pub(crate) fn targets_room_kept() -> u64 {
     GREW[1].store(since, Relaxed);
     // Whether the reserve was given up once already.
     static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let still = now.saturating_sub(since);
+    // Before the world's first frame the settle clock does not run: menus
+    // and loading screens that hold their targets still for 20 s would give
+    // the reserve up before the world's targets are made.
+    let still = if world_begun() { now.saturating_sub(since) } else { 0 };
     let released = RELEASED.load(Relaxed);
     if settle > 0 && still >= settle {
         RELEASED.store(true, Relaxed);
