@@ -127,20 +127,27 @@ impl Ripe {
 /// Pieces cut from blocks that were not ripe, for want of a ripe one.
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
-/// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+/// The free ranges of a block: start and length, never two that touch; and
+/// their bytes in all.
+struct Ranges(BTreeMap<u64, u64>, u64);
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges(BTreeMap::from([(0, size)]), size)
     }
 
-    /// The lowest place for `len` bytes at a multiple of `align`.
+    /// The place for `len` bytes at a multiple of `align` in the smallest
+    /// range it fits (the lowest of those), so that holes fill and large
+    /// ranges stay whole.
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
-            let at = start.next_multiple_of(align);
-            (at + len <= start + size).then_some((start, size, at))
-        })?;
+        let (start, size, at) = self
+            .0
+            .iter()
+            .filter_map(|(&start, &size)| {
+                let at = start.next_multiple_of(align);
+                (at + len <= start + size).then_some((start, size, at))
+            })
+            .min_by_key(|&(start, size, _)| (size, start))?;
         self.0.remove(&start);
         if at > start {
             self.0.insert(start, at - start);
@@ -148,10 +155,12 @@ impl Ranges {
         if at + len < start + size {
             self.0.insert(at + len, start + size - at - len);
         }
+        self.1 -= len;
         Some(at)
     }
 
     fn give(&mut self, mut start: u64, mut len: u64) {
+        self.1 += len;
         if let Some((&before, &size)) = self.0.range(..start).next_back()
             && before + size == start
         {
@@ -162,6 +171,11 @@ impl Ranges {
             len += size;
         }
         self.0.insert(start, len);
+    }
+
+    /// Free bytes.
+    fn bytes(&self) -> u64 {
+        self.1
     }
 
     fn whole(&self, size: u64) -> bool {
@@ -228,16 +242,16 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
-        let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
-            }
-        }
+        // The fullest ripe block first: pieces go where others lie, and
+        // blocks with few drain and are let go ([`Pool::reclaim`]).
+        let mut ripe_blocks: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().filter(|b| ripe.is(b) && b.free.bytes() >= len).map(|b| (b.free.bytes(), i)))
+            .collect();
+        ripe_blocks.sort_unstable();
+        let mut found = ripe_blocks.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
             let mut unripe: Vec<(u64, usize)> =
@@ -338,6 +352,12 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// Free bytes in blocks that hold some piece, and those blocks.
+    fn holes(&self) -> (u64, u64) {
+        let partly = self.blocks.iter().flatten().filter(|b| !b.free.whole(BLOCK));
+        partly.fold((0, 0), |(bytes, n), b| (bytes + b.free.bytes(), n + 1))
+    }
 }
 
 /// A mapped upload buffer's memory.
@@ -360,6 +380,14 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// Holes of the texture blocks: MiB free in blocks that hold some piece,
+/// those blocks, and all blocks.
+pub(crate) fn texture_holes() -> [u64; 3] {
+    let pool = lock(&TEXTURES);
+    let (bytes, n) = pool.holes();
+    [bytes >> 20, n, pool.blocks() as u64]
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -698,6 +726,9 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
         }
+        if let Some(h) = &heap {
+            crate::host::priority(device, h, false);
+        }
         heap
     })?;
     let mut made: Option<ID3D12Resource> = None;
@@ -753,6 +784,53 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn ranges_fill_the_smallest_hole_that_fits() {
+        let mut r = Ranges::new(1024);
+        assert_eq!(r.take(1024, 1), Some(0));
+        r.give(0, 300);
+        r.give(500, 100);
+        r.give(800, 224);
+        assert_eq!(r.bytes(), 624);
+        assert_eq!(r.take(100, 1), Some(500));
+        assert_eq!(r.take(200, 1), Some(800));
+        assert_eq!(r.take(250, 1), Some(0));
+        assert_eq!(r.bytes(), 74);
+    }
+
+    #[test]
+    fn pieces_go_to_the_fullest_block_and_sparse_ones_drain() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let quarter = BLOCK / 4;
+        // Two blocks full, then three quarters of each given back.
+        let pieces: Vec<Piece> = (0..8).map(|_| pool.take(quarter, 65536, 0, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 2);
+        let (a, b) = (pieces[0].block, pieces[4].block);
+        for p in &pieces[1..4] {
+            pool.give(*p, 0);
+        }
+        for p in &pieces[5..7] {
+            pool.give(*p, 0);
+        }
+        pool.rested(REST);
+        // Block b holds two quarters, a one: new pieces go to b until it is
+        // full, a's last piece goes, and a is let go past the spares.
+        let (p, _, _) = pool.take(quarter, 65536, REST, make).unwrap();
+        assert_eq!(p.block, b);
+        let (q, _, _) = pool.take(quarter, 65536, REST, make).unwrap();
+        assert_eq!(q.block, b);
+        pool.give(pieces[0], REST);
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.blocks[a].is_none());
+        assert_eq!(pool.holes(), (0, 1));
     }
 
     #[test]
