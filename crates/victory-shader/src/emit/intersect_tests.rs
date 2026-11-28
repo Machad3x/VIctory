@@ -612,6 +612,25 @@ fn the_32_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     run(false, Descriptor::Table, u64::from(NODES), true);
 }
 
+/// The buffer path's bound (#2368's counterexamples): a pointer whose node
+/// lies 4 GiB or more into the BVH has no 32-bit buffer offset, and the
+/// test agrees with the 64-bit offset `(pointer & !7) * 8`.
+#[test]
+fn nodes_past_4_gib_do_not_fit_a_buffer_offset() {
+    use super::lower::intersect::node_fits_buffer;
+    for (lo, hi, fits) in [
+        (0x1fff_fffdu32, 0u32, true), // 4 GiB - 64 bytes
+        (0x2000_0005, 0, false),      // 4 GiB: the low bits alone name node 0
+        (0x0000_0005, 1, false),      // 32 GiB
+        (0xffff_fffd, 0, false),
+        (5, 0, true),
+    ] {
+        let offset = ((u64::from(hi) << 32 | u64::from(lo)) & !7) * 8;
+        assert_eq!(offset < 1 << 32, fits, "pointer {hi:#x}:{lo:#x}");
+        assert_eq!(node_fits_buffer(lo, hi), fits, "pointer {hi:#x}:{lo:#x}");
+    }
+}
+
 /// Where the tests' title memory puts the buffer: past 4 GiB, on 256 bytes.
 const BASE: u64 = 0x12_3456_7800;
 
