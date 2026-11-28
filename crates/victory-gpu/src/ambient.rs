@@ -460,7 +460,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (any(isnan(found)) || any(isinf(found)) || any(found < 0.0)) found = 0.0;
     float3 was = unpack(light[p]);
+    if (any(isnan(was)) || any(isinf(was)) || any(was < 0.0)) was = 0.0;
     // Magenta/violet garbage the probes' memory held (green far under red and
     // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
     // garbage probes"). Seen on an RTX 5080 as a purple-blue glow on a lit
