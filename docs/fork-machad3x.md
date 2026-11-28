@@ -71,3 +71,21 @@ From now on, runs are compared on the average of the last 120 s (24 frame lines)
 |---|---|---|---|---|---|---|
 | t4b (batch 4) | 77.7 (110) | 24.3 | 41.5 | 10.0 | 0 | — |
 | t7a-2 (batch 7) | 75.2 (100) | 19.4 | 43.4 | 10.5 | 0 | alive 240 s, picture as t4b |
+
+## Batch 8 (2026-11-27)
+
+- Root-view buffer accesses in OOB_SELECT 1 (index only) mode drop lanes whose index is at or past `num_records`: loads read 0 and stores are dropped, as on the console. Offsets stay signed.
+- A null constant buffer view description writes a null view (port of trustno1-coder/VIctory-NVIDIA#646).
+- Heap samplers keep point mips when anisotropic, as static samplers do (port of trustno1-coder/VIctory-NVIDIA#656).
+- The compacted size of an acceleration structure is answered at the title's call with the builder's own maximum, and the builder's later size store is kept off the answered slot (`VICTORY_BVH_SIZE_ANSWER`, on by default, `=0` turns it off).
+
+| run | ms/frame (120 s avg, max) | GPU ms | prep ms | copy-back ms | dropped | result |
+|---|---|---|---|---|---|---|
+| t7a-2 (batch 7) | 75.2 (100) | 19.4 | 43.4 | 10.5 | 0 | â€” |
+| t8a-2 (batch 8) | 66.8 (85) | 6.1 | 47.1 | 11.4 | 0 | alive 240 s, picture as t7a-2; the 120 s shot is white (seen before in t4b, not attributed) |
+
+No shader or pipeline is refused.
+
+### Pacing option
+
+`VICTORY_LATE_WAIT=0` turns the late wait off: submissions are not held back. It is off by default. On this machine it costs a lot (run t7w: 124.3 ms/frame against 75.2), but it can feel steadier on some setups.
