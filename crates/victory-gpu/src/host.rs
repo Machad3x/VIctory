@@ -10152,11 +10152,24 @@ impl Meter {
                  {indirect:.0} indirect ({left_out:.0} of all these left out on purpose: \
                  ray-tracing passes without the structure builder); heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 {picked_waiting} in the queue ({picked_fresh} not uploaded yet, {picked_due} due now, {picked_memory} waiting for their \
+                 memory, {picked_partly} uploaded in part, {picked_again} uploaded whole and waiting for a look again), \
+                 {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
                  raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
+                // Why the slots in the queue are there (`TextureQueue::due_and_census`):
+                // in 134-160 s of a run 9,000 of 9,160 had been uploaded whole and
+                // only waited for their looks again, which read as 9,000 waiting.
+                picked_fresh = {
+                    let q = crate::draw::HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
+                    q[0].saturating_sub(q[2] + q[3] + q[5])
+                },
+                picked_due = crate::draw::HEAP_TEXTURES_QUEUE[1].load(Ordering::Relaxed),
+                picked_memory = crate::draw::HEAP_TEXTURES_QUEUE[2].load(Ordering::Relaxed),
+                picked_partly = crate::draw::HEAP_TEXTURES_QUEUE[3].load(Ordering::Relaxed),
+                picked_again = crate::draw::HEAP_TEXTURES_QUEUE[5].load(Ordering::Relaxed),
                 picked_away = crate::draw::HEAP_TEXTURES_AWAY.load(Ordering::Relaxed),
                 du0 = crate::resource::DEPTH_UNORDERED[0].load(Ordering::Relaxed),
                 du1 = crate::resource::DEPTH_UNORDERED[1].load(Ordering::Relaxed),
