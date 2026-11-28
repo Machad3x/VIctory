@@ -56,3 +56,18 @@ The defragmenting compute shader (02384a60fda6f2d0) is no longer left out:
 | t4b (batch 4) | Series X | 71.7-72.7 | 17-18 | 41-45 | 10-11 | 0 | alive 240 s, picture as t3r |
 
 Nothing is dropped or left out any more. The shader now running costs about 3 ms per frame.
+
+## Batch 7 (2026-11-27)
+
+- The emulated BVH walk is faster, with the same results:
+  - the second half of a box node is read from the same page lookup unless it crosses a page;
+  - a triangle node's 16 dwords are loaded up front;
+  - node addresses are computed in 32-bit pairs.
+- The precompiled-pipeline lookups (device methods 0x1c8 and 0x218) decline quietly. The title then builds the same pipelines through its normal path, so nothing was ever missing.
+
+From now on, runs are compared on the average of the last 120 s (24 frame lines), because single lines swing between 70 and 110 ms.
+
+| run | ms/frame (120 s avg, max) | GPU ms | prep ms | copy-back ms | dropped | result |
+|---|---|---|---|---|---|---|
+| t4b (batch 4) | 77.7 (110) | 24.3 | 41.5 | 10.0 | 0 | — |
+| t7a-2 (batch 7) | 75.2 (100) | 19.4 | 43.4 | 10.5 | 0 | alive 240 s, picture as t4b |
