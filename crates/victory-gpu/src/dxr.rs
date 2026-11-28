@@ -20,10 +20,33 @@
 //! STRUCTURE_BATCHED_DESC2`) is the console's own and its layout is not
 //! public: the wrapper looks for the standard desc in it ([`find_descs`])
 //! and logs its raw bytes (the first calls, then one in [`RAW_EVERY`]),
-//! with those of the memory its first qwords point to, for the next stage
-//! to be written against what a run shows. Nothing is built on the host yet.
+//! with those of the memory its first qwords point to. Nothing is built on
+//! the host yet.
+//!
+//! What a run's log showed of that layout ([`Element`]): elements of 80
+//! bytes, the standard desc first, then the number of postbuild info descs
+//! and their address (standard ones: where the answer goes, and what is
+//! asked).
+//!
+//! **Sizes answered at the call** (`VICTORY_BVH_SIZE_ANSWER`, on unless
+//! `0`, with the builder's stages on; needs no `VICTORY_DXR`). The title
+//! asks for a new structure's compacted size in a postbuild info desc; the
+//! builder has a program on the card store it, and the title reads the slot
+//! a frame or two later without looking whether the answer is there, takes
+//! memory of that size and has the structure copied into it. Our
+//! submissions land late, so it read another structure's size and the copy
+//! wrote over its neighbours. Here the slot holds an answer before the
+//! batched build returns: the builder's own
+//! `ResultDataMaxSizeInBytes` for the same inputs (what the title was told
+//! by `GetRaytracingAccelerationStructurePrebuildInfo`, a fourth wrapper,
+//! or the builder asked again), which no compacted structure exceeds. What
+//! the builder's program stores into an answered slot later is kept out of
+//! title memory ([`keep_answers`]): it may be an older structure's. The
+//! builder's dispatches run as before.
 
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// How far DXR is used.
@@ -52,6 +75,20 @@ pub fn mode() -> Mode {
     static MODE: std::sync::LazyLock<Mode> =
         std::sync::LazyLock::new(|| parse_mode(std::env::var("VICTORY_DXR").ok().as_deref()));
     *MODE
+}
+
+/// `VICTORY_BVH_SIZE_ANSWER`'s meaning: on unless `0`.
+pub fn parse_answers(value: Option<&str>) -> bool {
+    value.is_none_or(|v| v.trim() != "0")
+}
+
+/// Whether compacted sizes are answered at the call (see the module):
+/// `VICTORY_BVH_SIZE_ANSWER` unless `0`, in runs with the builder's stages.
+pub fn answers() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        parse_answers(std::env::var("VICTORY_BVH_SIZE_ANSWER").ok().as_deref()) && crate::pipeline::builder_allowed()
+    });
+    *ON
 }
 
 /// `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC`, as the title
@@ -88,6 +125,7 @@ pub const PERFORM_UPDATE: u32 = 0x20;
 /// `…_ALLOW_COMPACTION`.
 pub const ALLOW_COMPACTION: u32 = 0x2;
 pub const BUILD_DESC_BYTES: usize = 48;
+pub const INPUTS_BYTES: usize = 24;
 pub const GEOMETRY_DESC_BYTES: usize = 56;
 /// `D3D12_RAYTRACING_INSTANCE_DESC`.
 pub const INSTANCE_DESC_BYTES: usize = 64;
@@ -108,19 +146,9 @@ impl BuildDesc {
         if bytes.len() < BUILD_DESC_BYTES {
             return None;
         }
-        let (kind, layout) = (dword(bytes, 8), dword(bytes, 20));
-        if kind > 1 || layout > 1 {
-            return None;
-        }
         Some(BuildDesc {
             dest: qword(bytes, 0),
-            inputs: Inputs {
-                top: kind == 0,
-                flags: dword(bytes, 12),
-                count: dword(bytes, 16),
-                pointers: layout == 1,
-                descs: qword(bytes, 24),
-            },
+            inputs: Inputs::parse(&bytes[8..])?,
             source: qword(bytes, 32),
             scratch: qword(bytes, 40),
         })
@@ -138,6 +166,74 @@ impl BuildDesc {
             && (self.inputs.count == 0 || self.inputs.descs != 0)
             && (self.source == 0 || address(self.source))
             && (self.inputs.flags & PERFORM_UPDATE == 0 || self.source != 0)
+    }
+}
+
+impl Inputs {
+    /// The inputs in `bytes` (at least [`INPUTS_BYTES`]). None if a field
+    /// that only has two values holds another.
+    pub fn parse(bytes: &[u8]) -> Option<Inputs> {
+        if bytes.len() < INPUTS_BYTES {
+            return None;
+        }
+        let (kind, layout) = (dword(bytes, 0), dword(bytes, 12));
+        if kind > 1 || layout > 1 {
+            return None;
+        }
+        Some(Inputs {
+            top: kind == 0,
+            flags: dword(bytes, 4),
+            count: dword(bytes, 8),
+            pointers: layout == 1,
+            descs: qword(bytes, 16),
+        })
+    }
+
+    /// What a structure's sizes follow from: the kind, the flags, and of
+    /// each geometry its kind, flags, formats and counts. Not where the
+    /// data lies: the title is told sizes before it has placed anything.
+    pub fn key(&self, geometries: &[Geometry]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.top, self.flags, self.count).hash(&mut h);
+        for g in geometries {
+            match *g {
+                Geometry::Triangles { flags, index_format, vertex_format, indices, vertices, .. } => {
+                    (0u8, flags, index_format, vertex_format, indices, vertices).hash(&mut h);
+                }
+                Geometry::Boxes { flags, count, .. } => (1u8, flags, count).hash(&mut h),
+            }
+        }
+        h.finish()
+    }
+}
+
+/// One element of the batched build's array (`D3D12XBOX_BUILD_RAYTRACING_
+/// ACCELERATION_STRUCTURE_BATCHED_DESC2`), as a run's log showed it: the
+/// standard desc, then at 48 the number of postbuild info descs and at 56
+/// their address; 16 bytes more that were zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Element {
+    pub desc: BuildDesc,
+    pub postbuilds: u32,
+    /// `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC`s
+    /// ([`POSTBUILD_DESC_BYTES`] each): where the answer goes (a GPU
+    /// address, title memory), and in a dword what is asked.
+    pub postbuild_descs: u64,
+}
+
+pub const ELEMENT_BYTES: usize = 80;
+pub const POSTBUILD_DESC_BYTES: usize = 16;
+/// `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE`:
+/// the answer is one qword, the size in bytes.
+pub const COMPACTED_SIZE: u32 = 0;
+
+impl Element {
+    pub fn parse(bytes: &[u8]) -> Option<Element> {
+        if bytes.len() < ELEMENT_BYTES {
+            return None;
+        }
+        Some(Element { desc: BuildDesc::parse(bytes)?, postbuilds: dword(bytes, 48), postbuild_descs: qword(bytes, 56) })
     }
 }
 
@@ -224,8 +320,8 @@ pub fn find_descs(bytes: &[u8], count: u32) -> Option<Layout> {
 }
 
 /// Counters since the last frame line, in the order of [`NAMES`].
-static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
-const NAMES: [&str; 12] = [
+static COUNTS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+const NAMES: [&str; 16] = [
     "batched build calls",
     "batched elements",
     "top builds",
@@ -238,6 +334,10 @@ const NAMES: [&str; 12] = [
     "rehydrated structures",
     "copies",
     "descs not understood",
+    "prebuild calls",
+    "sizes answered",
+    "sizes not answered",
+    "late size stores kept off",
 ];
 const CALLS: usize = 0;
 const ELEMENTS: usize = 1;
@@ -251,6 +351,10 @@ const REHYDRATES: usize = 8;
 const REHYDRATED: usize = 9;
 const COPIES: usize = 10;
 const UNKNOWN: usize = 11;
+const PREBUILDS: usize = 12;
+const ANSWERED: usize = 13;
+const UNANSWERED: usize = 14;
+const KEPT_OFF: usize = 15;
 
 fn count(what: usize, n: u64) {
     COUNTS[what].fetch_add(n, Ordering::Relaxed);
@@ -259,7 +363,7 @@ fn count(what: usize, n: u64) {
 /// The counters' line: what the title asked of its builder over the last
 /// `frames` frames (from the 10 s line of title memory by address).
 pub(crate) fn log_frame(frames: u64) {
-    if mode() == Mode::Off {
+    if mode() == Mode::Off && !answers() {
         return;
     }
     let counts = COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
@@ -281,10 +385,10 @@ fn title_bytes(at: u64, len: usize) -> Option<Vec<u8>> {
     Some(unsafe { std::slice::from_raw_parts(at as *const u8, len) }.to_vec())
 }
 
-/// The first [`VERBOSE`] descs of each kind (bottom, top, copy) are
-/// logged whole.
+/// The first [`VERBOSE`] descs of each kind (bottom, top, copy, prebuild,
+/// size store kept off, size answered) are logged whole.
 const VERBOSE: u64 = 16;
-static LOGGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static LOGGED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// After the first [`VERBOSE`] batched calls, one in this many is dumped.
 const RAW_EVERY: u64 = 1024;
 static BATCHED_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -392,10 +496,220 @@ fn note_build(desc: &BuildDesc, how: &str) {
 }
 
 /// The real methods, where the title's imports pointed ([`hook`]).
-static REAL: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+static REAL: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 const BATCHED: usize = 0;
 const COPY: usize = 1;
 const REHYDRATE: usize = 2;
+const PREBUILD: usize = 3;
+
+/// The geometry descs of bottom-level `inputs` (title CPU memory), all of
+/// them or none; none for a top level.
+fn geometries(inputs: &Inputs) -> Option<Vec<Geometry>> {
+    let n = inputs.count as usize;
+    if inputs.top {
+        return Some(Vec::new());
+    }
+    if n > 4096 {
+        return None;
+    }
+    if inputs.pointers {
+        let pointers = title_bytes(inputs.descs, 8 * n)?;
+        return (0..n).map(|k| Geometry::parse(&title_bytes(qword(&pointers, 8 * k), GEOMETRY_DESC_BYTES)?)).collect();
+    }
+    title_bytes(inputs.descs, GEOMETRY_DESC_BYTES * n)?.chunks_exact(GEOMETRY_DESC_BYTES).map(Geometry::parse).collect()
+}
+
+/// What the builder told the title a structure may take at most
+/// (`ResultDataMaxSizeInBytes`), by [`Inputs::key`]: the last [`TOLD`]
+/// keys.
+#[derive(Default)]
+struct Told {
+    sizes: HashMap<u64, u64>,
+    order: VecDeque<u64>,
+}
+
+const TOLD: usize = 4096;
+
+impl Told {
+    fn put(&mut self, key: u64, size: u64) {
+        if self.sizes.insert(key, size).is_some() {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > TOLD
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.sizes.remove(&oldest);
+        }
+    }
+}
+
+static TOLD_SIZES: std::sync::LazyLock<Mutex<Told>> = std::sync::LazyLock::new(Mutex::default);
+/// The title's prebuild calls without a stream desc, and with one.
+static STREAMS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+type Prebuild = extern "system" fn(*mut c_void, *const c_void, *const c_void, *mut u64);
+
+/// `XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo(inputs,
+/// stream, info)`: the sizes of a structure and of its scratch memory, on
+/// the CPU. What it said of the structure is kept by the inputs' key.
+extern "system" fn prebuild(this: *mut c_void, inputs: *const c_void, stream: *const c_void, info: *mut u64) {
+    let real = REAL[PREBUILD].load(Ordering::Relaxed);
+    // SAFETY: the method the title imported, with the title's arguments.
+    let real: Prebuild = unsafe { std::mem::transmute(real) };
+    real(this, inputs, stream, info);
+    count(PREBUILDS, 1);
+    STREAMS[usize::from(!stream.is_null())].fetch_add(1, Ordering::Relaxed);
+    let read = title_bytes(inputs as u64, INPUTS_BYTES).as_deref().and_then(Inputs::parse);
+    let said = title_bytes(info as u64, 24).map(|b| [0, 8, 16].map(|at| qword(&b, at)));
+    let key = read.as_ref().and_then(|i| Some(i.key(&geometries(i)?)));
+    if let (Some(key), Some([size, ..])) = (key, said) {
+        TOLD_SIZES.lock().unwrap_or_else(|e| e.into_inner()).put(key, size);
+    }
+    if verbose(3) {
+        tracing::info!(
+            inputs = ?read,
+            stream = format_args!("{:#x}", stream as usize),
+            stream_bytes = %title_bytes(stream as u64, 16).as_deref().map(hex).unwrap_or_default(),
+            sizes = ?said,
+            key = ?key,
+            "dxr builder prebuild (result, scratch, update scratch)"
+        );
+    }
+}
+
+/// The most a structure of `inputs` (which lie at `at`, in a batched
+/// build's element) takes, as the builder itself says, and where that is
+/// from: what it told the title for the same inputs, else asked now, in
+/// the form the title asks (without a stream desc, and only once the title
+/// was seen to ask so and never otherwise).
+fn max_size(this: *mut c_void, inputs: &Inputs, at: u64) -> Option<(u64, &'static str)> {
+    let told = geometries(inputs).and_then(|g| TOLD_SIZES.lock().unwrap_or_else(|e| e.into_inner()).sizes.get(&inputs.key(&g)).copied());
+    let size = match told {
+        Some(size) => (size, "told to the title"),
+        None => {
+            let real = REAL[PREBUILD].load(Ordering::Relaxed);
+            if real == 0 || STREAMS[0].load(Ordering::Relaxed) == 0 || STREAMS[1].load(Ordering::Relaxed) != 0 {
+                return None;
+            }
+            let mut info = [0u64; 3];
+            // SAFETY: the builder's method as the title calls it, with the
+            // builder the title is calling now and the inputs it passes.
+            let real: Prebuild = unsafe { std::mem::transmute(real) };
+            real(this, at as *const c_void, std::ptr::null(), info.as_mut_ptr());
+            (info[0], "asked now")
+        }
+    };
+    (size.0 != 0 && size.0 < 1 << 32).then_some(size)
+}
+
+/// The slots (title addresses of a qword) that hold an answer of ours, and
+/// the span they lie in, for [`keep_answers`] to look no further in most
+/// calls.
+static SLOTS: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+static SPAN: [AtomicU64; 2] = [AtomicU64::new(u64::MAX), AtomicU64::new(0)];
+/// The most slots held: the title's are a ring in a small buffer.
+const SLOTS_MOST: usize = 1 << 16;
+
+/// `slot` holds an answer of ours from now on; false if no more are held.
+fn hold_slot(slot: u64) -> bool {
+    let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    if slots.len() >= SLOTS_MOST && !slots.contains(&slot) {
+        return false;
+    }
+    slots.insert(slot);
+    SPAN[0].fetch_min(slot, Ordering::Relaxed);
+    SPAN[1].fetch_max(slot + 8, Ordering::Relaxed);
+    true
+}
+
+/// `slot` is the builder's to store into again.
+fn free_slot(slot: u64) {
+    if slot < SPAN[1].load(Ordering::Relaxed) {
+        SLOTS.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
+    }
+}
+
+/// Before what shaders wrote goes into title memory at `at` (`title`: what
+/// is there, `merged`: the same with their bytes put in): the bytes of
+/// slots that hold an answer of ours stay as they are. The builder's store
+/// of a compacted size lands frames after the title asked, by when the
+/// slot may be another structure's. None if `merged` is right as it is.
+pub(crate) fn keep_answers(at: usize, title: &[u8], merged: &[u8]) -> Option<Vec<u8>> {
+    let (from, to) = (at as u64, (at + merged.len().min(title.len())) as u64);
+    if from >= SPAN[1].load(Ordering::Relaxed) || to <= SPAN[0].load(Ordering::Relaxed) {
+        return None;
+    }
+    let slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut kept: Option<Vec<u8>> = None;
+    for &slot in slots.range(from.saturating_sub(7)..to) {
+        let (a, b) = ((slot.max(from) - from) as usize, ((slot + 8).min(to) - from) as usize);
+        if merged[a..b] == title[a..b] {
+            continue;
+        }
+        count(KEPT_OFF, 1);
+        if b - a == 8 && verbose(4) {
+            tracing::info!(
+                slot = format_args!("{slot:#x}"),
+                answer = format_args!("{:#x}", qword(title, a)),
+                store = format_args!("{:#x}", qword(merged, a)),
+                "dxr: the builder's late size store is kept off an answered slot"
+            );
+        }
+        kept.get_or_insert_with(|| merged.to_vec())[a..b].copy_from_slice(&title[a..b]);
+    }
+    kept
+}
+
+/// Writes the answers of a batched build's compacted-size postbuild descs
+/// (see the module) and returns them (slot, size). A slot that gets no
+/// answer of ours (another kind of info, or no size known) is the
+/// builder's again.
+fn answer_sizes(this: *mut c_void, n: u32, descs: u64) -> Vec<(u64, u64)> {
+    let mut answered = Vec::new();
+    let Some(bytes) = title_bytes(descs, ELEMENT_BYTES * (n as usize).min(4096)) else {
+        return answered;
+    };
+    for (k, element) in bytes.chunks_exact(ELEMENT_BYTES).enumerate() {
+        let Some(element) = Element::parse(element).filter(|e| e.desc.plausible() && (1..=8).contains(&e.postbuilds)) else {
+            continue;
+        };
+        let Some(posts) = title_bytes(element.postbuild_descs, POSTBUILD_DESC_BYTES * element.postbuilds as usize) else {
+            continue;
+        };
+        for post in posts.chunks_exact(POSTBUILD_DESC_BYTES) {
+            let (slot, kind) = (qword(post, 0), dword(post, 8));
+            let size = (kind == COMPACTED_SIZE && title_bytes(slot, 8).is_some())
+                .then(|| max_size(this, &element.desc.inputs, descs + (k * ELEMENT_BYTES + 8) as u64))
+                .flatten()
+                .filter(|_| hold_slot(slot));
+            let Some((size, from)) = size else {
+                free_slot(slot);
+                if kind == COMPACTED_SIZE {
+                    count(UNANSWERED, 1);
+                }
+                continue;
+            };
+            put_answer(slot, size);
+            count(ANSWERED, 1);
+            if verbose(5) {
+                tracing::info!(
+                    structure = format_args!("{:#x}", element.desc.dest),
+                    slot = format_args!("{slot:#x}"),
+                    size = format_args!("{size:#x}"),
+                    from,
+                    "dxr: compacted size answered at the call with the builder's most"
+                );
+            }
+            answered.push((slot, size));
+        }
+    }
+    answered
+}
+
+fn put_answer(slot: u64, size: u64) {
+    crate::host::write_mapped(slot as *mut u8, size.to_le_bytes().as_ptr(), 8);
+}
 
 /// The most bytes read of a batched build's array to find its layout.
 const PROBE_BYTES: usize = 512;
@@ -403,6 +717,25 @@ const PROBE_BYTES: usize = 512;
 /// `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X(list,
 /// count, descs)`: every build and refit of the title's.
 extern "system" fn batched(this: *mut c_void, list: *mut c_void, n: u32, descs: *const c_void) {
+    if mode() != Mode::Off {
+        watch_batched(n, descs);
+    }
+    let answered = if answers() { answer_sizes(this, n, descs as u64) } else { Vec::new() };
+    let real = REAL[BATCHED].load(Ordering::Relaxed);
+    // SAFETY: the method the title imported, with the title's arguments.
+    let real: extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void) = unsafe { std::mem::transmute(real) };
+    real(this, list, n, descs);
+    // Once more: whatever the builder's own code put there while it
+    // recorded, the title reads the answer.
+    for (slot, size) in answered {
+        if title_bytes(slot, 8).is_some_and(|b| qword(&b, 0) != size) {
+            put_answer(slot, size);
+        }
+    }
+}
+
+/// What a batched build asks, counted and logged.
+fn watch_batched(n: u32, descs: *const c_void) {
     count(CALLS, 1);
     count(ELEMENTS, u64::from(n));
     // The layout is the console's own: looked for in the first bytes, at
@@ -429,10 +762,6 @@ extern "system" fn batched(this: *mut c_void, list: *mut c_void, n: u32, descs: 
         }
         None => count(UNKNOWN, u64::from(n)),
     }
-    let real = REAL[BATCHED].load(Ordering::Relaxed);
-    // SAFETY: the method the title imported, with the title's arguments.
-    let real: extern "system" fn(*mut c_void, *mut c_void, u32, *const c_void) = unsafe { std::mem::transmute(real) };
-    real(this, list, n, descs);
 }
 
 /// `XboxBvhBuilder::CopyRaytracingAccelerationStructure(list, dest,
@@ -479,6 +808,8 @@ fn wrapper_of(symbol: &str) -> Option<(usize, usize)> {
         Some((COPY, copy as *const () as usize))
     } else if is("RehydrateRaytracingAccelerationStructureBatched2X") {
         Some((REHYDRATE, rehydrate as *const () as usize))
+    } else if is("GetRaytracingAccelerationStructurePrebuildInfo") {
+        Some((PREBUILD, prebuild as *const () as usize))
     } else {
         None
     }
@@ -487,12 +818,13 @@ fn wrapper_of(symbol: &str) -> Option<(usize, usize)> {
 /// The title imports `symbol` from its acceleration-structure builder,
 /// which exports it at `real`: with DXR on ([`mode`]), the address to
 /// bind instead, a wrapper that reads the call and passes it on. None
-/// (bind the builder's own) for other symbols and with DXR off.
+/// (bind the builder's own) for other symbols and with DXR off; the two
+/// methods sizes are answered from ([`answers`]) are wrapped without it.
 pub fn hook(symbol: &str, real: usize) -> Option<usize> {
-    if mode() == Mode::Off {
+    let (which, wrapper) = wrapper_of(symbol)?;
+    if mode() == Mode::Off && !(answers() && matches!(which, BATCHED | PREBUILD)) {
         return None;
     }
-    let (which, wrapper) = wrapper_of(symbol)?;
     REAL[which].store(real, Ordering::Relaxed);
     tracing::info!(symbol, real = format_args!("{real:#x}"), "dxr: the builder's method is watched");
     Some(wrapper)
@@ -628,7 +960,158 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_watched_methods_have_wrappers() {
+    fn sizes_are_answered_unless_switched_off() {
+        assert!(parse_answers(None));
+        assert!(parse_answers(Some("1")));
+        assert!(!parse_answers(Some(" 0 ")));
+    }
+
+    /// An element as a run logged it: the desc, one postbuild desc, zeros.
+    fn element_bytes(dest: u64, flags: u32, n: u32, descs: u64, postbuilds: u32, postbuild_descs: u64) -> Vec<u8> {
+        let mut e = desc_bytes(dest, 1, flags, n, 0, descs, 0, 0x1d_c000_0000);
+        e.extend(u64::from(postbuilds).to_le_bytes());
+        e.extend(postbuild_descs.to_le_bytes());
+        e.extend([0u8; 16]);
+        assert_eq!(e.len(), ELEMENT_BYTES);
+        e
+    }
+
+    #[test]
+    fn a_batched_element_holds_its_postbuild_descs() {
+        let e = element_bytes(0xd_6000_8700, 0xa, 1, 0xd_1000_6ed0, 1, 0x5f_f000_5d50);
+        let got = Element::parse(&e).unwrap();
+        assert_eq!((got.desc.dest, got.postbuilds, got.postbuild_descs), (0xd_6000_8700, 1, 0x5f_f000_5d50));
+        assert!(got.desc.plausible());
+        assert_eq!(got.desc.inputs, Inputs::parse(&e[8..]).unwrap());
+        assert_eq!(Element::parse(&e[..72]), None);
+    }
+
+    fn triangles(indices: u32, vertices: u32, buffer: u64) -> Geometry {
+        Geometry::Triangles {
+            flags: 1,
+            transform: 0,
+            index_format: 57,
+            vertex_format: 6,
+            indices,
+            vertices,
+            index_buffer: buffer,
+            vertex_buffer: buffer + 0x100,
+            vertex_stride: 12,
+        }
+    }
+
+    #[test]
+    fn sizes_follow_from_counts_not_from_addresses() {
+        let inputs = |flags, descs| Inputs { top: false, flags, count: 1, pointers: false, descs };
+        let key = inputs(0xa, 0x1000).key(&[triangles(300, 120, 0x7000)]);
+        assert_eq!(key, inputs(0xa, 0x2000).key(&[triangles(300, 120, 0x9000)]));
+        assert_ne!(key, inputs(0xa, 0x1000).key(&[triangles(303, 120, 0x7000)]));
+        assert_ne!(key, inputs(0xa, 0x1000).key(&[triangles(300, 121, 0x7000)]));
+        assert_ne!(key, inputs(0xb, 0x1000).key(&[triangles(300, 120, 0x7000)]));
+        assert_ne!(key, inputs(0xa, 0x1000).key(&[Geometry::Boxes { flags: 1, count: 100, boxes: 0x7000, stride: 24 }]));
+    }
+
+    #[test]
+    fn what_the_title_was_told_is_bounded() {
+        let mut told = Told::default();
+        for key in 0..TOLD as u64 + 10 {
+            told.put(key, key + 1);
+        }
+        // Told again: the newer size, in the same place.
+        told.put(TOLD as u64 + 9, 7);
+        assert_eq!((told.sizes.len(), told.order.len()), (TOLD, TOLD));
+        assert_eq!(told.sizes.get(&9), None);
+        assert_eq!(told.sizes.get(&10), Some(&11));
+        assert_eq!(told.sizes.get(&(TOLD as u64 + 9)), Some(&7));
+    }
+
+    #[test]
+    fn a_late_store_stays_off_an_answered_slot() {
+        let at = 0x7_1234_0000usize;
+        let title = [0x11u8; 32];
+        let mut merged = title;
+        merged[4..20].fill(0x22);
+        assert_eq!(keep_answers(at, &title, &merged), None);
+        assert!(hold_slot(at as u64 + 8));
+        // The slot's bytes stay; what is stored beside it lands.
+        let kept = keep_answers(at, &title, &merged).unwrap();
+        assert_eq!((&kept[4..8], &kept[8..16], &kept[16..20]), (&[0x22; 4][..], &[0x11; 8][..], &[0x22; 4][..]));
+        // A stretch that begins inside the slot.
+        let kept = keep_answers(at + 12, &title[12..], &merged[12..]).unwrap();
+        assert_eq!((&kept[..4], &kept[4..8]), (&[0x11; 4][..], &[0x22; 4][..]));
+        // Nothing stored there, and stretches beside it.
+        assert_eq!(keep_answers(at, &title, &title), None);
+        assert_eq!(keep_answers(at + 16, &title[16..], &merged[16..]), None);
+        assert_eq!(keep_answers(at, &title[..8], &merged[..8]), None);
+        // Given back to the builder.
+        free_slot(at as u64 + 8);
+        assert_eq!(keep_answers(at, &title, &merged), None);
+    }
+
+    /// The builder's prebuild method, for the test below: 0x1000 a geometry.
+    extern "system" fn told(_: *mut c_void, inputs: *const c_void, _: *const c_void, info: *mut u64) {
+        // SAFETY: the test's inputs and its three qwords.
+        unsafe {
+            let n = inputs.cast::<u32>().add(2).read_unaligned();
+            info.write(u64::from(n) * 0x1000);
+            info.add(1).write(0x40);
+            info.add(2).write(0x20);
+        }
+    }
+
+    /// From the title's prebuild call to its batched build, in memory of
+    /// the test's: the slot of a compacted size holds the builder's most
+    /// before the build goes on, whether the title was told that size or
+    /// not; a slot asked something else is left alone.
+    #[test]
+    fn a_compacted_size_is_answered_with_what_the_builder_said() {
+        fn geometry_bytes(n: usize, indices: u32) -> Vec<u8> {
+            let mut b = vec![0u8; GEOMETRY_DESC_BYTES * n];
+            for g in b.chunks_exact_mut(GEOMETRY_DESC_BYTES) {
+                g[16..20].copy_from_slice(&57u32.to_le_bytes());
+                g[20..24].copy_from_slice(&6u32.to_le_bytes());
+                g[24..28].copy_from_slice(&indices.to_le_bytes());
+                g[28..32].copy_from_slice(&120u32.to_le_bytes());
+            }
+            b
+        }
+        REAL[PREBUILD].store(told as *const () as usize, Ordering::Relaxed);
+        let slots = Box::new([0xAAAA_u64; 4]);
+        let slot = |k: usize| std::ptr::from_ref(&slots[k]) as u64;
+        let post = |slot: u64, kind: u32| {
+            let mut b = slot.to_le_bytes().to_vec();
+            b.extend(u64::from(kind).to_le_bytes());
+            b
+        };
+        let (told_of, new, third) = (geometry_bytes(2, 300), geometry_bytes(3, 600), geometry_bytes(1, 30));
+        let posts = [post(slot(0), COMPACTED_SIZE), post(slot(1), COMPACTED_SIZE), [post(slot(2), COMPACTED_SIZE), post(slot(3), 3)].concat()];
+        // The title asks the sizes of the first structure, in other memory
+        // than it builds from later.
+        let asked = geometry_bytes(2, 300);
+        let inputs = element_bytes(0x100, 0xa, 2, asked.as_ptr() as u64, 0, 0);
+        let mut info = [0u64; 3];
+        prebuild(std::ptr::null_mut(), inputs[8..].as_ptr().cast(), std::ptr::null(), info.as_mut_ptr());
+        assert_eq!(info, [0x2000, 0x40, 0x20]);
+        // Nothing was said of the second and the third: the builder is asked.
+        let mut elements = element_bytes(0xd_6000_0100, 0xa, 2, told_of.as_ptr() as u64, 1, posts[0].as_ptr() as u64);
+        elements.extend(element_bytes(0xd_6000_4100, 0xa, 3, new.as_ptr() as u64, 1, posts[1].as_ptr() as u64));
+        elements.extend(element_bytes(0xd_6000_8100, 0xa, 1, third.as_ptr() as u64, 2, posts[2].as_ptr() as u64));
+        // A slot that held an older answer and is asked something else now
+        // is given back.
+        assert!(hold_slot(slot(3)));
+        let answered = answer_sizes(std::ptr::null_mut(), 3, elements.as_ptr() as u64);
+        assert_eq!(answered, [(slot(0), 0x2000), (slot(1), 0x3000), (slot(2), 0x1000)]);
+        assert_eq!(*slots, [0x2000, 0x3000, 0x1000, 0xAAAA]);
+        // The builder's stores, landing late: off the answered slots only.
+        let title: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let kept = keep_answers(slot(0) as usize, &title, &[0x77; 32]).unwrap();
+        assert_eq!((&kept[..24], &kept[24..]), (&title[..24], &[0x77; 8][..]));
+    }
+
+    #[test]
+    fn only_the_four_watched_methods_have_wrappers() {
+        let prebuild = "?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z";
+        assert_eq!(wrapper_of(prebuild).map(|w| w.0), Some(PREBUILD));
         let batched = "?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2@@@Z";
         assert_eq!(wrapper_of(batched).map(|w| w.0), Some(BATCHED));
         let copy = "?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z";

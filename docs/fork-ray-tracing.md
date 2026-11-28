@@ -94,6 +94,7 @@ after it was given them as an unordered access view.
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_SIZE_ANSWER=0` | a structure's compacted size is not answered at the title's call (on by default, see the known gaps) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
@@ -114,7 +115,23 @@ dispatches, faults and what came.
   slot held before, another structure's size, and the copy wrote over the
   neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
   did not mend it and costs some 20 ms a frame (light-15): the title asks in
-  every frame, and what it read was as old as before. Open.
+  every frame, and what it read was as old as before.
+  Since then (`crates/victory-gpu/src/dxr.rs`, `VICTORY_BVH_SIZE_ANSWER`, on
+  by default; not yet shown by a run): the title's batched build call passes
+  through a wrapper that writes an answer into each compacted-size slot
+  before the build is recorded. The answer is the most the builder itself
+  says the structure can take (`ResultDataMaxSizeInBytes` of its
+  `GetRaytracingAccelerationStructurePrebuildInfo` for the same inputs, as
+  the title was told, or asked again), so the copy always has room. The
+  builder's program still runs and stores the true size; that store is kept
+  out of an answered slot, since it lands frames late. The price: copies of
+  dynamic structures take their most, not their compacted size, from the
+  title's pool. A run shows it in the ten-second line `dxr builder over N
+  frames: ... sizes answered, ... late size stores kept off` (`sizes not
+  answered` should be absent), and in the first sixteen `dxr: compacted size
+  answered at the call` and `dxr: the builder's late size store is kept off`
+  lines, whose `store` should not exceed `answer`. Not covered: a slot in a
+  title buffer the card writes in place.
 - What a structure that was written over says of its size sent the builder's
   copy of it through gigabytes of other structures; bounded now
   (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
