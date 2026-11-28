@@ -15,3 +15,17 @@ This branch is based on trustno1-coder/VIctory-NVIDIA main. Every run here has t
 | tn1a (base) | off | 40.5 | ~1 | 30-33 | 10-11 | 330 + 637 indirect (left out) | alive |
 | tn1b (base) | on | — | — | — | — | — | watchdog crash at 84 s |
 | t1b (batch 1) | on | 90-97 | 32-42 | 46-47 | 13-15 | 1 | alive 300 s |
+
+## Batch 2 (2026-11-27)
+
+Merged from tn1: #516, #501, #498, #497, #532, #521. Fixes on top:
+- watch: re-read the books when title memory is made real (race in #516);
+- lazy: `hot_within` joins a piece only onto a range it overlaps (#501);
+- ambient: `raise` scrubs the probe result channel by channel, so one bad channel no longer zeroes the whole probe (#521; the right side of the cell went dark).
+
+Also: a BVH node past a buffer's 4 GiB reads as a miss, and the title's builder calls are watched for DXR (`VICTORY_DXR`, off by default). Autotest runs 240 s with shots every 120 s.
+
+| run | ray tracing | ms/frame | GPU ms | prep ms | copy-back ms | dropped draws/frame | result |
+|---|---|---|---|---|---|---|---|
+| t2a (batch 2, before the probe fix) | on | 63.7-67.2 | 5-9 | 42-48 | 9-10 | 1 | alive 300 s, right side darker |
+| t2b (batch 2) | on | 61.5-63.9 | 2-3 | 46-49 | 12 | 1 | alive 240 s, picture back |
