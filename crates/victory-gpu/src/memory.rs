@@ -824,6 +824,7 @@ impl Memory {
             s.came[3],
             self.faulted
         );
+        crate::dxr::log_frame(frames as u64);
         self.stats.from = Some((now, self.frame));
     }
 }
