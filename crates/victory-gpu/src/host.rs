@@ -9082,37 +9082,37 @@ impl Batch {
         if due_len > 0 {
             crate::shadow::wide_each(due_len, move |i| due[i].refresh());
         }
-        crate::shadow::wide_chunks(spans_len, 32, move |range| {
-            if !many {
-                for i in range {
+        if !many {
+            crate::shadow::wide_each(spans_len, move |i| {
+                let (shadow, from, to) = &spans[i];
+                Self::update(shadow, *from, *to);
+            });
+        } else {
+            crate::shadow::wide_chunks(spans_len, 32, move |range| {
+                let mut need = [0usize; 32];
+                let mut n_need = 0usize;
+                let mut skipped = 0u64;
+                {
+                    let journal = crate::watch::read_journal();
+                    for i in range {
+                        let (shadow, from, to) = &spans[i];
+                        if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                            skipped += 1;
+                        } else {
+                            need[n_need] = i;
+                            n_need += 1;
+                        }
+                    }
+                }
+                if skipped > 0 {
+                    FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+                }
+                for &i in &need[..n_need] {
                     let (shadow, from, to) = &spans[i];
                     Self::update(shadow, *from, *to);
                 }
-                return;
-            }
-            let mut need = [0usize; 32];
-            let mut n_need = 0usize;
-            let mut skipped = 0u64;
-            {
-                let journal = crate::watch::read_journal();
-                for i in range {
-                    let (shadow, from, to) = &spans[i];
-                    if shadow.nothing_new_with(&journal, *from, *to - *from) {
-                        skipped += 1;
-                    } else {
-                        need[n_need] = i;
-                        n_need += 1;
-                    }
-                }
-            }
-            if skipped > 0 {
-                FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
-            }
-            for &i in &need[..n_need] {
-                let (shadow, from, to) = &spans[i];
-                Self::update(shadow, *from, *to);
-            }
-        });
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9282,37 +9282,37 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 let len = refreshes.len();
                 let check = len > FEW;
-                crate::shadow::wide_chunks(len, 32, move |range| {
-                    if !check {
-                        for i in range {
+                if !check {
+                    crate::shadow::wide_each(len, move |i| {
+                        let (shadow, from, to) = &refreshes[i];
+                        Self::update(shadow, *from, *to);
+                    });
+                } else {
+                    crate::shadow::wide_chunks(len, 32, move |range| {
+                        let mut need = [0usize; 32];
+                        let mut n_need = 0usize;
+                        let mut skipped = 0u64;
+                        {
+                            let journal = crate::watch::read_journal();
+                            for i in range {
+                                let (shadow, from, to) = &refreshes[i];
+                                if shadow.nothing_new_with(&journal, *from, *to - *from) {
+                                    skipped += 1;
+                                } else {
+                                    need[n_need] = i;
+                                    n_need += 1;
+                                }
+                            }
+                        }
+                        if skipped > 0 {
+                            FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
+                        }
+                        for &i in &need[..n_need] {
                             let (shadow, from, to) = &refreshes[i];
                             Self::update(shadow, *from, *to);
                         }
-                        return;
-                    }
-                    let mut need = [0usize; 32];
-                    let mut n_need = 0usize;
-                    let mut skipped = 0u64;
-                    {
-                        let journal = crate::watch::read_journal();
-                        for i in range {
-                            let (shadow, from, to) = &refreshes[i];
-                            if shadow.nothing_new_with(&journal, *from, *to - *from) {
-                                skipped += 1;
-                            } else {
-                                need[n_need] = i;
-                                n_need += 1;
-                            }
-                        }
-                    }
-                    if skipped > 0 {
-                        FLUSHES[2].fetch_add(skipped, Ordering::Relaxed);
-                    }
-                    for &i in &need[..n_need] {
-                        let (shadow, from, to) = &refreshes[i];
-                        Self::update(shadow, *from, *to);
-                    }
-                });
+                    });
+                }
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes
