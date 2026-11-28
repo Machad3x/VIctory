@@ -295,6 +295,9 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // With `VICTORY_DXR`, the title's calls into its acceleration-structure
+    // builder pass through `victory_gpu::dxr` first.
+    let with_dlls = BuilderWatch(&with_dlls);
     // The title's Bink exports go through the movie skipper when
     // VICTORY_SKIP_BINK asks for it (bound as before otherwise); beneath
     // the FidelityFX interposer, which only looks at its own DLL.
@@ -505,6 +508,28 @@ fn poke(base: usize, size: usize) {
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
+}
+
+/// Binds the title's imports from its acceleration-structure builder to
+/// `victory_gpu::dxr`'s wrappers where it has one (`VICTORY_DXR`): they
+/// read each call and pass it on to the builder's own method.
+#[cfg(windows)]
+struct BuilderWatch<'a>(&'a dyn victory_loader::ImportResolver);
+
+#[cfg(windows)]
+impl victory_loader::ImportResolver for BuilderWatch<'_> {
+    fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+        use victory_loader::{Provenance, Resolution};
+        let found = self.0.resolve(dll, symbol);
+        if let Resolution::Found { address, provenance: Provenance::Title } = found
+            && dll.eq_ignore_ascii_case("XboxBvhBuilder.dll")
+            && let victory_pe::ImportSymbol::Name { name, .. } = symbol
+            && let Some(wrapper) = victory_hle::dxr::hook(name, address)
+        {
+            return Resolution::Found { address: wrapper, provenance: Provenance::Title };
+        }
+        found
+    }
 }
 
 /// The DLLs among `imported` (the main image's static imports) that must

@@ -135,6 +135,8 @@ impl<'a> Lower<'a> {
             inverse: [f[7], f[8], f[9]],
         };
         let c = self.cur;
+        // Lanes whose node lies past what a buffer offset reaches.
+        let mut far = None;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -146,6 +148,18 @@ impl<'a> Lower<'a> {
                 // (pointer >> 3) << 6 from the buffer's start.
                 let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);
+                // A buffer offset is 32 bits: a node 4 GiB or more into the
+                // BVH (`node_fits_buffer`) is no byte of it and reads as a
+                // miss, not as the node its low bits name (#2368).
+                let k29 = self.s.m.i32(29);
+                let mut high = self.s.m.bin(c, Bin::LShr, pointer, k29);
+                if let Some(hi) = pointer_high {
+                    high = self.s.m.bin(c, Bin::Or, high, hi);
+                }
+                let zero = self.s.m.i32(0);
+                let over = self.s.m.cmp(c, pred::NE, high, zero);
+                far = Some(over);
+                let byte = self.s.m.select(c, over, zero, byte);
                 let byte = self.s.m.bin(c, Bin::Shl, byte, k3);
                 NodeAt::Buffer { handle, byte }
             }
@@ -214,7 +228,16 @@ impl<'a> Lower<'a> {
                     (other[k], leaf_block),
                 ],
             );
-            results.push((phi, zero));
+            // A far lane's miss of its pointer's type: a triangle's, or no child.
+            let r = match far {
+                Some(far) => {
+                    let none = self.s.m.i32(bvh::NONE);
+                    let miss = self.s.m.select(join, is_triangle, other[k], none);
+                    self.s.m.select(join, far, miss, phi)
+                }
+                None => phi,
+            };
+            results.push((r, zero));
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
@@ -596,4 +619,12 @@ impl<'a> Lower<'a> {
             self.as_int(f)
         })
     }
+}
+
+/// Whether the node a pointer (`lo`, `hi`: its dwords) names lies within
+/// the 4 GiB a buffer offset reaches: its byte offset is `(pointer & !7) * 8`.
+/// The buffer path's `far` lanes are those for which this is false.
+#[cfg(test)]
+pub(crate) fn node_fits_buffer(lo: u32, hi: u32) -> bool {
+    lo >> 29 == 0 && hi == 0
 }

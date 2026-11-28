@@ -29,6 +29,9 @@ pub use victory_gpu::console;
 pub use victory_gpu::streamline;
 #[cfg(windows)]
 pub use victory_gpu::reserve_upload_space;
+/// The title's acceleration-structure builder, watched (`VICTORY_DXR`).
+#[cfg(windows)]
+pub use victory_gpu::dxr;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 
