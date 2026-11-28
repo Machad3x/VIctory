@@ -171,7 +171,20 @@ impl Mapped {
             .open(path)
             .ok()?;
         file.set_len(len as u64).ok()?;
-        Mapped::map(&file, len, true)
+        let mut mapped = Mapped::map(&file, len, true)?;
+        mapped._file = Some(file);
+        Some(mapped)
+    }
+
+    /// Puts a view made by [`Mapped::create`] on the disk: its pages, then
+    /// the file (a rename is journaled at once, mapped pages are written
+    /// lazily: a stop soon after could leave the new name on zeros).
+    fn flush(&self) -> std::io::Result<()> {
+        // SAFETY: our live view of `len` bytes.
+        if unsafe { windows_sys::Win32::System::Memory::FlushViewOfFile(self.at.Value, self.len) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self._file.as_ref().map_or(Ok(()), std::fs::File::sync_all)
     }
 
     fn bytes(&self) -> &[u8] {
@@ -488,6 +501,74 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+/// The library's length and hash, a line each for the library on disk and
+/// the one a save is about to rename over it: written after the new
+/// library's bytes are on the disk and before the rename, so a save cut
+/// short on either side of it leaves a library that matches. A library
+/// that matches no line is set aside ([`MISMATCHED_FILE`]) and not loaded;
+/// one with no sum file (saved before sums were kept) is loaded.
+const SUM_FILE: &str = "host-pipelines.sum";
+/// Where a library that does not match its sum is put (the last one only).
+const MISMATCHED_FILE: &str = "host-pipelines.mismatched";
+
+/// The sum of the library file on disk, as this run loaded or last saved
+/// it.
+static ON_DISK: Mutex<Option<String>> = Mutex::new(None);
+
+/// What [`SUM_FILE`] holds for `bytes`.
+fn sum(bytes: &[u8]) -> String {
+    format!("{} {}", bytes.len(), blake3::hash(bytes).to_hex())
+}
+
+/// Why a library of sum `found` may not be loaded under the sum file
+/// `saved`, if it may not: no line matches. None with no sum file.
+fn mismatch(found: &str, saved: Option<&[u8]>) -> Option<&'static str> {
+    let saved = saved?;
+    let mut lines = saved.split(|&b| b == b'\n').map(<[u8]>::trim_ascii).filter(|l| !l.is_empty());
+    if lines.clone().any(|l| l == found.as_bytes()) {
+        return None;
+    }
+    let len = found.split(' ').next().unwrap_or_default();
+    Some(if lines.any(|l| l.split(|&b| b == b' ').next() == Some(len.as_bytes())) {
+        "its bytes differ from the sum"
+    } else {
+        "its length differs from the sum"
+    })
+}
+
+/// The sum file written before a library of sum `new` is renamed over the
+/// one of sum `on_disk`: it holds for both.
+fn sums(new: &str, on_disk: Option<&str>) -> String {
+    match on_disk {
+        Some(old) if old != new => format!("{new}\n{old}"),
+        _ => new.to_owned(),
+    }
+}
+
+/// `blob`, the library file in `dir`, with its sum if it matches the sum
+/// file; else nothing, and the file is set aside as [`MISMATCHED_FILE`].
+fn checked(dir: &std::path::Path, blob: Blob) -> (Blob, Option<String>) {
+    if blob.bytes().is_empty() {
+        return (blob, None);
+    }
+    let found = sum(blob.bytes());
+    let saved = std::fs::read(dir.join(SUM_FILE)).ok();
+    let Some(why) = mismatch(&found, saved.as_deref()) else {
+        return (blob, Some(found));
+    };
+    // Unmapped (and its file closed) before it is moved.
+    drop(blob);
+    let aside = std::fs::rename(dir.join(LIBRARY_FILE), dir.join(MISMATCHED_FILE));
+    tracing::warn!(
+        why,
+        found,
+        saved = %String::from_utf8_lossy(saved.as_deref().unwrap_or_default()).trim(),
+        set_aside = aside.is_ok(),
+        "host pipeline library does not match its sum file (a save cut short?): set aside as {MISMATCHED_FILE}, starting an empty one"
+    );
+    (Blob::None, None)
+}
+
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 100_000;
 
@@ -496,7 +577,11 @@ fn library() -> Option<&'static Library> {
     LIBRARY
         .get_or_init(|| {
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
-            let blob = DIR.get().map_or(Blob::None, |d| Blob::of(d));
+            let blob = DIR.get().map_or(Blob::None, |d| {
+                let (blob, found) = checked(d, Blob::of(d));
+                *ON_DISK.lock().unwrap_or_else(|e| e.into_inner()) = found;
+                blob
+            });
             let library = open(&device, blob);
             if library.is_none() {
                 tracing::warn!("no host pipeline library: pipelines are not kept");
@@ -640,7 +725,7 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, staged, added) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
@@ -649,25 +734,28 @@ pub(crate) fn save(now: bool) {
             return;
         }
         if added == 0 {
-            0
+            (0, Blob::None, 0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
             let _call = call("serialise", "the whole library");
-            if let Err(e) = serialise(&library.library, &tmp, size) {
-                tracing::warn!(error = %e, "host pipeline library not serialised");
-                let _ = std::fs::remove_file(&tmp);
-                return;
-            }
+            let staged = match serialise(&library.library, &tmp, size) {
+                Ok(staged) => staged,
+                Err(e) => {
+                    tracing::warn!(error = %e, "host pipeline library not serialised");
+                    let _ = std::fs::remove_file(&tmp);
+                    return;
+                }
+            };
             library.added.store(0, Ordering::Relaxed);
             SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, staged, added)
         }
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    let library_written = if bytes > 0 { finish(dir, &tmp, staged, added, &library.added) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
@@ -704,18 +792,56 @@ pub(crate) fn save(now: bool) {
 /// 1.3 GB more of the process's own memory for the seconds a save takes;
 /// through a buffer where the file cannot be mapped (and with
 /// `VICTORY_LIBRARY_MAP=0`).
-fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usize) -> std::io::Result<()> {
+/// Returns the bytes written: still mapped ([`Mapped::flush`] puts them on
+/// the disk) or, through a buffer, written and flushed.
+fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usize) -> std::io::Result<Blob> {
     let failed = |e: windows::core::Error| std::io::Error::other(e.to_string());
     if mapped()
         && let Some(mut file) = Mapped::create(tmp, size)
     {
         // SAFETY: a buffer of the size the library asks for.
-        return unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed);
+        unsafe { library.Serialize(file.bytes_mut()) }.map_err(failed)?;
+        return Ok(Blob::Mapped(file));
     }
     let mut bytes = vec![0u8; size];
     // SAFETY: a buffer of the size the library asks for.
     unsafe { library.Serialize(&mut bytes) }.map_err(failed)?;
-    std::fs::write(tmp, &bytes)
+    write_synced(tmp, &bytes)?;
+    Ok(Blob::Held(bytes))
+}
+
+/// The library `staged` (written to `tmp`, of `added` pipelines) on the
+/// disk, its sum beside it, then renamed into place ([`replace_library`]).
+/// Hashed outside the library's lock: gigabytes. On failure `tmp` goes and
+/// the pipelines count as added again, for the next save.
+fn finish(dir: &std::path::Path, tmp: &std::path::Path, staged: Blob, added: u64, count: &AtomicU64) -> std::io::Result<()> {
+    let new = sum(staged.bytes());
+    let mut on_disk = ON_DISK.lock().unwrap_or_else(|e| e.into_inner());
+    let written = match &staged {
+        Blob::Mapped(file) => file.flush(),
+        _ => Ok(()),
+    }
+    .and_then(|()| {
+        drop(staged);
+        write_atomically(&dir.join(SUM_FILE), sums(&new, on_disk.as_deref()).as_bytes())
+    })
+    .and_then(|()| replace_library(dir, tmp));
+    match &written {
+        Ok(()) => *on_disk = Some(new),
+        Err(_) => {
+            let _ = std::fs::remove_file(tmp);
+            count.fetch_add(added, Ordering::Relaxed);
+        }
+    }
+    written
+}
+
+/// `bytes` written to `path` and flushed to the disk.
+fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 /// Renames the written library `tmp` over the library's file in `dir`. This
@@ -740,7 +866,7 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".tmp-{}-{n}", std::process::id()));
     let tmp = path.with_file_name(name);
-    let res = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let res = write_synced(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -982,6 +1108,95 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
+    }
+
+    /// A library loads if a line of its sum file matches, or with no sum
+    /// file (saved before sums); cut short or with pages never written, it
+    /// does not, and says which.
+    #[test]
+    fn a_library_loads_only_if_it_matches_its_sum() {
+        let blob = b"a library's bytes".repeat(100);
+        let saved = sum(&blob);
+        assert_eq!(mismatch(&saved, Some(saved.as_bytes())), None);
+        assert_eq!(mismatch(&saved, Some(format!("{saved}\r\n").as_bytes())), None);
+        assert_eq!(mismatch(&saved, None), None, "saved before sums");
+        let cut = sum(&blob[..blob.len() - 1]);
+        assert_eq!(mismatch(&cut, Some(saved.as_bytes())), Some("its length differs from the sum"));
+        let mut zeroed = blob.clone();
+        zeroed[500..600].fill(0);
+        assert_eq!(mismatch(&sum(&zeroed), Some(saved.as_bytes())), Some("its bytes differ from the sum"));
+        assert!(mismatch(&saved, Some(b"")).is_some(), "an empty sum file");
+        // Written before the rename, the sum file holds for the old library
+        // and the new: a stop on either side of it loads what is there.
+        let (old, new, other) = (sum(b"old library"), sum(b"new library"), sum(b"other"));
+        let file = sums(&new, Some(&old));
+        assert_eq!(mismatch(&old, Some(file.as_bytes())), None, "stopped before the rename");
+        assert_eq!(mismatch(&new, Some(file.as_bytes())), None, "stopped after the rename");
+        assert!(mismatch(&other, Some(file.as_bytes())).is_some());
+        assert_eq!(sums(&new, None), new);
+        assert_eq!(sums(&new, Some(&new)), new);
+    }
+
+    /// On load a mismatched library is set aside and not used; a matching
+    /// one, or one with no sum file, is used.
+    #[test]
+    fn a_mismatched_library_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, sums_at) = (dir.path().join(LIBRARY_FILE), dir.path().join(SUM_FILE));
+        let bytes = b"library".repeat(1000);
+        std::fs::write(&path, &bytes).unwrap();
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert_eq!((blob.bytes(), found.as_deref()), (&bytes[..], Some(&*sum(&bytes))), "no sum file");
+        drop(blob);
+        std::fs::write(&sums_at, sum(&bytes)).unwrap();
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert_eq!((blob.bytes(), found.as_deref()), (&bytes[..], Some(&*sum(&bytes))), "matches");
+        drop(blob);
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert!(matches!(blob, Blob::None) && found.is_none(), "cut short");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(dir.path().join(MISMATCHED_FILE)).unwrap(), &bytes[..bytes.len() / 2]);
+        // No library at all: nothing to check.
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert!(matches!(blob, Blob::None) && found.is_none());
+    }
+
+    /// A save puts the new library on the disk with a sum file that holds
+    /// for it and for the one it replaces; the next start loads it.
+    #[test]
+    fn a_saved_library_is_summed_and_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let old = b"old".repeat(5000);
+        std::fs::write(&path, &old).unwrap();
+        *ON_DISK.lock().unwrap() = Some(sum(&old));
+        let new: Vec<u8> = (0..300_000u32).map(|i| (i * 7) as u8).collect();
+        let tmp = path.with_extension("tmp");
+        let staged = match Mapped::create(&tmp, new.len()) {
+            Some(mut file) => {
+                file.bytes_mut().copy_from_slice(&new);
+                Blob::Mapped(file)
+            }
+            None => {
+                write_synced(&tmp, &new).unwrap();
+                Blob::Held(new.clone())
+            }
+        };
+        let count = AtomicU64::new(0);
+        finish(dir.path(), &tmp, staged, 5, &count).unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(!tmp.exists());
+        let saved = std::fs::read_to_string(dir.path().join(SUM_FILE)).unwrap();
+        assert_eq!(saved, sums(&sum(&new), Some(&sum(&old))));
+        assert_eq!(ON_DISK.lock().unwrap().as_deref(), Some(&*sum(&new)));
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert_eq!((blob.bytes(), found), (&new[..], Some(sum(&new))));
+        drop(blob);
+        // A save that fails counts its pipelines as added again.
+        let gone = dir.path().join("no such folder").join("x.tmp");
+        assert!(finish(dir.path(), &gone, Blob::Held(vec![1]), 5, &count).is_err());
+        assert_eq!(count.load(Ordering::Relaxed), 5);
     }
 
     #[test]
