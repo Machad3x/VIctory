@@ -1868,15 +1868,18 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 ///
-/// Once the world's targets are made (half of the reserve or more) and
-/// have not grown by 64 MiB for `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS`
-/// (20,000; 0: kept for the run, as before), nothing is kept: at 1440p the
+/// Once the targets have not grown by 64 MiB for
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS` (20,000; 0: kept for the run,
+/// as before), whatever their size, nothing is kept: at 1440p the
 /// targets level off at 2.1-2.9 GB, and the rest of the 3,072 MB (990 MB
 /// at the first world frame, 160-640 MB in play) stayed reserved for
 /// targets that never came while thousands of textures waited for room
 /// (2026-11-26 diag run 16:28, 10:59:54: 8,722 MB in use + 836 MB kept
-/// for targets against a line of 9,527 MB). The reserve comes back when
-/// the targets grow by 64 MiB again (a new scene's), for as long again.
+/// for targets against a line of 9,527 MB); at 720-1080p they level off
+/// at 1.4-1.5 GB, under half of the reserve, which a test of half never
+/// gave back. When the targets grow by 64 MiB again (a new scene's), only
+/// 128 MiB above them is kept, for as long again: keeping the whole rest
+/// re-reserved about 1.1 GB for every 64 MiB step.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -1904,7 +1907,14 @@ pub(crate) fn targets_room_kept() -> u64 {
     let (last, since) = targets_seen(last, since, targets, now);
     GREW[0].store(last, Relaxed);
     GREW[1].store(since, Relaxed);
-    targets_kept(most, targets, now.saturating_sub(since), settle)
+    // Whether the reserve was given up once already.
+    static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let still = now.saturating_sub(since);
+    let released = RELEASED.load(Relaxed);
+    if settle > 0 && still >= settle {
+        RELEASED.store(true, Relaxed);
+    }
+    targets_kept(most, targets, still, settle, released)
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -1924,14 +1934,18 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 }
 
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
-/// hold yet, or nothing once they hold half of it or more and have not
-/// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
+/// hold yet, nothing once they have not grown for `settle` ms (`still_ms`;
+/// `settle` 0: always kept), and after that first release (`released`) at
+/// most 128 MiB above them while they grow again.
 #[cfg(any(windows, test))]
-fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
-    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64, released: bool) -> u64 {
+    let rest = most.saturating_sub(targets);
+    if settle > 0 && still_ms >= settle {
         0
+    } else if released {
+        rest.min(128 << 20)
     } else {
-        most.saturating_sub(targets)
+        rest
     }
 }
 
@@ -5181,14 +5195,27 @@ float4 lit() : SV_Target { return 1.0; }
     fn room_for_targets_is_given_up_once_they_settle() {
         const MIB: u64 = 1 << 20;
         let most = 3072 * MIB;
-        // Before the world: kept, however long.
-        assert_eq!(targets_kept(most, 652 * MIB, 60_000, 20_000), 2420 * MIB);
         // The world's first frames: still growing.
-        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000), 989 * MIB);
-        // Settled: nothing kept.
-        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000), 0);
+        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000, false), 989 * MIB);
+        // Settled: nothing kept, under half of the reserve too.
+        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000, false), 0);
+        assert_eq!(targets_kept(most, 1490 * MIB, 20_000, 20_000, false), 0);
         // `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=0`: kept as before.
-        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0), 640 * MIB);
+        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0, false), 640 * MIB);
+    }
+
+    /// Once given up, the room kept for growing targets is 128 MiB above
+    /// them, not the whole rest of the reserve.
+    #[test]
+    fn room_for_targets_after_a_release_is_small() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // Grew by 64 MiB after the release: 128 MiB kept, not 1,518 MiB.
+        assert_eq!(targets_kept(most, 1554 * MIB, 1_000, 20_000, true), 128 * MIB);
+        // Near the reserve: no more than its rest.
+        assert_eq!(targets_kept(most, 3000 * MIB, 1_000, 20_000, true), 72 * MIB);
+        // Settled again: nothing kept.
+        assert_eq!(targets_kept(most, 1554 * MIB, 20_000, 20_000, true), 0);
 
         // Growth of 64 MiB restarts the clock; less does not.
         assert_eq!(targets_seen(2000 * MIB, 1_000, 2050 * MIB, 9_000), (2000 * MIB, 1_000));
