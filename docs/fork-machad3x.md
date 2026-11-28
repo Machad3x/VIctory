@@ -10,10 +10,10 @@ shot every 120 s from batch 2 on.
 
 | | |
 |---|---|
-| latest batch | 8 (run t8a-2) |
-| ms/frame, average of the last 120 s | 66.8 (max 85) |
-| card (GPU) ms | 6.1 |
-| prep ms | 47.1 |
+| latest batch | 9 (run t9c, with `VICTORY_STORE_BESIDE=1`) |
+| ms/frame, average of the last 120 s | 67.0 (max 75) |
+| card (GPU) ms | 14.0 |
+| prep ms | 41.7 |
 | dropped draws | 0 |
 | refused shaders or pipelines | 0 |
 
@@ -24,6 +24,7 @@ Open issues filed with the base:
 - [#690](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/690): root-view buffer accesses ignore OOB_SELECT 1, out-of-range stores land in memory.
 - [#691](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/691): VRAM at 99.9% of budget, about 1.9 GB free in partly used texture blocks.
 - [#692](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/692): an intermittent full white frame around 120 s into the opening cutscene.
+- [#817](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/817): a late lock-free write fault can undo a guard taken since (access violation); fixed here in 3175c5dc.
 
 ## Runtime switches added by this fork
 
@@ -32,6 +33,13 @@ Open issues filed with the base:
 | `VICTORY_BVH_SIZE_ANSWER` | on | The compacted size of an acceleration structure is answered at the title's call with the builder's own maximum. `=0` turns it off. |
 | `VICTORY_LATE_WAIT=0` | not set | The pacing option: turns the late wait off, so submissions are not held back. Slower here (batch 8), it can feel steadier on some setups. |
 | `VICTORY_DXR` | off | Watches the title's builder calls for DXR: `1` on, `check` compares both ways. |
+| `VICTORY_REFRESH_ONCE` | on | A submission refreshes only the pages its lists read. `=0` turns it off. |
+| `VICTORY_ASK_READ_ONLY` | on | A submission asks the write watch only about the pages its lists read. `=0` turns it off. |
+| `VICTORY_RESIDENCY_PRIORITY` | on | High residency priority for card copies, render targets and UAV memory. `=0` turns it off (run t9b: 106.1 ms/frame against 85.2). |
+| `VICTORY_TARGET_ROOM_SMALL` | on | From the world's first frame only a margin above the render targets is kept for them (the larger of 256 MiB and 15 %). `=0` keeps the whole reserve. |
+| `VICTORY_PRESSURE_EXIT_GB` | 3.5 | Host memory pressure ends once this many GiB are free. |
+| `VICTORY_VIEW_REMAP=1` | off | Places title view slots past NVIDIA's capped descriptor heap through a table (trustno1-coder/VIctory-NVIDIA#638). Costs about 47 ms/frame here with no visible change (runs lt1b-2 and lt1c-2). |
+| `VICTORY_STORE_BESIDE=1` | off | Stores beside the guards instead of opening them. Used in the batch 9 runs: protections 29 to 22 ms in run t8s. |
 
 `autotest.ps1` sets `VICTORY_BVH_BUILDER=1` itself; `-More @{VICTORY_BVH_BUILDER=''}` turns ray tracing off for a run.
 
@@ -124,6 +132,36 @@ From now on, runs are compared on the average of the last 120 s (24 frame lines)
 | t8a-2 (batch 8) | 66.8 (85) | 6.1 | 47.1 | 11.4 | 0 | alive 240 s, picture as t7a-2; the 120 s shot is white (seen before in t4b, not attributed; #692) |
 
 No shader or pipeline is refused.
+
+## Batch 9 (2026-11-28)
+
+Preparing time:
+- 57093e3d, 99930de6: the write watch remembers blocks it refused; few refreshes are spread one per claim again.
+- 7a84d45a: lock-free no-op refreshes, thin-worker refresh coalescing and an AVX2 copy diff (port of trustno1-coder/VIctory-NVIDIA#614 by wike1701).
+- f1ab9cd8, 7a7bb526: a submission refreshes and asks about only the pages its lists read (`VICTORY_REFRESH_ONCE`, `VICTORY_ASK_READ_ONLY`, both on).
+
+VRAM and early pop-in:
+- 7e483ba5: textures go best-fit into the fullest pool block, so sparse blocks drain.
+- de148876: residency priorities (`VICTORY_RESIDENCY_PRIORITY`, on).
+- 5f2c4844, 115983e8, 8aae1c34: the render-target reserve is given back once the targets settle, and only a margin above them is kept from the world's first frame (`VICTORY_TARGET_ROOM_SMALL`, on). The settle clock now starts at the world's first frame. Before 8aae1c34, menus could release the reserve early, and run t9a went to 85.2 ms/frame.
+- b9073aff: host memory pressure ends at 3.5 GiB free.
+- aae614e6: the log says why texture slots wait in the queue.
+
+Descriptors:
+- cf28538c, 9bb19b95: view places past a capped host heap (port of trustno1-coder/VIctory-NVIDIA#638 by chemist6913), behind `VICTORY_VIEW_REMAP=1`, off.
+
+Fixes:
+- 3175c5dc: a late lock-free write fault no longer undoes a guard taken since. It was a real race that could crash on a title write (#817).
+- df65d657: two tests no longer release a view while a mapping change is still in progress, which made a test hang.
+
+| run | ms/frame (120 s avg, max) | GPU ms | prep ms | copy-back ms | dropped | result |
+|---|---|---|---|---|---|---|
+| lt1b-2 (base for this batch) | 66.6 (81) | 8.3 | 46.8 | 10.6 | 0 | - |
+| t9a (before 8aae1c34) | 85.2 (100) | 30.9 | 43.0 | 10.0 | 0 | reserve given up in the menus |
+| t9b (`RESIDENCY_PRIORITY=0`) | 106.1 (118) | 62.6 | 35.0 | 9.1 | 0 | priorities kept on |
+| t9c (batch 9) | 67.0 (75) | 14.0 | 41.7 | 9.8 | 0 | alive 240 s, picture as lt1b-2 |
+
+Over the first 80 s after the world starts, t9c averages 148.5 ms/frame (max 615) against 261.3 (max 714) for lt1b-2, so early loading is faster. No shader or pipeline is refused. The dark interior is unchanged.
 
 ### Pacing option
 

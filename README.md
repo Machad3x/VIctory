@@ -413,8 +413,8 @@ delete that file to go back to them. Full screen: start the game, then run
   by trustno1-coder and its contributors: the base of this fork. Its pull
   requests merged here and their authors: #497 and #498 (tiadiff), #501
   (ballsimulation), #516 and #532 (henriazz10), #521 (Wiktorxd-1), #544
-  (fromrivertothesea), #547 and #552 (Glory-star), #548 (vilanx), #646 and
-  #656 (kibagami-nc).
+  (fromrivertothesea), #547 and #552 (Glory-star), #548 (vilanx), #614
+  (wike1701), #638 (chemist6913), #646 and #656 (kibagami-nc).
 - Fixes from Marvisak/VIctory pull requests, ported through the base:
   Marvisak/VIctory#2449 by makmatvey (#646) and Marvisak/VIctory#2031 by
   0xkn0wh3r3 (#656).
