@@ -95,9 +95,26 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+/// The PC's free memory that ends the pressure state:
+/// `VICTORY_PRESSURE_EXIT_GB` (3.5; 0: 5, as before), never under 3.25 GiB
+/// (it begins at 3 GiB). A 32 GB PC sat at 4.5-4.9 GB free in play, under
+/// the old 5 GiB, so texture prefetch stayed capped to the end of the run.
+fn exit_physical() -> u64 {
+    static EXIT: OnceLock<u64> = OnceLock::new();
+    *EXIT.get_or_init(|| exit_physical_of(std::env::var("VICTORY_PRESSURE_EXIT_GB").ok().as_deref()))
+}
+
+fn exit_physical_of(value: Option<&str>) -> u64 {
+    match value.map(|v| v.trim().parse::<f64>()) {
+        Some(Ok(gb)) if gb == 0.0 => 5 * GIB,
+        Some(Ok(gb)) if gb.is_finite() && gb > 0.0 => ((gb * GIB as f64) as u64).max(3 * GIB + GIB / 4),
+        _ => 3 * GIB + GIB / 2,
+    }
+}
+
+fn next_pressure(was: bool, physical: u64, commit: u64, exit: u64) -> bool {
     if was {
-        physical < 5 * GIB || commit < 6 * GIB
+        physical < exit || commit < 6 * GIB
     } else {
         physical <= 3 * GIB || commit <= 4 * GIB
     }
@@ -109,7 +126,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let pressure = next_pressure(was, physical, commit, exit_physical());
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -179,12 +196,29 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        let old = 5 * GIB;
+        assert!(next_pressure(false, 12 * GIB, 4 * GIB, old));
+        assert!(next_pressure(false, 3 * GIB, 16 * GIB, old));
+        assert!(next_pressure(true, 4 * GIB, 7 * GIB, old));
+        assert!(next_pressure(true, 6 * GIB, 5 * GIB, old));
+        assert!(!next_pressure(true, 5 * GIB, 6 * GIB, old));
+        assert!(!next_pressure(false, 4 * GIB, 5 * GIB, old));
+    }
+
+    /// `VICTORY_PRESSURE_EXIT_GB`: a 32 GB PC at 4.9 GB free leaves the
+    /// pressure state; between 3 GiB and the exit it stays as it was.
+    #[test]
+    fn pressure_exit_is_reachable() {
+        let exit = exit_physical_of(None);
+        assert_eq!(exit, 3 * GIB + GIB / 2);
+        assert!(!next_pressure(true, 4900 * MIB, 12 * GIB, exit));
+        assert!(next_pressure(true, 3200 * MIB, 12 * GIB, exit));
+        assert!(!next_pressure(false, 3200 * MIB, 12 * GIB, exit));
+        // 0: as before; too low a value keeps a gap above the entry.
+        assert_eq!(exit_physical_of(Some("0")), 5 * GIB);
+        assert_eq!(exit_physical_of(Some("4")), 4 * GIB);
+        assert_eq!(exit_physical_of(Some("1")), 3 * GIB + GIB / 4);
+        assert_eq!(exit_physical_of(Some("x")), 3 * GIB + GIB / 2);
     }
 
     #[test]
