@@ -2201,19 +2201,7 @@ fn back_piece(
     if differs == 0 {
         return None;
     }
-    let mut i = 0;
-    while i < n {
-        while i < n && mask[i] == 0 {
-            i += 1;
-        }
-        let start = i;
-        while i < n && mask[i] != 0 {
-            i += 1;
-        }
-        if i > start {
-            runs.push((start, i - start));
-        }
-    }
+    push_runs(n, |a, b| unequal(&mask[a..b], &[0; 64][..b - a]), runs);
     Some((first, n))
 }
 
@@ -2249,31 +2237,53 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    let n = now.len().min(was.len());
     let mut runs = Vec::new();
-    let mut i = 0;
-    while i < n {
-        // Equal bytes, many at a time while they last (a page looked at
-        // under a flight's writes hardly ever differs at all).
-        while i + 512 <= n && now[i..i + 512] == was[i..i + 512] {
-            i += 512;
-        }
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
-        }
-        while i < n && now[i] == was[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        while i < n && now[i] != was[i] {
-            i += 1;
-        }
-        runs.push((first, i - first));
-    }
+    push_runs(now.len().min(was.len()), |a, b| unequal(&now[a..b], &was[a..b]), &mut runs);
     runs
+}
+
+/// Pushes onto `runs` the runs of set bits of `bits` over `[0, n)`, as
+/// (offset, bytes), each a whole run: `bits(a, b)` has bit `i` set for
+/// byte `a + i` of a run, for up to 64 bytes. A byte at a time, a page the
+/// shaders rewrote cost 85-180 us of walking (4-7 times this).
+fn push_runs(n: usize, mut bits: impl FnMut(usize, usize) -> u64, runs: &mut Vec<(usize, usize)>) {
+    let mut at = 0;
+    while at < n {
+        let end = (at + 64).min(n);
+        let mut mask = bits(at, end);
+        // Each run of set bits: from its first, the ones that follow.
+        while mask != 0 {
+            let first = mask.trailing_zeros();
+            let ones = (!(mask >> first)).trailing_zeros();
+            let (from, to) = (at + first as usize, at + (first + ones) as usize);
+            match runs.last_mut() {
+                Some((a, len)) if *a + *len == from => *len = to - *a,
+                _ => runs.push((from, to - from)),
+            }
+            mask &= u64::MAX.checked_shl(first + ones).unwrap_or(0);
+        }
+        at = end;
+    }
+}
+
+/// Bit `i` set where `a[i]` differs from `b[i]`, for up to 64 bytes.
+fn unequal(a: &[u8], b: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    if let (Ok(a), Ok(b)) = (<&[u8; 64]>::try_from(a), <&[u8; 64]>::try_from(b)) {
+        use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+        let equal = (0..4).fold(0u64, |mask, k| {
+            // SAFETY: 16 bytes inside each 64-byte array, read unaligned;
+            // SSE2 is part of x86-64.
+            let sixteen = unsafe {
+                let x = _mm_loadu_si128(a.as_ptr().add(16 * k).cast());
+                let y = _mm_loadu_si128(b.as_ptr().add(16 * k).cast());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(x, y))
+            };
+            mask | u64::from(sixteen as u16) << (16 * k)
+        });
+        return !equal;
+    }
+    a.iter().zip(b).enumerate().fold(0, |mask, (i, (x, y))| mask | u64::from(x != y) << i)
 }
 
 /// The kernel's page.
@@ -2847,6 +2857,83 @@ mod merge_tests {
                 }
             }
             assert_eq!(word_runs(0x1000, &now, &was), dword_runs(0x1000, &now, &was, 0), "round {round}");
+        }
+    }
+
+    /// The runs found 64 bytes at a time are those of a byte-by-byte walk,
+    /// and a piece put back is what it was with that walk, on random data
+    /// at every alignment, with dense and sparse changes and odd tails.
+    #[test]
+    fn runs_by_64_match_the_byte_walk() {
+        fn walk(n: usize, differs: impl Fn(usize) -> bool) -> Vec<(usize, usize)> {
+            let (mut runs, mut i) = (Vec::new(), 0);
+            while i < n {
+                while i < n && !differs(i) {
+                    i += 1;
+                }
+                let start = i;
+                while i < n && differs(i) {
+                    i += 1;
+                }
+                if i > start {
+                    runs.push((start, i - start));
+                }
+            }
+            runs
+        }
+        let mut seed = 0x9e37_79b9u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let lens = [0, 1, 7, 63, 64, 65, 127, 128, 129, 191, 4099, PIECE - 7, PIECE];
+        for round in 0..400 {
+            let len = if round < lens.len() { lens[round] } else { random() as usize % 1000 };
+            let skew = random() as usize % 8;
+            // Values in 0..4: about three bytes of four differ; or one in 61.
+            let dense = round % 2 == 0;
+            let mut byte = || if dense { (random() & 3) as u8 } else { u8::from(random() % 61 == 0) };
+            let old: Vec<u8> = (0..len + skew).map(|_| byte()).collect();
+            let host0: Vec<u8> = (0..len + skew).map(|_| byte()).collect();
+            let title0: Vec<u8> = (0..len + skew).map(|_| byte()).collect();
+            let (old, h0, t0) = (&old[skew..], &host0[skew..], &title0[skew..]);
+            assert_eq!(changed_runs(h0, t0), walk(len, |i| h0[i] != t0[i]), "round {round}");
+
+            // The piece put back, against the merge and walk it had.
+            let mut host = h0.to_vec();
+            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let read = |first: usize, into: &mut [u8]| {
+                into.copy_from_slice(&t0[first..first + into.len()]);
+                true
+            };
+            let got = back_piece(&mut host, old, &mut title, &mut mask, &mut runs, read);
+            let (mut want_host, mut want_title) = (h0.to_vec(), t0.to_vec());
+            for i in 0..len {
+                if h0[i] != old[i] && t0[i] == old[i] {
+                    want_title[i] = h0[i];
+                }
+            }
+            let differ: Vec<usize> = (0..len).filter(|&i| h0[i] != old[i]).collect();
+            match (differ.first(), differ.last()) {
+                (Some(&first), Some(&last)) => {
+                    let wanted_runs = walk(last + 1 - first, |i| want_title[first + i] != t0[first + i]);
+                    if wanted_runs.is_empty() {
+                        assert_eq!(got, None, "round {round}");
+                    } else {
+                        assert_eq!(got, Some((first, last + 1 - first)), "round {round}");
+                        assert_eq!(title, want_title[first..=last], "round {round}");
+                        assert_eq!(runs, wanted_runs, "round {round}");
+                    }
+                    // The copy takes the merge from the first to the last change.
+                    want_host[first..=last].copy_from_slice(&want_title[first..=last]);
+                    if got.is_some() {
+                        assert_eq!(host, want_host, "round {round}");
+                    }
+                }
+                _ => assert_eq!(got, None, "round {round}"),
+            }
         }
     }
 
@@ -3629,7 +3716,7 @@ impl Shadow {
             // Sized to each stretch read (`back_piece`): a zeroed 64 KiB per
             // range, most of whose ranges differ nowhere, was most of the
             // work for small ranges.
-            let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+            let (mut title, mut mask, mut runs, mut was) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
@@ -3641,7 +3728,8 @@ impl Shadow {
                 };
                 // Title memory as read, beside it with the card's bytes put
                 // in: only the dwords that differ are written.
-                let was: Vec<u8> = title.iter().zip(&mask).map(|(now, changed)| now ^ changed).collect();
+                was.clear();
+                was.extend(title.iter().zip(&mask).map(|(now, changed)| now ^ changed));
                 if !runs.is_empty() {
                     written += put_changed(start + at + first, &was[..n], &title[..n]);
                 }
