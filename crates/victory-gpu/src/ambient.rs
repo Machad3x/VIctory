@@ -1,7 +1,8 @@
 //! A stand-in for the indirect light the title traces rays for.
 //!
-//! With the ray-tracing structure builder off (`crate::pipeline::builder_runs`)
-//! the title's rays find nothing. Its program that resolves the diffuse light
+//! In runs without the ray-tracing structure builder
+//! (`crate::pipeline::builder_allowed`) the title's rays find nothing. Frames
+//! where an allowed builder rests keep the probes' own history. Its program that resolves the diffuse light
 //! of its screen probes (`CS_ScreenProbes_TemporalResolve_*`) then leaves the
 //! sky's light outdoors, nothing indoors (walls are black where no lamp or
 //! sun reaches) and, in blocks of the picture's tiles, what the probes'
@@ -135,7 +136,7 @@ fn set() -> Set {
 /// Whether a stand-in is on (for the diffuse light or for reflections):
 /// set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
-    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_runs()
+    (set() != Set::Off || specular().is_some()) && !crate::pipeline::builder_allowed()
 }
 
 /// `VICTORY_AMBIENT_SPECULAR=<share>[,<sky>]`: reflections whose rays found
