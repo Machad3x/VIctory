@@ -29,3 +29,6 @@ Also: a BVH node past a buffer's 4 GiB reads as a miss, and the title's builder 
 |---|---|---|---|---|---|---|---|
 | t2a (batch 2, before the probe fix) | on | 63.7-67.2 | 5-9 | 42-48 | 9-10 | 1 | alive 300 s, right side darker |
 | t2b (batch 2) | on | 61.5-63.9 | 2-3 | 46-49 | 12 | 1 | alive 240 s, picture back |
+| t2c (batch 2, ambient estimate switches unset) | on | 65.3-68.4 | 11-14 | 40-44 | 9-11 | 1 | alive 240 s, picture as t2b |
+
+With ray tracing on, the ambient estimate now stays out for the whole run (it was only kept out in frames where the builder ran). t2c runs the same thing through the switches.
