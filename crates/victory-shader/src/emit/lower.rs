@@ -2228,7 +2228,7 @@ impl<'a> Lower<'a> {
             if let Some(bias) = self.root_bias(a.param) {
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
-            match self.root_memory(&src, off, guard, false) {
+            match self.root_memory(&src, off, guard, false, true, None) {
                 Some((h, byte)) => {
                     off = byte;
                     Some(h)
@@ -3595,24 +3595,48 @@ impl<'a> Lower<'a> {
     }
 
     /// For an access through such a root view: the raw view of the host copy
-    /// and the byte in it of the view's byte `off` (signed: an offset below
-    /// the address stays below it). [`Lower::handle`] gives the same view for
-    /// the rest of the instruction. None for any other source. Goes on in
-    /// another block.
+    /// and the byte in it of the view's byte `off` (with `signed`, an offset
+    /// below the address stays below it; a buffer's offset is unsigned).
+    /// Lanes where `inside` is false touch nothing: their loads read zeros
+    /// and their stores are dropped, as the console's range check does.
+    /// [`Lower::handle`] gives the same view for the rest of the instruction.
+    /// None for any other source. Goes on in another block.
     /// shortcut: an access of several dwords is taken not to cross the end
     /// of a host copy (the builder's records lie on their size).
-    fn root_memory(&mut self, src: &Source, off: V, guard: Option<V>, store: bool) -> Option<(V, V)> {
+    fn root_memory(
+        &mut self,
+        src: &Source,
+        off: V,
+        guard: Option<V>,
+        store: bool,
+        signed: bool,
+        inside: Option<V>,
+    ) -> Option<(V, V)> {
         let (lo, hi) = self.root_address(src)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let sum = self.s.m.bin(c, Bin::Add, lo, off);
         let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
         let carry = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
-        let k31 = self.s.m.i32(31);
-        let sign = self.s.m.bin(c, Bin::AShr, off, k31);
-        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
-        let mut hi = self.s.m.bin(c, Bin::Add, hi, sign);
+        let mut hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        if signed {
+            let k31 = self.s.m.i32(31);
+            let sign = self.s.m.bin(c, Bin::AShr, off, k31);
+            hi = self.s.m.bin(c, Bin::Add, hi, sign);
+        }
         let mut sum = sum;
+        let mut guard = guard;
+        if let Some(inside) = inside {
+            // Address 0: a page without a copy (zeros, writes dropped), and
+            // no fault noted for it.
+            let zero = self.s.m.i32(0);
+            sum = self.s.m.select(c, inside, sum, zero);
+            hi = self.s.m.select(c, inside, hi, zero);
+            guard = Some(match guard {
+                Some(g) => self.s.m.bin(c, Bin::And, g, inside),
+                None => inside,
+            });
+        }
         if super::builder_bounds() {
             // No structure is near 64 MiB (the greatest seen has 14). One
             // whose memory was written over says it has gigabytes, and the
@@ -7059,7 +7083,7 @@ impl<'a> Lower<'a> {
                 && matches!(soffset, Operand::Scalar { code: NULL, .. })
                 && super::builder_bounds();
             let mut root = false;
-            let h = match self.root_memory(src, addr, None, false) {
+            let h = match self.root_memory(src, addr, None, false, false, None) {
                 Some((h, byte)) => {
                     addr = byte;
                     root = true;
@@ -12561,6 +12585,9 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // The element and the offset in it, as the console's range check
+        // sees them.
+        let (asked, at) = (index, off);
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -12632,7 +12659,41 @@ impl<'a> Lower<'a> {
                 off = self.s.m.bin(c, Bin::Add, element, off);
                 index = None;
             }
-            if let Some((_, byte)) = self.root_memory(src, off, guard, store || atomic.is_some()) {
+            // RDNA2 range checking (dword 3's OOB_SELECT): 0 the element and
+            // the offset in it, 1 the element, 2 none (but no records), 3 the
+            // raw offset and the access's size.
+            let inside = match *src {
+                Source::Built {
+                    bits,
+                    words: [records, word3],
+                    ..
+                } => {
+                    let n = self.s.m.i32(records);
+                    let zero = self.s.m.i32(0);
+                    let element = asked.unwrap_or(zero);
+                    Some(match (word3 >> 28) & 3 {
+                        0 => {
+                            let stride = self.s.m.i32((bits >> 16) & 0x3FFF);
+                            let a = self.s.m.cmp(c, pred::IULT, element, n);
+                            let b = self.s.m.cmp(c, pred::IULT, at, stride);
+                            self.s.m.bin(c, Bin::And, a, b)
+                        }
+                        1 => self.s.m.cmp(c, pred::IULT, element, n),
+                        2 => self.s.m.cmp(c, pred::NE, n, zero),
+                        _ => {
+                            let size = narrow.map_or(4 * count, |(bits, _)| bits / 8);
+                            let size = self.s.m.i32(size);
+                            let left = self.s.m.bin(c, Bin::Sub, n, at);
+                            let a = self.s.m.cmp(c, pred::IULT, at, n);
+                            let b = self.s.m.cmp(c, pred::IUGE, left, size);
+                            self.s.m.bin(c, Bin::And, a, b)
+                        }
+                    })
+                }
+                _ => None,
+            };
+            let written = store || atomic.is_some();
+            if let Some((_, byte)) = self.root_memory(src, off, guard, written, false, inside) {
                 off = byte;
             }
         }
