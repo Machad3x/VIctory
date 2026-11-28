@@ -32,3 +32,13 @@ Also: a BVH node past a buffer's 4 GiB reads as a miss, and the title's builder 
 | t2c (batch 2, ambient estimate switches unset) | on | 65.3-68.4 | 11-14 | 40-44 | 9-11 | 1 | alive 240 s, picture as t2b |
 
 With ray tracing on, the ambient estimate now stays out for the whole run (it was only kept out in frames where the builder ran). t2c runs the same thing through the switches.
+
+## Batch 3 (2026-11-27)
+
+Merged from tn1: #552, #548 (its counting-allocator tests now run in diagnostics builds only), #547, #544. #550 (the code table starts after the instructions) is left out: with it the card time per frame went from 11-19 ms to 76-224 ms on the Series X profile, with the same picture.
+
+| run | profile | ms/frame | GPU ms | prep ms | copy-back ms | dropped draws/frame | result |
+|---|---|---|---|---|---|---|---|
+| t3b (batch 3 with #550) | Series X | 153-308 | 76-224 | 62-71 | 12 | 1 | alive 240 s, card time up |
+| t3s (batch 3 with #550) | Series S | 50.4-53.2 | 1-5 | 39-41 | 7-10 | 1 | alive 240 s |
+| t3r (batch 3 without #550) | Series X | 67.3-70.5 | 18-19 | 39-42 | 9-10 | 1 | alive 240 s, picture as t2b |
