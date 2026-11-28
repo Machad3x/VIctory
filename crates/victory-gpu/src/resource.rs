@@ -1880,6 +1880,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// gave back. When the targets grow by 64 MiB again (a new scene's), only
 /// 128 MiB above them is kept, for as long again: keeping the whole rest
 /// re-reserved about 1.1 GB for every 64 MiB step.
+///
+/// `VICTORY_TARGET_ROOM_SMALL` (on; 0: off, as before): from the world's
+/// first frame on ([`world_begun`]) only a margin above the targets is
+/// kept, the larger of 256 MiB and 15 % of them. The whole reserve still
+/// stands until that frame, which makes most of them with no room test.
+/// Kept whole through the first frames, it held 1,156-1,750 MB for 85 s
+/// of play while the textures were only 16-300 MB over the line, as every
+/// 64 MiB step restarted the settle clock.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -1914,7 +1922,30 @@ pub(crate) fn targets_room_kept() -> u64 {
     if settle > 0 && still >= settle {
         RELEASED.store(true, Relaxed);
     }
-    targets_kept(most, targets, still, settle, released)
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let small = *SMALL.get_or_init(|| std::env::var("VICTORY_TARGET_ROOM_SMALL").as_deref() != Ok("0"));
+    targets_kept(most, targets, still, settle, released, small && world_begun())
+}
+
+/// Whether a frame has run 500 draws or more (the world's first frame;
+/// menus and loading screens run tens).
+#[cfg(windows)]
+static WORLD_BEGUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// At every present: notes the world's first frame for [`targets_room_kept`].
+#[cfg(windows)]
+pub(crate) fn frame_presented() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let drawn = crate::draw::drawn();
+    if drawn.saturating_sub(LAST.swap(drawn, Relaxed)) >= 500 && !WORLD_BEGUN.swap(true, Relaxed) {
+        tracing::info!("the first frame of 500 draws or more: from here only a margin above the render targets is kept for them (VICTORY_TARGET_ROOM_SMALL)");
+    }
+}
+
+#[cfg(windows)]
+fn world_begun() -> bool {
+    WORLD_BEGUN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -1936,14 +1967,18 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
 /// hold yet, nothing once they have not grown for `settle` ms (`still_ms`;
 /// `settle` 0: always kept), and after that first release (`released`) at
-/// most 128 MiB above them while they grow again.
+/// most 128 MiB above them while they grow again. Once the world has begun
+/// with a small reserve (`small`), at most the larger of 256 MiB and 15 %
+/// of the targets.
 #[cfg(any(windows, test))]
-fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64, released: bool) -> u64 {
+fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64, released: bool, small: bool) -> u64 {
     let rest = most.saturating_sub(targets);
     if settle > 0 && still_ms >= settle {
         0
     } else if released {
         rest.min(128 << 20)
+    } else if small {
+        rest.min((256 << 20).max(targets / 100 * 15))
     } else {
         rest
     }
@@ -5196,12 +5231,31 @@ float4 lit() : SV_Target { return 1.0; }
         const MIB: u64 = 1 << 20;
         let most = 3072 * MIB;
         // The world's first frames: still growing.
-        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000, false), 989 * MIB);
+        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000, false, false), 989 * MIB);
         // Settled: nothing kept, under half of the reserve too.
-        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000, false), 0);
-        assert_eq!(targets_kept(most, 1490 * MIB, 20_000, 20_000, false), 0);
+        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000, false, false), 0);
+        assert_eq!(targets_kept(most, 1490 * MIB, 20_000, 20_000, false, false), 0);
         // `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=0`: kept as before.
-        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0, false), 640 * MIB);
+        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0, false, false), 640 * MIB);
+    }
+
+    /// `VICTORY_TARGET_ROOM_SMALL`: from the world's first frame on, only a
+    /// margin above the targets is kept, not the whole rest of the reserve.
+    #[test]
+    fn room_for_targets_in_the_world_is_a_margin() {
+        const MIB: u64 = 1 << 20;
+        let most = 3072 * MIB;
+        // 1,322 MiB of targets at the first world frames: 256 MiB, not 1,750.
+        assert_eq!(targets_kept(most, 1322 * MIB, 5_000, 20_000, false, true), 256 * MIB);
+        // Larger targets: 15 % of them.
+        assert_eq!(targets_kept(most, 2400 * MIB, 5_000, 20_000, false, true), 2400 * MIB / 100 * 15);
+        // Never more than the rest of the reserve.
+        assert_eq!(targets_kept(most, 3000 * MIB, 5_000, 20_000, false, true), 72 * MIB);
+        // Settled or released: as before.
+        assert_eq!(targets_kept(most, 1322 * MIB, 20_000, 20_000, false, true), 0);
+        assert_eq!(targets_kept(most, 1322 * MIB, 1_000, 20_000, true, true), 128 * MIB);
+        // Off, or before the world: the whole rest.
+        assert_eq!(targets_kept(most, 1322 * MIB, 5_000, 20_000, false, false), 1750 * MIB);
     }
 
     /// Once given up, the room kept for growing targets is 128 MiB above
@@ -5211,11 +5265,11 @@ float4 lit() : SV_Target { return 1.0; }
         const MIB: u64 = 1 << 20;
         let most = 3072 * MIB;
         // Grew by 64 MiB after the release: 128 MiB kept, not 1,518 MiB.
-        assert_eq!(targets_kept(most, 1554 * MIB, 1_000, 20_000, true), 128 * MIB);
+        assert_eq!(targets_kept(most, 1554 * MIB, 1_000, 20_000, true, false), 128 * MIB);
         // Near the reserve: no more than its rest.
-        assert_eq!(targets_kept(most, 3000 * MIB, 1_000, 20_000, true), 72 * MIB);
+        assert_eq!(targets_kept(most, 3000 * MIB, 1_000, 20_000, true, false), 72 * MIB);
         // Settled again: nothing kept.
-        assert_eq!(targets_kept(most, 1554 * MIB, 20_000, 20_000, true), 0);
+        assert_eq!(targets_kept(most, 1554 * MIB, 20_000, 20_000, true, false), 0);
 
         // Growth of 64 MiB restarts the clock; less does not.
         assert_eq!(targets_seen(2000 * MIB, 1_000, 2050 * MIB, 9_000), (2000 * MIB, 1_000));
