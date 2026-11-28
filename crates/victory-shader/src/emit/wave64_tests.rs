@@ -899,6 +899,33 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
     eprintln!("ran on the hardware device: both console waves' loops, as the console runs them");
 }
 
+/// The same program through [`super::widen`], as a translation takes it: the first form
+/// still needs 64-lane waves, and so does the one with its loops' branches taken by each host
+/// wave together ([`super::emit_program`]). That one is no better, so the first keeps the
+/// blocks where the host waves must meet and the back edge around them is taken per console
+/// wave: 32-lane waves. (It was taken as it was, with no blocks named, and the program stayed
+/// on 64-lane waves: `CS_DefragHeap_ComputeRelocations`, groups of 128, did not translate.)
+#[test]
+fn a_loop_form_as_wide_as_the_first_leaves_its_branches_to_widen() {
+    let words = [
+        0x3402_0082, 0x3A06_00BF, 0x3406_0682, 0x4A04_0000, 0x2C0E_0084, 0x4A0E_0E81,
+        0x7E0A_0280, 0xBE8E_047E, 0xD834_0000, 0x0000_0201, 0xD8D8_0000, 0x0400_0003,
+        0xBF8C_C07F, 0x4A04_0902, 0x4A0A_0A81, 0x7DA8_0B07, 0xBF89_FFF7, 0xBEFE_040E,
+        0xD760_0007, 0x0001_7F02, 0x4A04_0407, 0xE070_1000, 0x8002_0201,
+    ]; // (as in the test above)
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let c = crate::dxbc::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let r = super::widen(&c, &native, &p, false, false, true);
+    lower::TEST_HOST_WAVE.set(was);
+    let (_, wave) = r.expect("widen");
+    assert_eq!(wave, Some(32));
+}
+
 /// Which LDS accesses need the host waves of their console wave to meet
 /// ([`lower::LdsOrder`]): before a barrier a lane writes its dword and reads it back (the
 /// order counts); after it the lanes read and add with atomics only (it does not: a read
@@ -1010,3 +1037,4 @@ fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
     }
     eprintln!("ran on the hardware device: 64 of 64 console threads, each once");
 }
+

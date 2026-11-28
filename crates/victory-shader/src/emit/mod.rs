@@ -951,8 +951,11 @@ fn emit_program(
         emit_program_plain(c, native, p, &st, io, &res)
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    // (one as wide as the first and wider than the host's waves is no better: the first keeps
+    // its needs, so that [`widen`] takes the branches around them wave-wide)
+    let host = lower::host_max_wave();
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        Ok((shader, Some(w))) if w < *wave || w == *wave && (host == 0 || w <= host) => {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }
