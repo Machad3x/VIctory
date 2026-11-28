@@ -12585,9 +12585,8 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
-        // The element and the offset in it, as the console's range check
-        // sees them.
-        let (asked, at) = (index, off);
+        // The element as the console's range check sees it.
+        let asked = index;
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -12659,36 +12658,14 @@ impl<'a> Lower<'a> {
                 off = self.s.m.bin(c, Bin::Add, element, off);
                 index = None;
             }
-            // RDNA2 range checking (dword 3's OOB_SELECT): 0 the element and
-            // the offset in it, 1 the element, 2 none (but no records), 3 the
-            // raw offset and the access's size.
-            let inside = match *src {
-                Source::Built {
-                    bits,
-                    words: [records, word3],
-                    ..
-                } => {
-                    let n = self.s.m.i32(records);
-                    let zero = self.s.m.i32(0);
-                    let element = asked.unwrap_or(zero);
-                    Some(match (word3 >> 28) & 3 {
-                        0 => {
-                            let stride = self.s.m.i32((bits >> 16) & 0x3FFF);
-                            let a = self.s.m.cmp(c, pred::IULT, element, n);
-                            let b = self.s.m.cmp(c, pred::IULT, at, stride);
-                            self.s.m.bin(c, Bin::And, a, b)
-                        }
-                        1 => self.s.m.cmp(c, pred::IULT, element, n),
-                        2 => self.s.m.cmp(c, pred::NE, n, zero),
-                        _ => {
-                            let size = narrow.map_or(4 * count, |(bits, _)| bits / 8);
-                            let size = self.s.m.i32(size);
-                            let left = self.s.m.bin(c, Bin::Sub, n, at);
-                            let a = self.s.m.cmp(c, pred::IULT, at, n);
-                            let b = self.s.m.cmp(c, pred::IUGE, left, size);
-                            self.s.m.bin(c, Bin::And, a, b)
-                        }
-                    })
+            // RDNA2 range checking with dword 3's OOB_SELECT 1 (structured,
+            // element only): an element at or past num_records touches
+            // nothing. shortcut: the other modes go unchecked, as before;
+            // check them once their offsets and strides are known exactly.
+            let inside = match (src, asked) {
+                (Source::Built { words, .. }, Some(element)) if (words[1] >> 28) & 3 == 1 => {
+                    let n = self.s.m.i32(words[0]);
+                    Some(self.s.m.cmp(c, pred::IULT, element, n))
                 }
                 _ => None,
             };
