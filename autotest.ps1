@@ -41,6 +41,9 @@ Get-ChildItem (Split-Path $exe) -File | Where-Object { $_.Name -in 'victory.exe'
 $exe = Join-Path $run 'victory.exe'
 
 $env:VICTORY_GAME_DIR = $Game
+# Work on this base is done with the title's ray tracing on; -More @{VICTORY_BVH_BUILDER=''} turns it off.
+if (-not $More.ContainsKey('VICTORY_BVH_BUILDER')) { $env:VICTORY_BVH_BUILDER = '1' }
+elseif (-not $More['VICTORY_BVH_BUILDER']) { Remove-Item Env:VICTORY_BVH_BUILDER -ErrorAction SilentlyContinue }
 $env:VICTORY_KEYS = (0..10 | ForEach-Object { '{0}:Enter' -f (15 + $_ * 0.5).ToString([cultureinfo]::InvariantCulture) }) -join ','
 if ($Loop -gt 0) { $env:VICTORY_SHADER_LOOP_LIMIT = "$Loop" }
 if ($Dred) { $env:VICTORY_D3D12_DRED = '1'; $env:VICTORY_GPU_TIMING = '1' }
