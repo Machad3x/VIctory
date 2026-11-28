@@ -506,7 +506,8 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 /// library's bytes are on the disk and before the rename, so a save cut
 /// short on either side of it leaves a library that matches. A library
 /// that matches no line is set aside ([`MISMATCHED_FILE`]) and not loaded;
-/// one with no sum file (saved before sums were kept) is loaded.
+/// one with no sum file, or newer than it (saved by a build that kept no
+/// sums), is loaded.
 const SUM_FILE: &str = "host-pipelines.sum";
 /// Where a library that does not match its sum is put (the last one only).
 const MISMATCHED_FILE: &str = "host-pipelines.mismatched";
@@ -552,6 +553,15 @@ fn checked(dir: &std::path::Path, blob: Blob) -> (Blob, Option<String>) {
         return (blob, None);
     }
     let found = sum(blob.bytes());
+    let modified = |name| std::fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok();
+    // A save writes the sum file before renaming the library in: a library
+    // newer than its sum was saved by a build that kept no sums.
+    if let (Some(library), Some(summed)) = (modified(LIBRARY_FILE), modified(SUM_FILE))
+        && library > summed
+    {
+        tracing::info!("host pipeline library is newer than its sum file (saved by a build without sums): loaded unchecked");
+        return (blob, Some(found));
+    }
     let saved = std::fs::read(dir.join(SUM_FILE)).ok();
     let Some(why) = mismatch(&found, saved.as_deref()) else {
         return (blob, Some(found));
@@ -1153,6 +1163,7 @@ mod tests {
         assert_eq!((blob.bytes(), found.as_deref()), (&bytes[..], Some(&*sum(&bytes))), "matches");
         drop(blob);
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        age(&path);
         let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
         assert!(matches!(blob, Blob::None) && found.is_none(), "cut short");
         assert!(!path.exists());
@@ -1160,6 +1171,32 @@ mod tests {
         // No library at all: nothing to check.
         let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
         assert!(matches!(blob, Blob::None) && found.is_none());
+    }
+
+    /// `path`'s modified time set a minute back.
+    fn age(path: &std::path::Path) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(then).unwrap();
+    }
+
+    /// A library newer than its sum file (saved by a build without sums)
+    /// loads unchecked; one older than a sum it does not match is set aside.
+    #[test]
+    fn a_library_newer_than_its_sum_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(LIBRARY_FILE);
+        let bytes = b"newer".repeat(1000);
+        std::fs::write(dir.path().join(SUM_FILE), sum(b"older")).unwrap();
+        age(&dir.path().join(SUM_FILE));
+        std::fs::write(&path, &bytes).unwrap();
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert_eq!((blob.bytes(), found.as_deref()), (&bytes[..], Some(&*sum(&bytes))), "newer than its sum");
+        drop(blob);
+        std::fs::write(dir.path().join(SUM_FILE), sum(b"older")).unwrap();
+        age(&path);
+        let (blob, found) = checked(dir.path(), Blob::of(dir.path()));
+        assert!(matches!(blob, Blob::None) && found.is_none(), "sum newer, mismatched");
+        assert_eq!(std::fs::read(dir.path().join(MISMATCHED_FILE)).unwrap(), bytes);
     }
 
     /// A save puts the new library on the disk with a sum file that holds
