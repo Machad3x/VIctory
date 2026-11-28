@@ -460,9 +460,11 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
-    if (any(isnan(found)) || any(isinf(found)) || any(found < 0.0)) found = 0.0;
+    // Each channel on its own: a NaN or Inf one becomes 0, a negative one is
+    // clamped to 0, and the others keep their light.
+    found = (isnan(found) || isinf(found)) ? 0.0 : max(found, 0.0);
     float3 was = unpack(light[p]);
-    if (any(isnan(was)) || any(isinf(was)) || any(was < 0.0)) was = 0.0;
+    was = (isnan(was) || isinf(was)) ? 0.0 : max(was, 0.0);
     // Magenta/violet garbage the probes' memory held (green far under red and
     // blue): dropped, as VIctory-Belobug-AMD does (ambient.rs, "Filter magenta
     // garbage probes"). Seen on an RTX 5080 as a purple-blue glow on a lit
@@ -850,6 +852,23 @@ mod tests {
         }
         // Where the title's light is above the estimate nothing changes.
         assert_eq!(settle(0.8, 0.6, &[1.0, 1.0], true), vec![1.0, 1.0]);
+    }
+
+    /// `raise`'s scrub of the probe result, channel by channel as the shader's
+    /// per-component `?:` takes it.
+    fn scrub(c: [f32; 3]) -> [f32; 3] {
+        c.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })
+    }
+
+    /// One bad channel never takes the pixel's other channels with it.
+    #[test]
+    fn raise_scrubs_each_channel_on_its_own() {
+        assert!(SOURCE.contains("found = (isnan(found) || isinf(found)) ? 0.0 : max(found, 0.0);"));
+        assert!(!SOURCE.contains("any(found < 0.0)"));
+        assert_eq!(scrub([0.3, -0.1, 0.5]), [0.3, 0.0, 0.5]);
+        assert_eq!(scrub([0.3, f32::NAN, 0.5]), [0.3, 0.0, 0.5]);
+        assert_eq!(scrub([f32::INFINITY, 0.2, 0.5]), [0.0, 0.2, 0.5]);
+        assert_eq!(scrub([0.3, 0.2, 0.5]), [0.3, 0.2, 0.5]);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
