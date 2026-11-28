@@ -95,7 +95,8 @@ pub(super) fn hot_within(shadow: &Shadow, from: usize, to: usize, out: &mut Vec<
             let (a, b) = piece_offsets(shadow, piece);
             let (a, b) = (a.max(lo) + start, b.min(hi) + start);
             match out.last_mut() {
-                Some(last) if last.1 >= a => last.1 = last.1.max(b),
+                // `out` may already hold unrelated ranges; callers sort and join after.
+                Some(last) if last.0 <= a && last.1 >= a => last.1 = last.1.max(b),
                 _ => out.push((a, b)),
             }
         }
@@ -308,4 +309,23 @@ fn log() {
         "lazy compares in the last 5 s (VICTORY_LAZY_COMPARE_MB): pieces compared as written lately, before a send, in the \
          sweep; left out; found written; written lately now"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hot_piece_below_an_unrelated_range_stays() {
+        const P: usize = 64 << 10;
+        let start = 16 * P;
+        let data = Box::leak(vec![0u8; 4 * P].into_boxed_slice()).as_mut_ptr();
+        let shadow = Shadow::unbacked(start as u64, data, (4 * P) as u64, true);
+        let piece = shadow.card_piece_of(P);
+        with(&shadow, |state| state.hot[piece as usize] = 1);
+        let above = (start + 3 * P, start + 3 * P + 16);
+        let mut out = vec![above];
+        hot_within(&shadow, start, start + 4 * P, &mut out);
+        assert_eq!(out, vec![above, (start + P, start + 2 * P)]);
+    }
 }
