@@ -255,8 +255,9 @@ struct Places {
     as_is: u32,
     /// Title slots: `as_is` up to this.
     count: u32,
-    /// Where dynamic slots start, and the null place every index without a
-    /// place reads.
+    /// Dynamic slots: this many, from place `dynamic_at`; and the null
+    /// place every index without a place reads.
+    dynamic: u32,
     dynamic_at: u32,
     null_at: u32,
     /// Where a view goes that finds the pool empty: a place no index reads.
@@ -276,10 +277,102 @@ struct Places {
 const AS_IS: u32 = 1 << 16;
 
 /// Whether a capped view heap places the title's slots through a table
-/// ([`Places`]; `VICTORY_VIEW_REMAP=0`: slots past what fits read null, as
-/// before).
+/// ([`Places`]; `VICTORY_VIEW_REMAP=1`; off by default: slots past what fits
+/// read null, as before). A host whose heaps are not capped never does.
 fn view_remap_on() -> bool {
-    std::env::var_os("VICTORY_VIEW_REMAP").is_none_or(|v| v != "0")
+    std::env::var_os("VICTORY_VIEW_REMAP").is_some_and(|v| v == "1")
+}
+
+/// Since the last frame line, of [`Places`]: places given, given back, and
+/// writes that found the pool empty (they read null); then the places in
+/// use now.
+pub(crate) static PLACES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Since the last frame line: title view slots on changed heap pages that
+/// have no host slot (a capped heap without [`Places`]). An index a shader
+/// computes there reads the null slot.
+pub(crate) static LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Places {
+    /// For `count` title slots, the first `as_is` of them kept where they
+    /// are, and `dynamic` dynamic ones in a heap of `size`, whose last slot
+    /// is the null one.
+    fn new(count: u32, size: u32, dynamic: u32, as_is: u32) -> Self {
+        let dynamic_at = size - 1 - dynamic;
+        let as_is = as_is.min(count);
+        Places {
+            as_is,
+            count,
+            dynamic,
+            dynamic_at,
+            null_at: size - 1,
+            sink: dynamic_at - 1,
+            of: (as_is..count).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
+            free: Mutex::new((as_is..dynamic_at - 1).collect()),
+        }
+    }
+
+    /// The place of slot `index`: the null one if it has none.
+    fn place(&self, index: u32) -> u32 {
+        if index < self.as_is {
+            index
+        } else if index < self.count {
+            self.of[(index - self.as_is) as usize]
+                .load(std::sync::atomic::Ordering::Acquire)
+                .checked_sub(1)
+                .unwrap_or(self.null_at)
+        } else if index - self.count < self.dynamic {
+            self.dynamic_at + (index - self.count)
+        } else {
+            self.null_at
+        }
+    }
+
+    /// [`Places::place`], with a place of the pool given to a title slot
+    /// that has none (and whether one was given now), or the sink, which no
+    /// index reads, if none is free.
+    fn take(&self, index: u32) -> (u32, bool) {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        if index < self.as_is || index >= self.count {
+            return (self.place(index), false);
+        }
+        let of = &self.of[(index - self.as_is) as usize];
+        if let Some(at) = of.load(Acquire).checked_sub(1) {
+            return (at, false);
+        }
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = of.load(Acquire).checked_sub(1) {
+            return (at, false);
+        }
+        let Some(at) = free.pop_front() else {
+            PLACES[2].fetch_add(1, Relaxed);
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(index, "no free place for a title view slot; it reads null"));
+            return (self.sink, false);
+        };
+        // (The place is null: made so, or given back after its slot was.)
+        of.store(at + 1, Release);
+        PLACES[0].fetch_add(1, Relaxed);
+        PLACES[3].fetch_add(1, Relaxed);
+        (at, true)
+    }
+
+    /// Title slot `index`, made null, gives its place back; whether it had
+    /// one.
+    fn give_back(&self, index: u32) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        if index < self.as_is || index >= self.count {
+            return false;
+        }
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = self.of[(index - self.as_is) as usize].swap(0, AcqRel).checked_sub(1) else {
+            return false;
+        };
+        free.push_back(at);
+        PLACES[1].fetch_add(1, Relaxed);
+        PLACES[3].fetch_sub(1, Relaxed);
+        true
+    }
 }
 
 /// Since the last frame line: writes that left `placed` alone
@@ -2119,25 +2212,16 @@ impl HostHeap {
             sampler,
         ));
         let places = (!sampler && victory_shader::emit::view_remap()).then(|| {
-            let dynamic_at = size - 1 - extra;
-            let as_is = count.min(AS_IS);
-            let pool = dynamic_at - 1 - as_is;
+            let p = Places::new(count, size, extra, AS_IS);
+            let (as_is, pool) = (p.as_is, p.sink - p.as_is);
             tracing::info!(
                 title_slots = count,
                 as_is,
                 pool,
-                dynamic_at,
-                "view heap: title slots from {as_is} on are placed in a pool of {pool}"
+                dynamic_at = p.dynamic_at,
+                "view heap: title slots from {as_is} on are placed in a pool of {pool} (VICTORY_VIEW_REMAP=1)"
             );
-            Places {
-                as_is,
-                count,
-                dynamic_at,
-                null_at: size - 1,
-                sink: dynamic_at - 1,
-                of: (as_is..count).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
-                free: Mutex::new((as_is..dynamic_at - 1).collect()),
-            }
+            p
         });
         let strides = (!sampler)
             .then(|| {
@@ -3975,55 +4059,26 @@ impl HostHeap {
 
     /// The place of slot `index` in the host's heap ([`Places`]).
     pub(crate) fn place(&self, index: u32) -> u32 {
-        let Some(p) = &self.places else { return index };
-        if index < p.as_is {
-            index
-        } else if index < p.count {
-            p.of[(index - p.as_is) as usize].load(std::sync::atomic::Ordering::Acquire).checked_sub(1).unwrap_or(p.null_at)
-        } else if index < p.count + self.dynamic {
-            p.dynamic_at + (index - p.count)
-        } else {
-            p.null_at
-        }
+        self.places.as_ref().map_or(index, |p| p.place(index))
     }
 
     /// [`HostHeap::place`], with a place of the pool given to a title slot
     /// that has none (or the sink, which no index reads, if none is free).
     fn place_for(&self, index: u32) -> u32 {
-        use std::sync::atomic::Ordering::Acquire;
         let Some(p) = &self.places else { return index };
-        if index < p.as_is || index >= p.count {
-            return self.place(index);
+        let (at, given) = p.take(index);
+        if given {
+            self.write_place(index, at);
         }
-        let of = &p.of[(index - p.as_is) as usize];
-        if let Some(at) = of.load(Acquire).checked_sub(1) {
-            return at;
-        }
-        let mut free = p.free.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = of.load(Acquire).checked_sub(1) {
-            return at;
-        }
-        let Some(at) = free.pop_front() else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(index, "no free place for a title view slot; it reads null"));
-            return p.sink;
-        };
-        // (The place is null: made so, or given back after its slot was.)
-        of.store(at + 1, std::sync::atomic::Ordering::Release);
-        self.write_place(index, at);
         at
     }
 
     /// Title slot `index`, made null, gives its place back ([`Places`]).
     fn place_back(&self, index: u32) {
-        let Some(p) = &self.places else { return };
-        if index < p.as_is || index >= p.count {
-            return;
-        }
-        let mut free = p.free.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(at) = p.of[(index - p.as_is) as usize].swap(0, std::sync::atomic::Ordering::AcqRel).checked_sub(1) {
+        if let Some(p) = &self.places
+            && p.give_back(index)
+        {
             self.write_place(index, p.null_at);
-            free.push_back(at);
         }
     }
 
@@ -7282,5 +7337,100 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+}
+
+#[cfg(test)]
+mod places_tests {
+    use super::Places;
+
+    /// A capped heap of 64 places: 8 title slots as they are, a pool of 50,
+    /// the sink, 4 dynamic slots and the null one.
+    fn places(count: u32) -> Places {
+        Places::new(count, 64, 4, 8)
+    }
+
+    #[test]
+    fn slots_without_a_view_read_the_null_place() {
+        let p = Places::new(super::AS_IS + 100, 1_000_000, super::DYNAMIC, super::AS_IS);
+        assert_eq!(p.place(7), 7);
+        assert_eq!(p.place(super::AS_IS - 1), super::AS_IS - 1);
+        assert_eq!(p.place(super::AS_IS), 999_999);
+        // Dynamic slots follow the title's, one after another, up to the null place.
+        assert_eq!(p.place(super::AS_IS + 100), 999_999 - super::DYNAMIC);
+        assert_eq!(p.place(super::AS_IS + 100 + super::DYNAMIC - 1), 999_998);
+        assert_eq!(p.place(super::AS_IS + 100 + super::DYNAMIC), 999_999);
+        assert_eq!(p.place(u32::MAX), 999_999);
+    }
+
+    #[test]
+    fn a_written_slot_keeps_its_place_until_it_is_made_null() {
+        let p = places(1000);
+        let (at, given) = p.take(900);
+        assert!(given && (p.as_is..p.sink).contains(&at));
+        assert_eq!(p.take(900), (at, false));
+        assert_eq!(p.place(900), at);
+        let (other, _) = p.take(10);
+        assert_ne!(other, at);
+        assert!(p.give_back(900));
+        assert!(!p.give_back(900));
+        assert_eq!(p.place(900), p.null_at);
+        assert_eq!(p.place(10), other);
+    }
+
+    #[test]
+    fn slots_that_move_every_frame_never_run_out_of_places() {
+        let p = places(100_000);
+        // Each frame writes 40 slots somewhere else and makes the last frame's null.
+        let mut last: Vec<u32> = Vec::new();
+        for frame in 0..5000u32 {
+            for &index in &last {
+                assert!(p.give_back(index));
+            }
+            last = (0..40).map(|k| p.as_is + (frame * 7919 + k * 13) % (100_000 - p.as_is)).collect();
+            last.sort_unstable();
+            last.dedup();
+            let mut taken: Vec<u32> = last.iter().map(|&index| p.take(index).0).collect();
+            assert!(taken.iter().all(|at| (p.as_is..p.sink).contains(at)), "frame {frame}");
+            taken.sort_unstable();
+            taken.dedup();
+            assert_eq!(taken.len(), last.len(), "frame {frame}: two slots at one place");
+        }
+    }
+
+    #[test]
+    fn a_place_given_back_is_the_last_to_be_given_again() {
+        let p = places(1000);
+        let first = p.take(500).0;
+        assert!(p.give_back(500));
+        let pool = p.sink - p.as_is;
+        let later: Vec<u32> = (0..pool).map(|k| p.take(600 + k).0).collect();
+        assert_eq!(later.last(), Some(&first));
+        assert!(!later[..later.len() - 1].contains(&first));
+    }
+
+    #[test]
+    fn a_full_pool_leaves_a_slot_at_a_place_no_index_reads() {
+        let p = places(1000);
+        let pool = p.sink - p.as_is;
+        for k in 0..pool {
+            assert!(p.take(p.as_is + k).1);
+        }
+        let index = p.as_is + pool;
+        assert_eq!(p.take(index), (p.sink, false));
+        assert_eq!(p.place(index), p.null_at);
+        assert!((0..2000).all(|i| p.place(i) != p.sink));
+        // A place given back serves the next one.
+        assert!(p.give_back(p.as_is));
+        assert!(p.take(index).1);
+    }
+
+    #[test]
+    fn a_small_title_heap_stays_as_it_is() {
+        let p = places(8);
+        assert_eq!((0..8).map(|i| p.take(i)).collect::<Vec<_>>(), (0..8).map(|i| (i, false)).collect::<Vec<_>>());
+        assert_eq!(p.place(8), p.dynamic_at);
+        assert_eq!(p.place(11), p.null_at - 1);
+        assert_eq!(p.place(12), p.null_at);
     }
 }

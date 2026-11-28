@@ -160,8 +160,18 @@ pub fn set_view_heap_limit(null_slot: u32) {
     VIEW_LIMIT.store(null_slot, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone: [`view_heap_limit`] and [`view_remap`].
+    pub(crate) static VIEW_PLACES_HERE: std::cell::Cell<Option<(u32, bool)>> = const { std::cell::Cell::new(None) };
+}
+
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
+    #[cfg(test)]
+    if let Some((limit, _)) = VIEW_PLACES_HERE.get() {
+        return limit;
+    }
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -181,6 +191,10 @@ pub fn set_view_remap(on: bool) {
 
 /// See [`set_view_remap`].
 pub fn view_remap() -> bool {
+    #[cfg(test)]
+    if let Some((_, on)) = VIEW_PLACES_HERE.get() {
+        return on;
+    }
     VIEW_REMAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -510,7 +524,7 @@ impl Shader {
     ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
         // (the raw twins of buffer views lie past it: such an index comes bounded)
-        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
+        let limit = if bounded { 0 } else { view_heap_limit() };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);

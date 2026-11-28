@@ -98,6 +98,11 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// hardware GPU and on WARP (each skipped without a device) and returns,
 /// per one that ran, the UAV's 32 dwords.
 pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_with(shader, views, &[])
+}
+
+/// [`run`], with `table` (if any) as each of the shader's root SRVs (it has no other root view).
+pub(super) fn run_with(shader: &HostShader, views: &[View], table: &[u32]) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -137,7 +142,9 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots: std::iter::once((0, Root::Constants(ud)))
+                        .chain((1..).zip(&shader.root_srvs).filter(|_| !table.is_empty()).map(|(n, _)| (n, Root::View { srv: true, data: table.to_vec() })))
+                        .collect(),
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],

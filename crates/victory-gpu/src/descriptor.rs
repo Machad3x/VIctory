@@ -483,6 +483,8 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        let left: u64 = parts.iter().map(|&(from, to)| slots_left_out(from, to, start as usize, step, heap.desc.count, mirrored_count)).sum();
+        host::LEFT_OUT.fetch_add(left, Relaxed);
         // A few pages a thread at a time: read, compared with what was last
         // seen there and sorted out, beside one another (14 ms a frame of one
         // thread at 160 pages, run faults-6).
@@ -749,6 +751,25 @@ pub(crate) fn sync_line(frames: f64) {
             lost as f64 / frames
         );
     }
+    let left = host::LEFT_OUT.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if left > 0 {
+        tracing::info!(
+            "view slots past the host heap on changed heap pages per frame (an index a shader computes there reads null; \
+             VICTORY_VIEW_REMAP=1 places them): {:.0}",
+            left as f64 / frames
+        );
+    }
+    let [given, back, sunk] = [0, 1, 2].map(|i| host::PLACES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let used = host::PLACES[3].load(std::sync::atomic::Ordering::Relaxed);
+    if given + back + sunk + used > 0 {
+        tracing::info!(
+            "view places per frame (VICTORY_VIEW_REMAP=1): {:.0} given, {:.0} given back, {:.0} writes that found none free \
+             (they read null); {used} in use",
+            given as f64 / frames,
+            back as f64 / frames,
+            sunk as f64 / frames
+        );
+    }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
@@ -814,6 +835,14 @@ fn changed_slots(
     let first = from / step;
     let last = to.div_ceil(step).min(u64::from(mirrored_count));
     first.min(last)..last
+}
+
+/// Of the title's `count` descriptor slots, those in a changed byte range that
+/// [`changed_slots`] leaves out: past a capped host heap's (a diagnostic).
+#[cfg(windows)]
+fn slots_left_out(range_from: usize, range_end: usize, heap_start: usize, step: u64, count: u32, mirrored_count: u32) -> u64 {
+    let all = changed_slots(range_from, range_end, heap_start, step, count);
+    all.end - all.start.max(u64::from(mirrored_count)).min(all.end)
 }
 
 /// The title's view heap that shaders of a list without one get their views
@@ -2081,6 +2110,20 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn slots_past_a_capped_host_heap_are_counted_as_left_out() {
+        let (start, step) = (0x1000usize, 32usize);
+        let left = |from: usize, to: usize, mirrored| slots_left_out(start + from * step, start + to * step, start, step as u64, 10, mirrored);
+        // All of them fit: none.
+        assert_eq!(left(0, 10, 10), 0);
+        // A range below the host's count, across it, past it, and past the title's.
+        assert_eq!(left(0, 5, 5), 0);
+        assert_eq!(left(3, 8, 5), 3);
+        assert_eq!(left(6, 9, 5), 3);
+        assert_eq!(left(6, 40, 5), 4);
     }
 
     #[cfg(windows)]

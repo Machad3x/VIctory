@@ -369,3 +369,54 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
         assert_eq!(got[..2], [0, 6], "{label}");
     }
 }
+
+/// On a host that places view indices through its table (`set_view_remap`),
+/// every view index, a table's and one the program computes, reads the heap
+/// slot the table names for it; an index past the table reads its last one.
+#[test]
+fn view_indices_are_read_at_their_places() {
+    let program = |at: u32| {
+        let words = [
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xBE8C_03FF, // s_mov_b32 s12, at
+            at,
+            0xF408_0203, // s_load_dwordx4 s[8:11], s[6:7], s12
+            0x1800_0000,
+            0xE030_0004, // buffer_load_dword v5, off, s[8:11], 0 offset:4
+            0x8002_0500,
+            0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+            0xBE84_0380, // s_mov_b32 s4, 0
+        ];
+        [TABLE, &words, STORE].concat()
+    };
+    let (title, placed, null, texel) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8], [9u32, 10, 11, 12], [[0.0; 4]; 1]);
+    let raw = |data| View::Buffer { data, stride: Stride::Raw };
+    let other = || View::Texture(1, 1, &texel);
+    // Index 1 is at place 5 and the store's index 2 at place 6; every other one reads place 7.
+    let views = [other(), raw(&title), other(), other(), other(), raw(&placed), View::RawUav(2), raw(&null)];
+    const KEYS: u32 = 16;
+    let n = super::SLOT_STRIDES_COUNT as usize;
+    let mut table = vec![0u32; n + KEYS as usize];
+    table[n..].fill(7);
+    (table[n], table[n + 1], table[n + 2]) = (0, 5, 6);
+    for (at, expected) in [(32, 6), (32 * 9, 10), (32 * 1000, 10)] {
+        super::shader::VIEW_PLACES_HERE.set(Some((KEYS - 1, true)));
+        let shader = build(&program(at), (8, 0)).expect("translates");
+        super::shader::VIEW_PLACES_HERE.set(None);
+        // (The table's handle is made before the picked buffer asks for the strides.)
+        assert!(shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES));
+        for (label, got) in super::waterfall_tests::run_with(&shader, &views, &table) {
+            assert_eq!(got[..2], [0, expected], "{label}: byte {at}");
+        }
+    }
+    // Without it nothing reads the table, and index 1 is slot 1.
+    super::shader::VIEW_PLACES_HERE.set(Some((KEYS - 1, false)));
+    let shader = build(&program(32), (8, 0)).expect("translates");
+    super::shader::VIEW_PLACES_HERE.set(None);
+    assert!(!shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES));
+    let views = [other(), raw(&title), View::RawUav(2)];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [0, 2], "{label}");
+    }
+}
