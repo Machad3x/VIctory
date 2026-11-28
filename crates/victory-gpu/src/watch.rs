@@ -3559,10 +3559,11 @@ mod tests {
             assert!(!g.protected.contains(at / BLOCK) && !g.clean.contains(at / BLOCK));
         }
         assert!(!published(at, at + BLOCK));
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(view) };
         drop(changing);
         assert!(!guards().left_alone(at / BLOCK));
+        // SAFETY: our view. (Not during the change: another test would take
+        // the address for a view the guards leave alone as changing.)
+        unsafe { UnmapViewOfFile(view) };
     }
 
     /// Memory at an address where blocks were guarded or absent is not
@@ -4006,6 +4007,9 @@ mod tests {
                 })
             };
         }
+        // As the runtime lets go (`xmem.rs`): told before the handle is
+        // closed, or a test that gets the number next loses its own view.
+        crate::title_memory_section_gone(section);
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
     }
@@ -4334,7 +4338,6 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
         assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
         drop_views(section, &[one, two], BLOCK);
-        crate::title_memory_section_gone(section);
     }
 
     /// Stores that fault, and copies, as the title makes them: what is there
@@ -4405,7 +4408,6 @@ mod tests {
         assert!(writable(one));
         crate::titlewrite::ON_IN_TEST.set(false);
         drop_views(section, &[one, two], SIZE);
-        crate::title_memory_section_gone(section);
     }
 
     /// Of a page taken before, what is taken again is the kernel's pages
@@ -4974,8 +4976,12 @@ mod many_askers_tests {
                         {
                             let _changing = super::title_memory_remapping();
                             super::title_memory_unmapping(one, PAGE);
-                            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
                         }
+                        // Let go of once the change is done: an address freed
+                        // during it is another test's next view, which the
+                        // guards would leave alone as still changing. (The
+                        // runtime maps into placeholders of its own.)
+                        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ }) };
                         last = [last[asked]; VIEWS];
                     }
                 });
