@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
+use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -325,12 +326,25 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
+/// Fast-path mirror of `journal().kept`: avoids building/sorting `ask_ahead`
+/// ranges and taking an exclusive `journal_mut()` write lock on every flush
+/// while a submission's one asking (`VICTORY_ASK_ONCE`) stands.
+static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the submission's one asking (`ask_once`) currently stands.
+pub(crate) fn is_kept() -> bool {
+    JOURNAL_KEPT.load(Ordering::Acquire)
+}
+
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if is_kept() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !REFUSED.all(r.0 / BLOCK, r.1.div_ceil(BLOCK)))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -507,6 +521,9 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if is_kept() {
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
@@ -564,15 +581,17 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
     for &(start, end) in ranges {
-        if start >= end || published(start, end) {
+        if start >= end || published(start, end) || REFUSED.all(start / BLOCK, end.div_ceil(BLOCK)) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            ahead.push((first, last));
+        if !ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            let pages = kernel_written(first, last);
+            note_refused(first, last, pages.is_none());
+            if let Some(pages) = pages {
+                written.extend(pages);
+                ahead.push((first, last));
+            }
         }
     }
     note_hot(&written);
@@ -586,17 +605,23 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
-    j.kept = !ahead.is_empty();
+    let kept = !ahead.is_empty();
+    j.kept = kept;
     j.ahead = ahead;
+    JOURNAL_KEPT.store(kept, Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    if !is_kept() {
+        return;
+    }
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        JOURNAL_KEPT.store(false, Ordering::Release);
     }
 }
 
@@ -604,6 +629,9 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if !is_kept() || len == 0 {
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept || len == 0 {
         return;
@@ -642,7 +670,10 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
+    // A block the kernel refused alone would fail the whole call: split first.
+    if !REFUSED.any(first * PAGE / BLOCK, (last * PAGE).div_ceil(BLOCK))
+        && let Some(pages) = kernel_written(first, last)
+    {
         written.extend(pages);
         asked.push((first, last));
         return;
@@ -704,7 +735,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
-    let pages = match if refused { None } else { kernel_written(first, last) } {
+    let pages = if refused { None } else { kernel_written(first, last) };
+    if !refused {
+        note_refused(first, last, pages.is_none());
+    }
+    let pages = match pages {
         Some(pages) => pages,
         None => {
             guards_asked = true;
@@ -750,29 +785,69 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
+/// A held read guard on the write-watch journal, allowing callers to check
+/// many buffers with [`JournalRead::nothing_new_atomic`] without acquiring
+/// `JOURNAL`'s `RwLock` on every single buffer.
+///
+/// Callers MUST drop `JournalRead` before calling any function that acquires
+/// `journal_mut()` (such as [`writes`]).
+pub(crate) struct JournalRead(std::sync::RwLockReadGuard<'static, Journal>);
+
+/// Acquires a shared read guard on the write-watch journal for batched
+/// [`JournalRead::nothing_new_atomic`] checks.
+pub(crate) fn read_journal() -> JournalRead {
+    JournalRead(journal())
+}
+
+impl JournalRead {
+    /// Lock-free check of whether nothing of `[start, end)` was written since
+    /// `copied` (one `AtomicU64` per 64 KiB page from `base` on) was taken.
+    /// Only invokes `ranged_fn` (which may lock `Shadow.ranged`) when a page in
+    /// `[first, last)` is partial (`0`) or older than a recorded write, keeping
+    /// the common whole-page no-op path 100% mutex-free.
+    pub(crate) fn nothing_new_atomic(
+        &self,
+        start: usize,
+        end: usize,
+        base: usize,
+        copied: &[std::sync::atomic::AtomicU64],
+        ranged_fn: impl FnOnce() -> u64,
+    ) -> bool {
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        let known = published(start, end);
+        #[cfg(feature = "diagnostics")]
+        if known {
+            crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        }
+        let j = &*self.0;
+        if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            return false;
+        }
+        let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+            return false;
+        };
+        let all_nonzero = taken.iter().all(|at| at.load(Ordering::Acquire) != 0);
+        if all_nonzero && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].load(Ordering::Acquire)) {
+            return true;
+        }
+        let ranged = ranged_fn();
+        (ranged != 0 || all_nonzero)
+            && j.written
+                .range(first..last)
+                .all(|(&page, &write)| write <= taken[page - first].load(Ordering::Acquire).max(ranged))
+    }
+}
+
 /// Whether nothing of `[start, end)` was written that a copy with the notes
 /// `copied` (the asking after which each page from page `base` on was taken)
 /// and `ranged` (the asking after which a range that holds this one was
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
+#[cfg(test)]
 pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
-    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
-    }
-    let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return false;
-    }
-    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
-        return false;
-    };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+    let atomic: Vec<std::sync::atomic::AtomicU64> = copied.iter().map(|&v| std::sync::atomic::AtomicU64::new(v)).collect();
+    read_journal().nothing_new_atomic(start, end, base, &atomic, || ranged)
 }
 
 impl Tracked {
@@ -1000,6 +1075,23 @@ static PUBLISHED: Bits = Bits::new();
 /// lock ([`writing`]): some 700 pieces a frame are landed in memory that is
 /// no view.
 static PROTECTED: Bits = Bits::new();
+
+/// The blocks of a range the kernel refused to answer for when asked alone
+/// (memory that is not write-watched, as views are): [`ask_ahead`] and
+/// [`ask_rest`] leave them to [`writes`], which still asks, and guards what
+/// is refused. A mark is a hint, never trusted for an answer: cleared when
+/// `writes` finds the memory watched, or the memory is freed or remapped.
+static REFUSED: Bits = Bits::new();
+
+/// The kernel did or did not answer for the pages `[first, last)` asked alone.
+fn note_refused(first: usize, last: usize, failed: bool) {
+    let (from, to) = (first * PAGE / BLOCK, (last * PAGE).div_ceil(BLOCK));
+    if failed {
+        (from..to).for_each(|block| REFUSED.set(block));
+    } else if REFUSED.any(from, to) {
+        REFUSED.clear_all(from, to);
+    }
+}
 
 /// The blocks the title's bytes were put in beside their guards
 /// ([`put_beside`]) and that no asking has told as written since. Such a
@@ -1378,6 +1470,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    REFUSED.clear_all(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     if len == 0 || !known_holes() {
         return;
     }
@@ -2860,6 +2953,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
+    // (With no length, to the allocation's end, asked only if its first block
+    // is marked: a mark left is cleared by the next `writes` that finds it watched.)
+    if len != 0 || REFUSED.any(at / BLOCK, at / BLOCK + 1) {
+        let to = if len != 0 { at.saturating_add(len) } else { allocation_end(at, at) };
+        REFUSED.clear_all(at / BLOCK, to.div_ceil(BLOCK));
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2926,6 +3025,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     // asking anyway. (A bit left would keep a hole mapped there from being
     // known by its bits.)
     BESIDE.clear_all(range.start, range.end);
+    REFUSED.clear_all(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
         g.absent.remove(block);
@@ -3327,6 +3427,33 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Memory the kernel refuses is marked, still answered by `writes`, and
+    /// the mark goes when the memory is freed or found watched.
+    #[test]
+    fn refused_blocks_are_marked_until_freed_or_watched() {
+        // SAFETY: fresh allocations, freed at the end.
+        let alloc = |watch| unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE) } as usize;
+        let plain = alloc(0);
+        assert_ne!(plain, 0);
+        let blocks = (plain / BLOCK, plain / BLOCK + 2);
+        assert!(writes(plain, plain + 2 * BLOCK, false).is_none());
+        assert!(REFUSED.all(blocks.0, blocks.1));
+        // Still refused: `writes` asks anyway and answers the same.
+        assert!(writes(plain, plain + 2 * BLOCK, false).is_none());
+        title_memory_freed(plain, 0);
+        assert!(!REFUSED.any(blocks.0, blocks.1));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
+        let watched = alloc(MEM_WRITE_WATCH);
+        assert_ne!(watched, 0);
+        let blocks = (watched / BLOCK, watched / BLOCK + 2);
+        (blocks.0..blocks.1).for_each(|b| REFUSED.set(b));
+        assert!(writes(watched, watched + 2 * BLOCK, false).is_some());
+        assert!(!REFUSED.any(blocks.0, blocks.1));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
