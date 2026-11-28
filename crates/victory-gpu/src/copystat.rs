@@ -404,6 +404,7 @@ fn big_blocks() -> String {
 
 /// The system's allocator with every block counted in [`OWN`] (two atomic
 /// additions per allocation and per release: diagnostics builds only).
+#[allow(dead_code)]
 struct Counting;
 
 // SAFETY: every call goes to the system's allocator unchanged; only
@@ -449,6 +450,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     }
 }
 
+// Only in diagnostics builds, as the doc above states: every allocation and
+// release in the process otherwise pays for the counters.
+#[cfg(feature = "diagnostics")]
 #[global_allocator]
 static HEAP: Counting = Counting;
 
@@ -489,6 +493,8 @@ mod own_tests {
     }
 
     /// A block of 32 MiB or more is listed by its size while it lives.
+    // The counting allocator is registered in diagnostics builds only.
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn big_blocks_are_listed_while_they_live() {
         let size = (48usize << 20) + 4096;
@@ -509,6 +515,8 @@ mod own_tests {
     /// A big block shows in the counters while it lives (other tests
     /// allocate small blocks meanwhile: only the big class is looked at,
     /// and only for at least this block).
+    // The counting allocator is registered in diagnostics builds only.
+    #[cfg(feature = "diagnostics")]
     #[test]
     fn a_block_is_counted_while_it_lives() {
         let block = vec![1u8; 8 << 20];
