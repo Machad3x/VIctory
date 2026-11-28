@@ -44,7 +44,9 @@ $env:VICTORY_GAME_DIR = $Game
 # Work on this base is done with the title's ray tracing on; -More @{VICTORY_BVH_BUILDER=''} turns it off.
 if (-not $More.ContainsKey('VICTORY_BVH_BUILDER')) { $env:VICTORY_BVH_BUILDER = '1' }
 elseif (-not $More['VICTORY_BVH_BUILDER']) { Remove-Item Env:VICTORY_BVH_BUILDER -ErrorAction SilentlyContinue }
-$env:VICTORY_KEYS = (0..10 | ForEach-Object { '{0}:Enter' -f (15 + $_ * 0.5).ToString([cultureinfo]::InvariantCulture) }) -join ','
+# No pipeline is left out in our runs (the launcher leaves two out); -More @{VICTORY_LEAVE_OUT='...'} only by hand.
+if (-not $More.ContainsKey('VICTORY_LEAVE_OUT')) { Remove-Item Env:VICTORY_LEAVE_OUT -ErrorAction SilentlyContinue }
+$env:VICTORY_KEYS =(0..10 | ForEach-Object { '{0}:Enter' -f (15 + $_ * 0.5).ToString([cultureinfo]::InvariantCulture) }) -join ','
 if ($Loop -gt 0) { $env:VICTORY_SHADER_LOOP_LIMIT = "$Loop" }
 if ($Dred) { $env:VICTORY_D3D12_DRED = '1'; $env:VICTORY_GPU_TIMING = '1' }
 # GPU time per pipeline in the log (each list submitted on its own: slower).
@@ -102,7 +104,11 @@ $cut = { param($s, $n) $s.Substring(0, [Math]::Min($n, $s.Length)) }
 $t | Select-String '^VIctory: ' | Select-Object -First 1 | ForEach-Object { & $cut $_.Line 600 }
 ($t | Select-String 'frame=(\d+)' | Select-Object -Last 1).Matches.Value
 $t | Select-String ' fps, ' | Select-Object -Last 2 | ForEach-Object { & $cut ($_.Line -replace '^.*victory_gpu::host: ') 300 }
-'slow submissions > 1 s: ' + @($t | Select-String 'slow host submission ms=\d{4,}').Count
+'refused or left out: ' + (@($t | Select-String 'left out|refus|stays off|does not translate|E_NOTIMPL|without a host pipeline \(' |
+    Where-Object { $_.Line -notmatch 'dropped 0 without a host pipeline \(0 being made\) and 0 indirect' }).Count) + ' lines'
+$t | Select-String 'left out|refus|stays off|does not translate|E_NOTIMPL' | ForEach-Object { ($_.Line -replace '^.*?(WARN|INFO|ERROR)\s+', '') -replace '\s+\S+=.*$', '' } |
+    Group-Object | Sort-Object Count -Descending | Select-Object -First 8 | ForEach-Object { '  {0} {1}' -f $_.Count, (& $cut $_.Name 160) }
+'slow submissions > 1 s: ' +@($t | Select-String 'slow host submission ms=\d{4,}').Count
 'untranslated, by reason:'
 $t | Select-String 'does not translate.*error=(.*?) cached' |
     ForEach-Object { $_.Matches[0].Groups[1].Value -replace '^.*GFX10 code at 0x[0-9a-f]+: ' } |
