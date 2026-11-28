@@ -1085,17 +1085,12 @@ static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// block another thread is opening waits for that one (100 microseconds at
 /// most), and one with every view of its page to open
 /// (`VICTORY_OPEN_ONE_VIEW=0`) goes the locked way.
-fn unlocked_from_env(val: Option<&std::ffi::OsStr>) -> bool {
-    val.is_none_or(|v| v != "0")
-}
-
 fn unlocked() -> bool {
     #[cfg(test)]
     if UNLOCKED_IN_TEST.get() {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| unlocked_from_env(std::env::var_os("VICTORY_FAULT_UNLOCKED").as_deref()))
+    crate::toggled!("VICTORY_FAULT_UNLOCKED")
 }
 
 #[cfg(test)]
@@ -2019,9 +2014,15 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
         }
     }
-    let soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
+    // The runtime's books are read outside the lock; a view made real
+    // before the lock was taken ([`title_memory_made_real`]) reads them anew.
+    let books = SOFT_MADE_REAL.load(std::sync::atomic::Ordering::Acquire);
+    let mut soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
     let rest = rest();
     let mut g = guards_timed();
+    if SOFT_MADE_REAL.load(std::sync::atomic::Ordering::Acquire) != books {
+        soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
+    }
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     for &(block, view) in &came {
@@ -3050,8 +3051,13 @@ pub fn title_memory_made_real(at: usize, len: usize) {
         return;
     }
     let mut g = guards();
+    SOFT_MADE_REAL.fetch_add(1, std::sync::atomic::Ordering::Release);
     open(&mut g, at, at.saturating_add(len));
 }
+
+/// Views made real ([`title_memory_made_real`]), counted under the guards'
+/// lock: [`guard`] reads the runtime's books before taking it.
+static SOFT_MADE_REAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
@@ -5286,14 +5292,5 @@ mod many_askers_tests {
         BITS.clear_all(0, usize::MAX);
         assert!(!BITS.any(0, 1 << 31));
         assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
-    }
-
-    #[test]
-    fn unlocked_defaults_on_unless_zero() {
-        use std::ffi::OsStr;
-        assert!(super::unlocked_from_env(None));
-        assert!(super::unlocked_from_env(Some(OsStr::new(""))));
-        assert!(super::unlocked_from_env(Some(OsStr::new("1"))));
-        assert!(!super::unlocked_from_env(Some(OsStr::new("0"))));
     }
 }
