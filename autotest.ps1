@@ -1,11 +1,11 @@
 ﻿# Automated game test with the repository's NVIDIA profile (scripts\play-foxhound.ps1 switches), diag build:
 # launch, press Enter from 15 s to 20 s, watch, stop, summarize.
-# Usage (from the worktree): .\autotest.ps1 -Name tn1a [-Seconds 300] [-ShotEvery 150] [-Warm] [-SeriesS]
+# Usage (from the worktree): .\autotest.ps1 -Name tn1a [-Seconds 240] [-ShotEvery 120] [-Warm] [-SeriesS]
 #   [-More @{VICTORY_X='1'}] [-Skip hash,hash] [-Dred] [-Timing] [-Loop n]
 param(
     [Parameter(Mandatory)][string]$Name,
-    [int]$Seconds = 300,
-    [int]$ShotEvery = 150,
+    [int]$Seconds = 240,
+    [int]$ShotEvery = 120,
     # `victory preload` (every shader, then the pipelines written down by earlier runs) before the game.
     [switch]$Warm,
     [switch]$SeriesS,
@@ -93,7 +93,9 @@ while (-not $p.HasExited -and ((Get-Date) - $start).TotalSeconds -lt $Seconds) {
 $alive = -not $p.HasExited
 $ran = [int]((Get-Date) - $start).TotalSeconds
 if ($alive) {
-    Save-Shot $p (Join-Path $out 'shot-end.png')
+    # The last timed shot when the loop ended just before it (no separate end shot).
+    $last = Join-Path $out ('shot-{0:000}.png' -f $Seconds)
+    if (-not (Test-Path $last)) { Save-Shot $p $last }
     # Ask to close first so an in-progress pipeline-library save can finish; kill after 30 s.
     if (-not ($p.CloseMainWindow() -and $p.WaitForExit(30000))) { Stop-Process -Id $p.Id -Force -Confirm:$false }
 }
