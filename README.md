@@ -1,4 +1,53 @@
-# VIctory on NVIDIA
+# VIctory NVIDIA RTX
+
+## This fork
+
+[Machad3x/VIctory-nvidia-RTX](https://github.com/Machad3x/VIctory-nvidia-RTX)
+is a fork of
+[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA),
+which builds on [Marvisak/VIctory](https://github.com/Marvisak/VIctory), the
+original project. It is aimed at NVIDIA RTX cards and tested on an RTX 3080 Ti
+(Ryzen 7 5700X), always with the title's ray tracing on
+(`VICTORY_BVH_BUILDER=1`) and with no shader or pipeline left out.
+
+- Work lands in numbered batches: pull requests from the base, ports from other
+  forks and this fork's own fixes, merged together and checked in one run each.
+  The batches, their runs, the current numbers and the switches this fork adds
+  are in [docs/fork-machad3x.md](docs/fork-machad3x.md).
+- Bugs found here that also affect the base are filed there.
+- Everything below this section is the base's README, kept as it is. Its
+  release links (`victory.exe`) are the base's builds, not this fork's; this
+  fork has no releases, so build it yourself.
+
+**Build and run** (same tools as the base, under *Building it yourself
+instead*):
+
+```powershell
+git clone https://github.com/Machad3x/VIctory-nvidia-RTX
+cd VIctory-nvidia-RTX
+.\Get-NVIDIA-DLSS.cmd
+powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe' -More @{VICTORY_BVH_BUILDER='1'}
+```
+
+`-More @{VICTORY_BVH_BUILDER='1'}` turns the title's ray tracing on, as every
+run here has it; the launcher leaves it off by default.
+
+**Test runs** use `autotest.ps1`, on the diagnostics build, which it does not
+build itself:
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
+.\autotest.ps1 -Name t8a       # 240 s, a shot every 120 s, ray tracing on, nothing left out
+```
+
+It starts the title with the launcher's switches (Series X, 2560x1440, DLSS
+Quality, frame generation off), presses Enter to get past the start, stops it
+and sums up the run in `target\autotest\<name>`.
+
+---
+
+# VIctory on NVIDIA (the base)
 
 > **Reporting a problem?** Please attach **both** logs from the run that went
 > wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address
@@ -355,6 +404,23 @@ delete that file to go back to them. Full screen: start the game, then run
   repository.
 
 ## Credits
+
+### Machad3x/VIctory-nvidia-RTX
+
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and
+  its contributors: the original project.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**
+  by trustno1-coder and its contributors: the base of this fork. Its pull
+  requests merged here and their authors: #497 and #498 (tiadiff), #501
+  (ballsimulation), #516 and #532 (henriazz10), #521 (Wiktorxd-1), #544
+  (fromrivertothesea), #547 and #552 (Glory-star), #548 (vilanx), #646 and
+  #656 (kibagami-nc).
+- Fixes from Marvisak/VIctory pull requests, ported through the base:
+  Marvisak/VIctory#2449 by makmatvey (#646) and Marvisak/VIctory#2031 by
+  0xkn0wh3r3 (#656).
+- Everything the base credits below came in with it.
+
+### The base's own credits
 
 A tree of other people's work with a little on top; the history is kept.
 
