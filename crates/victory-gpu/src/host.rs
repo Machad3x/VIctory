@@ -6243,12 +6243,26 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             batch.copy_spans(runs);
-            let Batch { spans, ranges, .. } = &mut batch;
+            let Batch { spans, ranges, reads, read, .. } = &mut batch;
             ranges.clear();
-            ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+            // With `VICTORY_ASK_READ_ONLY` only the pages the lists read, as
+            // [`Batch::narrow`] cuts the refreshes.
+            let only_read = *read && crate::watch::read_only();
+            let (mut asked, mut unread) = (0, 0);
+            for (shadow, from, to) in spans.iter().filter(|s| s.0.asked_ahead()) {
+                let (a, u) = match reads.get(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+                    Some(r) if only_read && !r.is_empty() => ask_read(r, *from, *to, ranges),
+                    _ => ask_read(&[(*from, *to)], *from, *to, ranges),
+                };
+                (asked, unread) = (asked + a, unread + u);
+            }
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
+            let asking = std::time::Instant::now();
             crate::watch::ask_once(&batch.ranges);
+            for (i, n) in [1, asked, unread, asking.elapsed().as_nanos() as usize].into_iter().enumerate() {
+                ASK_READ[i].fetch_add(n as u64, Ordering::Relaxed);
+            }
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
             // Behind flights: the title wrote memory that a flight's shaders
@@ -8493,6 +8507,7 @@ impl Split {
 fn submit_split_line(frames: f64) {
     let ms: [f64; 16] = std::array::from_fn(|i| SPLIT[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
     let f: [f64; 4] = std::array::from_fn(|i| FLUSHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    let [asked, done, unread] = std::array::from_fn(|i| ONCE[i].swap(0, Ordering::Relaxed) as f64 / frames);
     let after = AFTER_SEND.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
     let all: f64 = [0, 1, 2, 3, 4, 5, 11, 12, 13, 14, 15].iter().map(|&i| ms[i]).sum();
     if all + after <= 0.0 {
@@ -8502,7 +8517,9 @@ fn submit_split_line(frames: f64) {
         "preparing per frame, the submitting thread: {all:.1} ms in its submissions: {:.1} asking the write watch ({:.1} of them \
          finding what to ask), {:.1} putting the title's bytes under flights' writes, {:.1} in the lists' steps (refreshes {:.1} \
          in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on several threads, {:.1} one at a time in {:.0} \
-         before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies \
+         before shader writes; copies and fills {:.1}, the refreshes before copies among them; ranges {asked:.0} asked, {:.0} \
+         skipped as unchanged since their last refresh, {done:.0} done, {:.1} MB left out as unread (VICTORY_REFRESH_ONCE is {})), \
+         {:.1} snapshots, {:.1} for copies \
          in the card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the \
          submission lock, {:.1} planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is \
          swept; at the end {:.1} waiting for the heaps' records; after the sending {after:.1} (the flight noted, landed lists \
@@ -8519,6 +8536,9 @@ fn submit_split_line(frames: f64) {
         ms[9],
         ms[10] * 1e6,
         ms[7],
+        (asked - done).max(0.0),
+        unread / 1e6,
+        if refresh_once() { "on" } else { "off" },
         ms[3],
         ms[4],
         ms[5],
@@ -8545,6 +8565,7 @@ fn split_line(frames: f64) {
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
+    let r: [f64; 4] = std::array::from_fn(|i| ASK_READ[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if e[0] > 0.0 {
         tracing::info!(
             "asked early by a thread of its own per frame: {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
@@ -8557,7 +8578,7 @@ fn split_line(frames: f64) {
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
-         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
+         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED); the submissions' own: {:.1} askings of {:.0}          pages of 64 KiB, {:.0} left out as unread, {:.1} ms (VICTORY_ASK_READ_ONLY is {})",
         a[0],
         a[1] / 1024.0,
         a[11] / 1e6,
@@ -8575,6 +8596,11 @@ fn split_line(frames: f64) {
         s[1] / 1048576.0,
         s[2] / 1048576.0,
         s[3],
+        r[0],
+        r[1],
+        r[2],
+        r[3] / 1e6,
+        if crate::watch::read_only() && refresh_once() { "on" } else { "off" },
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
@@ -8673,6 +8699,11 @@ struct Batch {
     /// [`Batch::refresh_front`]'s walk over the steps.
     ranges: Vec<(usize, usize)>,
     touches: Vec<Touch>,
+    /// Per copy (by address), what the submission's steps read of it or give
+    /// to shaders, by whole pages, in order and apart ([`Batch::copy_spans`]),
+    /// and whether it is known ([`Batch::narrow`]).
+    reads: ByCopy<Vec<(usize, usize)>>,
+    read: bool,
 }
 
 thread_local! {
@@ -8711,6 +8742,120 @@ fn ahead_of_writes() -> bool {
 fn refresh_front() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
+}
+
+/// Whether a submission refreshes of each copy only the pages its steps read
+/// or give to shaders (`VICTORY_REFRESH_ONCE=0`: the span of all its ranges of
+/// the copy, as before).
+///
+/// A 174 MB copy was refreshed by 11.6 to 14.4 submissions a frame, each
+/// asking about all of it (the span of its many ranges) and copying the
+/// blocks the title wrote since, read by that submission or not. Now a page
+/// is copied again only when the title wrote it since its last refresh (the
+/// write watch or the guards say so) and a list of the submission reads it;
+/// a page nobody reads keeps its older bytes, still known stale, until a
+/// submission that reads it comes.
+fn refresh_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line ([`refresh_once`]'s numbers): ranges asked
+/// to be refreshed (after [`Batch::narrow`]), those refreshed (the others
+/// were known to copy nothing), and the bytes left out as nobody read them.
+static ONCE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `[from, to)` widened to whole pages: what is refreshed of a page in part
+/// is not noted as taken, and would be copied again at every refresh.
+fn page_range(from: usize, to: usize) -> (usize, usize) {
+    use crate::watch::PAGE;
+    (from / PAGE * PAGE, to.div_ceil(PAGE) * PAGE)
+}
+
+/// Of `[from, to)`, the parts `reads` (in order, apart) hold.
+fn read_runs(reads: &[(usize, usize)], from: usize, to: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let first = reads.partition_point(|r| r.1 <= from);
+    reads[first..].iter().take_while(move |r| r.0 < to).map(move |r| (r.0.max(from), r.1.min(to)))
+}
+
+/// Since the last frame line: the submissions' one askings
+/// ([`crate::watch::ask_once`]), the 64 KiB pages they asked about, those
+/// left out as no list of the submission reads them
+/// ([`crate::watch::read_only`]), and their nanoseconds.
+static ASK_READ: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Pushes to `out` what a submission asks the write watch about of a copy's
+/// span `[from, to)`: the parts `reads` holds ([`read_runs`]). The pages
+/// asked, and those of the span left out.
+fn ask_read(reads: &[(usize, usize)], from: usize, to: usize, out: &mut Vec<(usize, usize)>) -> (usize, usize) {
+    let pages = |a: usize, b: usize| if a < b { (page_range(a, b).1 - page_range(a, b).0) / crate::watch::PAGE } else { 0 };
+    let at = out.len();
+    out.extend(read_runs(reads, from, to));
+    let asked: usize = out[at..].iter().map(|r| pages(r.0, r.1)).sum();
+    (asked, pages(from, to).saturating_sub(asked))
+}
+
+#[cfg(test)]
+mod refresh_once_tests {
+    use super::{ask_read, join_ranges, page_range, read_runs};
+    use crate::watch::PAGE;
+
+    /// What a submission refreshes of a copy's `[from, to)`: the parts its
+    /// steps read, less those known unchanged since their last refresh.
+    fn due(raw: &[(usize, usize)], from: usize, to: usize, unchanged: impl Fn(usize, usize) -> bool) -> Vec<(usize, usize)> {
+        let mut reads = Vec::new();
+        join_ranges(&mut reads, raw.iter().map(|&(a, b)| page_range(a, b)));
+        read_runs(&reads, from, to).filter(|&(a, b)| !unchanged(a, b)).collect()
+    }
+
+    #[test]
+    fn reads_are_whole_pages_joined_where_they_touch() {
+        let mut reads = Vec::new();
+        join_ranges(&mut reads, [(10, 20), (PAGE + 5, PAGE + 6), (5 * PAGE + 1, 5 * PAGE + 2)].map(|(a, b)| page_range(a, b)));
+        assert_eq!(reads, [(0, 2 * PAGE), (5 * PAGE, 6 * PAGE)]);
+        assert_eq!(read_runs(&reads, PAGE, 10 * PAGE).collect::<Vec<_>>(), [(PAGE, 2 * PAGE), (5 * PAGE, 6 * PAGE)]);
+        assert_eq!(read_runs(&reads, 2 * PAGE, 5 * PAGE).count(), 0);
+    }
+
+    #[test]
+    fn unchanged_is_skipped() {
+        let raw = [(0, PAGE), (4 * PAGE, 5 * PAGE)];
+        assert!(due(&raw, 0, 10 * PAGE, |_, _| true).is_empty());
+    }
+
+    #[test]
+    fn written_since_and_read_is_refreshed_written_but_unread_is_not() {
+        // The title wrote pages 2 and 4 since their last refresh; only 4 is read.
+        let written = [2 * PAGE, 4 * PAGE];
+        let unchanged = |a: usize, b: usize| !written.iter().any(|&p| a <= p && p < b);
+        let raw = [(0, PAGE), (4 * PAGE + 8, 4 * PAGE + 16)];
+        assert_eq!(due(&raw, 0, 10 * PAGE, unchanged), [(4 * PAGE, 5 * PAGE)]);
+        // Read whole, as before the switch: both.
+        assert_eq!(due(&[(0, 10 * PAGE)], 0, 10 * PAGE, unchanged), [(0, 10 * PAGE)]);
+    }
+
+    #[test]
+    fn asking_covers_every_read_page_of_the_span_and_nothing_else() {
+        // A 10-page span; the lists read a byte of page 1 and pages 3 to 4,
+        // and page 12, beyond the span.
+        let mut reads = Vec::new();
+        join_ranges(&mut reads, [(PAGE + 7, PAGE + 8), (3 * PAGE, 5 * PAGE), (12 * PAGE, 13 * PAGE)].map(|(a, b)| page_range(a, b)));
+        let (from, to) = (100, 10 * PAGE - 100);
+        let mut asked = Vec::new();
+        assert_eq!(ask_read(&reads, from, to, &mut asked), (3, 7));
+        assert_eq!(asked, [(PAGE, 2 * PAGE), (3 * PAGE, 5 * PAGE)]);
+        // Every refresh the submission does of the span (cut the same way)
+        // lies inside one range asked: `writes` answers it from the asking.
+        for (a, b) in read_runs(&reads, from, to) {
+            assert!(asked.iter().any(|r| r.0 <= a && b <= r.1));
+        }
+        // Reads not known (or the switch off): the span whole.
+        let mut whole = Vec::new();
+        assert_eq!(ask_read(&[(from, to)], from, to, &mut whole), (10, 0));
+        assert_eq!(whole, [(from, to)]);
+        // Nothing read of it: nothing asked.
+        assert_eq!(ask_read(&reads, 6 * PAGE, 9 * PAGE, &mut Vec::new()), (0, 3));
+    }
 }
 
 /// Per copy what is refreshed in front of a submission's steps, as
@@ -8921,6 +9066,7 @@ impl Batch {
         self.spans_at.clear();
         self.ranges.clear();
         self.touches.clear();
+        self.read = false;
         SPARE_BATCH.set(Some(self));
     }
 
@@ -8933,13 +9079,29 @@ impl Batch {
     fn copy_spans(&mut self, runs: &[&HostList]) {
         self.spans.clear();
         self.spans_at.clear();
+        let once = refresh_once();
+        // (Room kept for the copies the last submission read; an empty list
+        // is no list: [`Batch::narrow`] leaves such a copy's range whole.)
+        self.reads.retain(|_, reads| {
+            let kept = !reads.is_empty();
+            reads.clear();
+            kept
+        });
+        self.read = once;
         // (Most come several times on end.)
         let mut last = (0, 0);
         for list in runs {
             for step in &list.deferred().copies {
-                let Step::Refresh(shadow, address, len) = step else {
+                let (Step::Refresh(shadow, address, len) | Step::GpuWrite(shadow, address, len)) = step else {
                     continue;
                 };
+                if once {
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    self.reads.entry(key).or_default().push(page_range(*address, *address + *len));
+                }
+                if matches!(step, Step::GpuWrite(..)) {
+                    continue;
+                }
                 let (from, to) = (*address, *address + *len);
                 let key = std::sync::Arc::as_ptr(shadow) as usize;
                 let at = if last.0 == key && key != 0 {
@@ -8959,6 +9121,39 @@ impl Batch {
                 (span.1, span.2) = (span.1.min(from), span.2.max(to));
             }
         }
+        for reads in self.reads.values_mut() {
+            join_ranges(reads, []);
+        }
+    }
+
+    /// With [`refresh_once`]: of each `(copy, from, to)`, the parts the
+    /// submission's steps read or give to shaders ([`read_runs`]); the
+    /// rest is left as it is, the title's writes there seen when a later
+    /// submission reads them. A copy whose reads are not known stays whole.
+    fn narrow(
+        &self,
+        list: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        let out = if !self.read {
+            list
+        } else {
+            let mut out = Vec::with_capacity(list.len());
+            let mut unread = 0;
+            for (shadow, from, to) in list {
+                match self.reads.get(&(std::sync::Arc::as_ptr(&shadow) as usize)) {
+                    Some(reads) if !reads.is_empty() => {
+                        let at = out.len();
+                        out.extend(read_runs(reads, from, to).map(|(a, b)| (shadow.clone(), a, b)));
+                        unread += (to - from) - out[at..].iter().map(|r| r.2 - r.1).sum::<usize>();
+                    }
+                    _ => out.push((shadow, from, to)),
+                }
+            }
+            ONCE[2].fetch_add(unread as u64, Ordering::Relaxed);
+            out
+        };
+        ONCE[0].fetch_add(out.len() as u64, Ordering::Relaxed);
+        out
     }
 
     /// [`stale_under_flights`] of the submission's refreshes, from
@@ -9003,8 +9198,10 @@ impl Batch {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
-            Self::update(&shadow, from, to);
+        for (shadow, from, to) in self.narrow(vec![(shadow, from, to)]) {
+            if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+                Self::update(&shadow, from, to);
+            }
         }
         let ns = started.elapsed().as_nanos() as u64;
         SPLIT[6].fetch_add(ns, Ordering::Relaxed);
@@ -9016,6 +9213,7 @@ impl Batch {
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
+        ONCE[1].fetch_add(1, Ordering::Relaxed);
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -9084,7 +9282,9 @@ impl Batch {
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
         const FEW: usize = 256;
-        let mut spans = spans;
+        // (The ahead spans above stay whole: every refresh inside one is
+        // among the reads, so refreshed here.)
+        let mut spans = self.narrow(spans);
         let many = spans.len() > FEW;
         if !many {
             let all = spans.len();
@@ -9181,6 +9381,7 @@ impl Batch {
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        let due = self.narrow(due);
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
         crate::shadow::wide_chunks(due.len(), 32, move |range| {
@@ -9266,6 +9467,8 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
+        let refreshes = std::mem::take(&mut self.refreshes);
+        self.refreshes = self.narrow(refreshes);
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views
