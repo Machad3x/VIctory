@@ -15,7 +15,7 @@
 //! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::lower::intersect::TEST_MEMORY;
+use super::lower::intersect::{TEST_MEMORY, TEST_PAGE_GAP};
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
 use crate::native::{
@@ -687,6 +687,82 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
         assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
         assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
     }
+}
+
+/// A 128-byte node at page byte 0xFFC0: its second half is the next 64 KiB
+/// page's first bytes and is read through that page's own look. The
+/// stand-in puts switched-off boxes between the pages, so a read that stays
+/// in the first page misses the last two boxes.
+#[test]
+fn a_box_node_at_page_byte_0xffc0_reads_its_second_half_from_the_next_page() {
+    const GAP: u32 = 256;
+    let node = 0x12_3457_FFC0u64;
+    // The records, then the node 4096 bytes on.
+    let base = node - 4096;
+    let unit = [-1.0f32, -1.0, -1.0, 1.0, 1.0, 1.0];
+    let lined: [[f32; 6]; 4] = std::array::from_fn(|n| {
+        let by = [[30.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 5.0, 0.0], [20.0, 0.0, 0.0]][n];
+        std::array::from_fn(|k| unit[k] + by[k % 3])
+    });
+    let words = nodes::box32([0x105, 0x20c, 0x304, 0x400], lined);
+    let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 1000.0);
+    let want = bvh::intersect(&words, 5, &ray, true);
+    assert!(want.contains(&0x400), "box 3, in the second half, is hit");
+    let mut data = vec![0u32; 4096 / 4];
+    let pointer = (node >> 3) | 5;
+    let r = &mut data[..13];
+    (r[0], r[1]) = (pointer as u32, (pointer >> 32) as u32);
+    r[2] = ray.extent.to_bits();
+    for a in 0..3 {
+        r[3 + a] = ray.origin[a].to_bits();
+        r[6 + a] = ray.direction[a].to_bits();
+        r[9 + a] = ray.inverse[a].to_bits();
+    }
+    r[12] = 1;
+    data.extend(&words[..16]);
+    data.extend(std::iter::repeat(f32::NAN.to_bits()).take((GAP / 4) as usize));
+    data.extend(&words[16..]);
+    let _memory = Memory::at(base);
+    TEST_PAGE_GAP.set(GAP);
+    let built = build(true, WHOLE);
+    TEST_PAGE_GAP.set(0);
+    let (shader, _) = built.expect("the program lowers");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(&out[0][..4], want, "{label}");
+        // The other threads' records are zeros: masked out.
+        assert_eq!(&out[0][4..8], BEFORE, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
 }
 
 #[test]
