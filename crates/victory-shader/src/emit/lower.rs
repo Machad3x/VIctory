@@ -2228,7 +2228,7 @@ impl<'a> Lower<'a> {
             if let Some(bias) = self.root_bias(a.param) {
                 off = self.s.m.bin(c, Bin::Add, off, bias);
             }
-            match self.root_memory(&src, off, guard, false, true, None) {
+            match self.root_memory(&src, off, guard, false, None) {
                 Some((h, byte)) => {
                     off = byte;
                     Some(h)
@@ -3595,8 +3595,8 @@ impl<'a> Lower<'a> {
     }
 
     /// For an access through such a root view: the raw view of the host copy
-    /// and the byte in it of the view's byte `off` (with `signed`, an offset
-    /// below the address stays below it; a buffer's offset is unsigned).
+    /// and the byte in it of the view's byte `off` (signed: an offset below
+    /// the address stays below it).
     /// Lanes where `inside` is false touch nothing: their loads read zeros
     /// and their stores are dropped, as the console's range check does.
     /// [`Lower::handle`] gives the same view for the rest of the instruction.
@@ -3609,7 +3609,6 @@ impl<'a> Lower<'a> {
         off: V,
         guard: Option<V>,
         store: bool,
-        signed: bool,
         inside: Option<V>,
     ) -> Option<(V, V)> {
         let (lo, hi) = self.root_address(src)?;
@@ -3618,12 +3617,10 @@ impl<'a> Lower<'a> {
         let sum = self.s.m.bin(c, Bin::Add, lo, off);
         let wrapped = self.s.m.cmp(c, pred::IULT, sum, lo);
         let carry = self.s.m.cast(c, Cast::ZExt, wrapped, i32t);
-        let mut hi = self.s.m.bin(c, Bin::Add, hi, carry);
-        if signed {
-            let k31 = self.s.m.i32(31);
-            let sign = self.s.m.bin(c, Bin::AShr, off, k31);
-            hi = self.s.m.bin(c, Bin::Add, hi, sign);
-        }
+        let k31 = self.s.m.i32(31);
+        let sign = self.s.m.bin(c, Bin::AShr, off, k31);
+        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        let mut hi = self.s.m.bin(c, Bin::Add, hi, sign);
         let mut sum = sum;
         let mut guard = guard;
         if let Some(inside) = inside {
@@ -7083,7 +7080,7 @@ impl<'a> Lower<'a> {
                 && matches!(soffset, Operand::Scalar { code: NULL, .. })
                 && super::builder_bounds();
             let mut root = false;
-            let h = match self.root_memory(src, addr, None, false, false, None) {
+            let h = match self.root_memory(src, addr, None, false, None) {
                 Some((h, byte)) => {
                     addr = byte;
                     root = true;
@@ -12670,7 +12667,7 @@ impl<'a> Lower<'a> {
                 _ => None,
             };
             let written = store || atomic.is_some();
-            if let Some((_, byte)) = self.root_memory(src, off, guard, written, false, inside) {
+            if let Some((_, byte)) = self.root_memory(src, off, guard, written, inside) {
                 off = byte;
             }
         }
