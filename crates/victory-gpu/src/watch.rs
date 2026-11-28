@@ -330,7 +330,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
         // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !REFUSED.all(r.0 / BLOCK, r.1.div_ceil(BLOCK)))
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -564,15 +564,17 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     // here, once; what is not write-watched stays with `writes`.
     let mut written = Vec::new();
     for &(start, end) in ranges {
-        if start >= end || published(start, end) {
+        if start >= end || published(start, end) || REFUSED.all(start / BLOCK, end.div_ceil(BLOCK)) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
-        {
-            written.extend(pages);
-            ahead.push((first, last));
+        if !ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+            let pages = kernel_written(first, last);
+            note_refused(first, last, pages.is_none());
+            if let Some(pages) = pages {
+                written.extend(pages);
+                ahead.push((first, last));
+            }
         }
     }
     note_hot(&written);
@@ -642,7 +644,10 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
+    // A block the kernel refused alone would fail the whole call: split first.
+    if !REFUSED.any(first * PAGE / BLOCK, (last * PAGE).div_ceil(BLOCK))
+        && let Some(pages) = kernel_written(first, last)
+    {
         written.extend(pages);
         asked.push((first, last));
         return;
@@ -704,7 +709,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut guards_asked = false;
     // (View memory read-only by our hand: the kernel would refuse.)
     let refused = guarded && light() && PROTECTED.any(first, last);
-    let pages = match if refused { None } else { kernel_written(first, last) } {
+    let pages = if refused { None } else { kernel_written(first, last) };
+    if !refused {
+        note_refused(first, last, pages.is_none());
+    }
+    let pages = match pages {
         Some(pages) => pages,
         None => {
             guards_asked = true;
@@ -1000,6 +1009,23 @@ static PUBLISHED: Bits = Bits::new();
 /// lock ([`writing`]): some 700 pieces a frame are landed in memory that is
 /// no view.
 static PROTECTED: Bits = Bits::new();
+
+/// The blocks of a range the kernel refused to answer for when asked alone
+/// (memory that is not write-watched, as views are): [`ask_ahead`] and
+/// [`ask_rest`] leave them to [`writes`], which still asks, and guards what
+/// is refused. A mark is a hint, never trusted for an answer: cleared when
+/// `writes` finds the memory watched, or the memory is freed or remapped.
+static REFUSED: Bits = Bits::new();
+
+/// The kernel did or did not answer for the pages `[first, last)` asked alone.
+fn note_refused(first: usize, last: usize, failed: bool) {
+    let (from, to) = (first * PAGE / BLOCK, (last * PAGE).div_ceil(BLOCK));
+    if failed {
+        (from..to).for_each(|block| REFUSED.set(block));
+    } else if REFUSED.any(from, to) {
+        REFUSED.clear_all(from, to);
+    }
+}
 
 /// The blocks the title's bytes were put in beside their guards
 /// ([`put_beside`]) and that no asking has told as written since. Such a
@@ -1378,6 +1404,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    REFUSED.clear_all(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     if len == 0 || !known_holes() {
         return;
     }
@@ -2860,6 +2887,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
     crate::shadow::write_combined_freed(at, len);
+    // (With no length, to the allocation's end, asked only if its first block
+    // is marked: a mark left is cleared by the next `writes` that finds it watched.)
+    if len != 0 || REFUSED.any(at / BLOCK, at / BLOCK + 1) {
+        let to = if len != 0 { at.saturating_add(len) } else { allocation_end(at, at) };
+        REFUSED.clear_all(at / BLOCK, to.div_ceil(BLOCK));
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -2926,6 +2959,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     // asking anyway. (A bit left would keep a hole mapped there from being
     // known by its bits.)
     BESIDE.clear_all(range.start, range.end);
+    REFUSED.clear_all(range.start, range.end);
     let absent: Vec<usize> = g.absent.range(range.clone()).collect();
     for block in absent {
         g.absent.remove(block);
@@ -3327,6 +3361,33 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Memory the kernel refuses is marked, still answered by `writes`, and
+    /// the mark goes when the memory is freed or found watched.
+    #[test]
+    fn refused_blocks_are_marked_until_freed_or_watched() {
+        // SAFETY: fresh allocations, freed at the end.
+        let alloc = |watch| unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE) } as usize;
+        let plain = alloc(0);
+        assert_ne!(plain, 0);
+        let blocks = (plain / BLOCK, plain / BLOCK + 2);
+        assert!(writes(plain, plain + 2 * BLOCK, false).is_none());
+        assert!(REFUSED.all(blocks.0, blocks.1));
+        // Still refused: `writes` asks anyway and answers the same.
+        assert!(writes(plain, plain + 2 * BLOCK, false).is_none());
+        title_memory_freed(plain, 0);
+        assert!(!REFUSED.any(blocks.0, blocks.1));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(plain as *mut _, 0, MEM_RELEASE) };
+        let watched = alloc(MEM_WRITE_WATCH);
+        assert_ne!(watched, 0);
+        let blocks = (watched / BLOCK, watched / BLOCK + 2);
+        (blocks.0..blocks.1).for_each(|b| REFUSED.set(b));
+        assert!(writes(watched, watched + 2 * BLOCK, false).is_some());
+        assert!(!REFUSED.any(blocks.0, blocks.1));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
