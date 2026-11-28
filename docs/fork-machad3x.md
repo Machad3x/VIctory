@@ -42,3 +42,17 @@ Merged from tn1: #552, #548 (its counting-allocator tests now run in diagnostics
 | t3b (batch 3 with #550) | Series X | 153-308 | 76-224 | 62-71 | 12 | 1 | alive 240 s, card time up |
 | t3s (batch 3 with #550) | Series S | 50.4-53.2 | 1-5 | 39-41 | 7-10 | 1 | alive 240 s |
 | t3r (batch 3 without #550) | Series X | 67.3-70.5 | 18-19 | 39-42 | 9-10 | 1 | alive 240 s, picture as t2b |
+
+## Batch 4 (2026-11-27)
+
+The defragmenting compute shader (02384a60fda6f2d0) is no longer left out:
+- a loop shape is accepted only when it is narrower than the host wave or fits it;
+- the second host wave does not poll in meet;
+- the indirect tests follow `VICTORY_INDIRECT_REST`'s default;
+- an old menu settings file that still leaves the shader out is rewritten when read.
+
+| run | profile | ms/frame | GPU ms | prep ms | copy-back ms | dropped draws/frame | result |
+|---|---|---|---|---|---|---|---|
+| t4b (batch 4) | Series X | 71.7-72.7 | 17-18 | 41-45 | 10-11 | 0 | alive 240 s, picture as t3r |
+
+Nothing is dropped or left out any more. The shader now running costs about 3 ms per frame.
