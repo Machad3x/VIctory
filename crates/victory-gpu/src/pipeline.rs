@@ -246,10 +246,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). While one cannot be made the builder
-/// is off; it is looked at again when the title creates another. A stage
+/// has created has a host pipeline. The workers make them from their
+/// creation, ahead of early starts; a builder dispatch waits for them up to
+/// the frame's pipeline budget, and while some are still being made no stage
+/// runs in that frame (a stage "still being made" would be a dropped stage).
+/// Made on the title's thread at the first dispatch, 53 of them held its
+/// frames 26 s and its 30 s watchdog ended it (run tn1b, during loading).
+/// While one cannot be made the builder is off; it is looked at again when the title creates another. A stage
 /// that could not be bound stops the stages after it for the rest of that
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
 /// rest of the run at first.
@@ -325,23 +328,55 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`.
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
+    let pipelines = {
+        let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+        if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
+            return false;
+        }
+        if b.whole {
+            return true;
+        }
+        b.pipelines.clone()
+    };
+    // Waited for outside the lock: the title creates pipelines meanwhile.
+    let made = make::all_made(&pipelines, make::wait_budget());
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
+    if b.pipelines.len() != pipelines.len() {
+        // The title created another meanwhile: looked at again at the next dispatch.
         return false;
     }
+    let Some(made) = made else {
+        // Still being made by the workers: none of its stages runs in this frame.
+        b.rests = b.rests.max(crate::frame::current() + 1);
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            tracing::info!(
+                pipelines = b.pipelines.len(),
+                "the ray-tracing structure builder waits for its host pipelines: being made, it rests this frame"
+            );
+        }
+        return false;
+    };
     if b.whole {
         return true;
     }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
-    if !missing.is_empty() {
+    if !made {
+        let missing: Vec<String> =
+            b.pipelines.iter().filter(|p| !make::made(p)).map(|p| make::hashes(p)).collect();
         b.off = b.pipelines.len();
         tracing::warn!(
             missing = missing.len(),
@@ -587,6 +622,10 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        if builder_allowed() {
+            // Made by the workers from now, not at its first dispatch.
+            make::begin(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

@@ -234,7 +234,7 @@ pub(crate) fn hashes(p: &Pending) -> String {
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
-fn wait_budget() -> Duration {
+pub(crate) fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
@@ -297,14 +297,42 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
-/// Makes `p` on this thread if it is not made yet (waiting for a worker
-/// that is making it); whether it has a host pipeline.
-pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
-        return false;
-    }
-    p.make();
+/// Whether `p` has a host pipeline now.
+pub(crate) fn made(p: &Pending) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+/// Queues `p` for the workers as a draw's, without waiting for it.
+pub(crate) fn begin(p: &Arc<Pending>) {
+    if p.left_out.is_none() {
+        start(p, REQUESTED);
+    }
+}
+
+/// Of `ps`, queued for the workers as draws' ([`begin`]): `Some(true)` once
+/// all have host pipelines, `Some(false)` if one never will (left out or
+/// refused), `None` if some are still being made after `most`. Never makes
+/// one on this thread: the structure builder's 53, made one after another
+/// on the title's thread at its first dispatch, held its frames 26 s and its
+/// 30 s watchdog ended it (run tn1b).
+pub(crate) fn all_made(ps: &[Arc<Pending>], most: Duration) -> Option<bool> {
+    ps.iter().for_each(begin);
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if ps.iter().any(|p| p.left_out.is_some() || matches!(p.made.get(), Some(None))) {
+            return Some(false);
+        }
+        if ps.iter().all(|p| p.made.get().is_some()) {
+            return Some(true);
+        }
+        let rest = most.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            return None;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -647,6 +675,24 @@ mod tests {
         assert!(matches!(p.made.get(), Some(None)));
     }
 
+    /// The structure builder's pipelines are waited for, never made on the
+    /// asking thread: one still with a worker leaves the wait at its bound
+    /// (run tn1b: made in turn on the title's thread, 26 s, its watchdog).
+    #[test]
+    fn all_made_waits_for_the_workers_within_its_bound() {
+        let being_made = Pending::new(Vec::new(), None);
+        being_made.queue_state.store(MAKING, Ordering::Relaxed);
+        let being_made = Arc::new(being_made);
+        let started = Instant::now();
+        assert_eq!(all_made(std::slice::from_ref(&being_made), Duration::from_millis(50)), None);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(being_made.made.get().is_none(), "not made on this thread");
+        // Queued for the workers, which refuse one with no shaders.
+        let refused = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(all_made(std::slice::from_ref(&refused), Duration::from_secs(10)), Some(false));
+        assert_ne!(refused.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+    }
+
     /// A pipeline left out on purpose (a ray-tracing resolve without the structure builder)
     /// is never queued, so never made: it is counted as left out, and named so, not as
     /// "being made" (some 630 indirect dispatches a frame were, in every gameplay frame).
@@ -658,7 +704,7 @@ mod tests {
         let before = LEFT_OUT.load(Ordering::Relaxed);
         assert!(ready(&p).is_none());
         assert!(ready(&p).is_none());
-        assert!(!now(&p));
+        assert_eq!(all_made(std::slice::from_ref(&p), Duration::ZERO), Some(false));
         assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         assert!(p.made.get().is_none());
         assert!(LEFT_OUT.load(Ordering::Relaxed) >= before + 2);
