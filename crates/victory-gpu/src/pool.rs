@@ -726,6 +726,9 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
         }
+        if let Some(h) = &heap {
+            crate::host::priority(device, h, false);
+        }
         heap
     })?;
     let mut made: Option<ID3D12Resource> = None;

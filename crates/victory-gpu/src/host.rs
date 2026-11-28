@@ -358,6 +358,32 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     made
 }
 
+/// Whether memory gets a residency priority ([`priority`]; on by default,
+/// `VICTORY_RESIDENCY_PRIORITY=0`: none, as before). At the card's budget
+/// Windows moves memory to the PC's, read over the bus: with no priorities
+/// it may pick the structures rays step through or render targets before
+/// texture blocks.
+fn residency_priority() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENCY_PRIORITY").is_none_or(|v| v != "0"))
+}
+
+/// Sets `object`'s residency priority: `high` for memory read every frame
+/// (card copies of title buffers, render targets, unordered access), else
+/// normal (texture blocks), which Windows moves out first.
+pub(crate) fn priority(device: &ID3D12Device, object: &impl Interface, high: bool) {
+    if !residency_priority() {
+        return;
+    }
+    let Ok(device) = device.cast::<ID3D12Device1>() else { return };
+    let Ok(object) = object.cast::<ID3D12Pageable>() else { return };
+    let level = if high { D3D12_RESIDENCY_PRIORITY_HIGH } else { D3D12_RESIDENCY_PRIORITY_NORMAL };
+    // SAFETY: one live object of the device's and one priority.
+    if let Err(e) = unsafe { device.SetResidencyPriority(1, &Some(object), &level) } {
+        tracing::debug!(error = %e, "no residency priority");
+    }
+}
+
 /// Times, microseconds and the longest of [`resident`].
 static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -9915,6 +9941,12 @@ impl Meter {
                         if weighed < line { "room" } else { "no room, new textures wait" }
                     );
                 }
+                let [holes, partly, blocks] = crate::pool::texture_holes();
+                tracing::info!(
+                    "texture blocks: {blocks}, {partly} of them in part used with {holes} MB free in them; residency \
+                     priorities {}",
+                    if residency_priority() { "on" } else { "off (VICTORY_RESIDENCY_PRIORITY=0)" }
+                );
                 let [looks, mapped, same, staged, all, made, views] =
                     [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_NANOS[i].swap(0, Ordering::Relaxed) / 1_000_000);
                 let rest = all.saturating_sub(looks + mapped + same + staged + made + views);
@@ -10805,10 +10837,11 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
-        #[cfg(feature = "diagnostics")]
         if made.is_ok()
             && let Some(b) = &buffer
         {
+            priority(&self.device, b, true);
+            #[cfg(feature = "diagnostics")]
             crate::book::made(b, || "a shared buffer".into());
         }
         match made {
@@ -10895,7 +10928,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                priority(&self.device, &buffer, true);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
@@ -10944,7 +10981,12 @@ impl Host {
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                if let Some(b) = &buffer {
+                    priority(&self.device, b, true);
+                }
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

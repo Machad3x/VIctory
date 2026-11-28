@@ -3044,6 +3044,12 @@ fn host_texture_as(
         tracing::warn!(error = %e, desc = ?d, "a host texture is not resident");
         texture = None;
     }
+    if !reserved
+        && d.flags & (TARGET | DEPTH | UNORDERED) != 0
+        && let Some(t) = &texture
+    {
+        crate::host::priority(&host.device, t, true);
+    }
     if let Some(t) = &texture {
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
