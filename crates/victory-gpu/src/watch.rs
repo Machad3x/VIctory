@@ -317,6 +317,26 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// The same with [`read_only`]: what is asked is cut to the pages the lists
+/// read, and walking 8 MiB of unread pages between two of them would give
+/// back most of what the cut saves (the walk is most of an asking's cost:
+/// 9.7 GB walked a frame took 15.8 ms in run t8a-2).
+/// shortcut: 2 MiB is a guess between a call's cost and the walk's, measure it with the log's MB and askings.
+const READ_GAP: usize = (2 << 20) / PAGE;
+
+/// Whether a submission's one asking ([`ask_once`]) is about the pages its
+/// lists read only, not the span of each copy's refreshed ranges
+/// (`VICTORY_ASK_READ_ONLY=0`: the spans, as before). Only with the host's
+/// `VICTORY_REFRESH_ONCE`, which refreshes those pages alone: what else is
+/// refreshed is asked by [`writes`] as it comes, so nothing is seen later.
+pub(crate) fn read_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_READ_ONLY").is_none_or(|v| v != "0"))
+}
+
+fn ahead_gap() -> usize {
+    if read_only() { READ_GAP } else { AHEAD_GAP }
+}
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
@@ -364,7 +384,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + ahead_gap()
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);

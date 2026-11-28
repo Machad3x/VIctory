@@ -6217,12 +6217,26 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             batch.copy_spans(runs);
-            let Batch { spans, ranges, .. } = &mut batch;
+            let Batch { spans, ranges, reads, read, .. } = &mut batch;
             ranges.clear();
-            ranges.extend(spans.iter().filter(|s| s.0.asked_ahead()).map(|s| (s.1, s.2)));
+            // With `VICTORY_ASK_READ_ONLY` only the pages the lists read, as
+            // [`Batch::narrow`] cuts the refreshes.
+            let only_read = *read && crate::watch::read_only();
+            let (mut asked, mut unread) = (0, 0);
+            for (shadow, from, to) in spans.iter().filter(|s| s.0.asked_ahead()) {
+                let (a, u) = match reads.get(&(std::sync::Arc::as_ptr(shadow) as usize)) {
+                    Some(r) if only_read && !r.is_empty() => ask_read(r, *from, *to, ranges),
+                    _ => ask_read(&[(*from, *to)], *from, *to, ranges),
+                };
+                (asked, unread) = (asked + a, unread + u);
+            }
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
+            let asking = std::time::Instant::now();
             crate::watch::ask_once(&batch.ranges);
+            for (i, n) in [1, asked, unread, asking.elapsed().as_nanos() as usize].into_iter().enumerate() {
+                ASK_READ[i].fetch_add(n as u64, Ordering::Relaxed);
+            }
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
             // Behind flights: the title wrote memory that a flight's shaders
@@ -8525,6 +8539,7 @@ fn split_line(frames: f64) {
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
+    let r: [f64; 4] = std::array::from_fn(|i| ASK_READ[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if e[0] > 0.0 {
         tracing::info!(
             "asked early by a thread of its own per frame: {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
@@ -8537,7 +8552,7 @@ fn split_line(frames: f64) {
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
-         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
+         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED); the submissions' own: {:.1} askings of {:.0}          pages of 64 KiB, {:.0} left out as unread, {:.1} ms (VICTORY_ASK_READ_ONLY is {})",
         a[0],
         a[1] / 1024.0,
         a[11] / 1e6,
@@ -8555,6 +8570,11 @@ fn split_line(frames: f64) {
         s[1] / 1048576.0,
         s[2] / 1048576.0,
         s[3],
+        r[0],
+        r[1],
+        r[2],
+        r[3] / 1e6,
+        if crate::watch::read_only() && refresh_once() { "on" } else { "off" },
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
@@ -8732,9 +8752,26 @@ fn read_runs(reads: &[(usize, usize)], from: usize, to: usize) -> impl Iterator<
     reads[first..].iter().take_while(move |r| r.0 < to).map(move |r| (r.0.max(from), r.1.min(to)))
 }
 
+/// Since the last frame line: the submissions' one askings
+/// ([`crate::watch::ask_once`]), the 64 KiB pages they asked about, those
+/// left out as no list of the submission reads them
+/// ([`crate::watch::read_only`]), and their nanoseconds.
+static ASK_READ: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Pushes to `out` what a submission asks the write watch about of a copy's
+/// span `[from, to)`: the parts `reads` holds ([`read_runs`]). The pages
+/// asked, and those of the span left out.
+fn ask_read(reads: &[(usize, usize)], from: usize, to: usize, out: &mut Vec<(usize, usize)>) -> (usize, usize) {
+    let pages = |a: usize, b: usize| if a < b { (page_range(a, b).1 - page_range(a, b).0) / crate::watch::PAGE } else { 0 };
+    let at = out.len();
+    out.extend(read_runs(reads, from, to));
+    let asked: usize = out[at..].iter().map(|r| pages(r.0, r.1)).sum();
+    (asked, pages(from, to).saturating_sub(asked))
+}
+
 #[cfg(test)]
 mod refresh_once_tests {
-    use super::{join_ranges, page_range, read_runs};
+    use super::{ask_read, join_ranges, page_range, read_runs};
     use crate::watch::PAGE;
 
     /// What a submission refreshes of a copy's `[from, to)`: the parts its
@@ -8769,6 +8806,29 @@ mod refresh_once_tests {
         assert_eq!(due(&raw, 0, 10 * PAGE, unchanged), [(4 * PAGE, 5 * PAGE)]);
         // Read whole, as before the switch: both.
         assert_eq!(due(&[(0, 10 * PAGE)], 0, 10 * PAGE, unchanged), [(0, 10 * PAGE)]);
+    }
+
+    #[test]
+    fn asking_covers_every_read_page_of_the_span_and_nothing_else() {
+        // A 10-page span; the lists read a byte of page 1 and pages 3 to 4,
+        // and page 12, beyond the span.
+        let mut reads = Vec::new();
+        join_ranges(&mut reads, [(PAGE + 7, PAGE + 8), (3 * PAGE, 5 * PAGE), (12 * PAGE, 13 * PAGE)].map(|(a, b)| page_range(a, b)));
+        let (from, to) = (100, 10 * PAGE - 100);
+        let mut asked = Vec::new();
+        assert_eq!(ask_read(&reads, from, to, &mut asked), (3, 7));
+        assert_eq!(asked, [(PAGE, 2 * PAGE), (3 * PAGE, 5 * PAGE)]);
+        // Every refresh the submission does of the span (cut the same way)
+        // lies inside one range asked: `writes` answers it from the asking.
+        for (a, b) in read_runs(&reads, from, to) {
+            assert!(asked.iter().any(|r| r.0 <= a && b <= r.1));
+        }
+        // Reads not known (or the switch off): the span whole.
+        let mut whole = Vec::new();
+        assert_eq!(ask_read(&[(from, to)], from, to, &mut whole), (10, 0));
+        assert_eq!(whole, [(from, to)]);
+        // Nothing read of it: nothing asked.
+        assert_eq!(ask_read(&reads, 6 * PAGE, 9 * PAGE, &mut Vec::new()), (0, 3));
     }
 }
 
