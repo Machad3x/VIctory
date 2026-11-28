@@ -25,6 +25,7 @@ Open issues filed with the base:
 - [#691](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/691): VRAM at 99.9% of budget, about 1.9 GB free in partly used texture blocks.
 - [#692](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/692): an intermittent full white frame around 120 s into the opening cutscene.
 - [#817](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/817): a late lock-free write fault can undo a guard taken since (access violation); fixed here in 3175c5dc.
+- [#846](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/846): the title's watchdog ends the process after a stall with a held value wait never released; fixed here in batch 11.
 
 ## Runtime switches added by this fork
 
@@ -39,6 +40,7 @@ Open issues filed with the base:
 | `VICTORY_TARGET_ROOM_SMALL` | on | From the world's first frame only a margin above the render targets is kept for them (the larger of 256 MiB and 15 %). `=0` keeps the whole reserve. |
 | `VICTORY_PRESSURE_EXIT_GB` | 3.5 | Host memory pressure ends once this many GiB are free. |
 | `VICTORY_VIEW_REMAP=1` | off | Places title view slots past NVIDIA's capped descriptor heap through a table (trustno1-coder/VIctory-NVIDIA#638). Costs about 47 ms/frame here with no visible change (runs lt1b-2 and lt1c-2). |
+| `VICTORY_HELD_WAIT_MS` | 1500 | A value wait nothing meets is passed after this many ms when no present is queued, and passed at once when the title waits on a fence whose signal is held behind it. The held work still runs. `=0` turns it off. |
 | `VICTORY_STORE_BESIDE=1` | off | Stores beside the guards instead of opening them. Used in the batch 9 runs: protections 29 to 22 ms in run t8s. |
 
 `autotest.ps1` sets `VICTORY_BVH_BUILDER=1` itself; `-More @{VICTORY_BVH_BUILDER=''}` turns ray tracing off for a run.
@@ -162,6 +164,16 @@ Fixes:
 | t9c (batch 9) | 67.0 (75) | 14.0 | 41.7 | 9.8 | 0 | alive 240 s, picture as lt1b-2 |
 
 Over the first 80 s after the world starts, t9c averages 148.5 ms/frame (max 615) against 261.3 (max 714) for lt1b-2, so early loading is faster. No shader or pipeline is refused. The dark interior is unchanged.
+
+## Batch 11 (2026-11-28)
+
+- 10fcc252, plus the review fixes from d4c31913: held value waits that nothing meets no longer stall the line until the title's watchdog ends the process. That crash happened in about 1 run in 10 during the load into the world (trustno1-coder/VIctory-NVIDIA#846). A wait is passed after `VICTORY_HELD_WAIT_MS` (1500) with no present queued. It is passed at once when the title waits on a fence whose signal is held behind it in the same queue. The work it held still runs.
+
+In t11a and t11b (240 s each) the release never fired and nothing crashed. GPU time in these runs (110 and 136 ms) shows the run-to-run spread described below, not this change: the change did not run.
+
+### GPU time spread between runs
+
+The same build gives 8 to 450 ms of GPU time per frame from run to run, and it often grows during a run. The work sent is the same: draws, indirect groups, structure builds and lists per frame. The card is compute-bound in slow runs (SM 100 %, memory bandwidth 2-5 %, clocks steady at 1950 MHz, little PCIe traffic). Slow runs mostly show the cell lit by bounce light (median 66 ms against about 25 ms for dark ones). So whether the title's ray-traced lighting walks real structure data varies between runs, and when it does the compute emulation of the rays is expensive. Moving those rays to the RT cores (DXR) is the planned fix. Runs that start less than 30 s after another one also read slower, so the runs now start 2 min apart.
 
 ### Pacing option
 
