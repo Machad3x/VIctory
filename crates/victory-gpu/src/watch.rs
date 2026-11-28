@@ -1070,8 +1070,8 @@ static OPENED: Mutex<Vec<Opened>> = Mutex::new(Vec::new());
 static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether a write fault opens a guarded block without the guards' lock
-/// (`VICTORY_FAULT_UNLOCKED=1`; off unless asked for, or flipped while the
-/// title runs by `VICTORY_AB`).
+/// (`VICTORY_FAULT_UNLOCKED=0` turns it off; on by default, or flipped while
+/// the title runs by `VICTORY_AB`).
 ///
 /// Under the lock the title's threads waited for it more than they did
 /// anything else in a fault: of 281 ms in the handler in 14 frames of play
@@ -1085,12 +1085,17 @@ static TO_SETTLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// block another thread is opening waits for that one (100 microseconds at
 /// most), and one with every view of its page to open
 /// (`VICTORY_OPEN_ONE_VIEW=0`) goes the locked way.
+fn unlocked_from_env(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_none_or(|v| v != "0")
+}
+
 fn unlocked() -> bool {
     #[cfg(test)]
     if UNLOCKED_IN_TEST.get() {
         return true;
     }
-    crate::asked_for!("VICTORY_FAULT_UNLOCKED")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| unlocked_from_env(std::env::var_os("VICTORY_FAULT_UNLOCKED").as_deref()))
 }
 
 #[cfg(test)]
@@ -2014,6 +2019,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
         }
     }
+    let soft = soft_runs(first * BLOCK, (last - first) * BLOCK);
     let rest = rest();
     let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
@@ -2036,7 +2042,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&mut g, from, to);
+            protect(&mut g, from, to, &soft);
             run = None;
             // Faults of the title's wait for the lock: each block is done on
             // its own, and looked at anew below.
@@ -2048,7 +2054,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         // is (`OPENING`).
         if unsettled(block, block + 1) {
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                protect(&mut g, from, to, &soft);
             }
             continue;
         }
@@ -2061,7 +2067,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // because one could not be made so. (Or clean, and bytes were put
             // in beside the guard: it stays.)
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                protect(&mut g, from, to, &soft);
             }
             if g.clean.contains(block) {
                 continue;
@@ -2072,11 +2078,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+            protect(&mut g, from, to, &soft);
         }
     }
     if let Some((from, to)) = run {
-        protect(&mut g, from, to);
+        protect(&mut g, from, to, &soft);
     }
     drop(g);
     #[cfg(feature = "diagnostics")]
@@ -2134,10 +2140,10 @@ fn is_view(start: usize, end: usize) -> bool {
 /// at every other view of them are made read-only too: a write through
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
-fn protect(g: &mut Guards, from: usize, to: usize) {
+fn protect(g: &mut Guards, from: usize, to: usize, soft: &[(usize, usize)]) {
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-    protect_here(g, from, to);
+    protect_here(g, from, to, soft);
     cover(g, from, to);
 }
 
@@ -2249,7 +2255,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
 }
 
 /// [`protect`] for one range, without the other views of its pages.
-fn protect_here(g: &mut Guards, from: usize, to: usize) {
+fn protect_here(g: &mut Guards, from: usize, to: usize, soft: &[(usize, usize)]) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
@@ -2289,9 +2295,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     // and the block would count as not there. Nothing writes through one
     // before a fault makes it real, which opens it
     // ([`title_memory_made_real`]).
-    let soft = soft_runs(from * BLOCK, (to - from) * BLOCK);
+    let any_soft = soft.iter().any(|&(at, n)| at < to * BLOCK && at + n > from * BLOCK);
     let in_books = |block: usize| soft.iter().any(|&(at, n)| at <= block * BLOCK && (block + 1) * BLOCK <= at + n);
-    if soft.is_empty() && set(from, to) {
+    if !any_soft && set(from, to) {
         note(g, from, to);
         return;
     }
@@ -5280,5 +5286,14 @@ mod many_askers_tests {
         BITS.clear_all(0, usize::MAX);
         assert!(!BITS.any(0, 1 << 31));
         assert!(!BITS.swap_on(70) && BITS.swap_on(70) && BITS.all(70, 71));
+    }
+
+    #[test]
+    fn unlocked_defaults_on_unless_zero() {
+        use std::ffi::OsStr;
+        assert!(super::unlocked_from_env(None));
+        assert!(super::unlocked_from_env(Some(OsStr::new(""))));
+        assert!(super::unlocked_from_env(Some(OsStr::new("1"))));
+        assert!(!super::unlocked_from_env(Some(OsStr::new("0"))));
     }
 }
