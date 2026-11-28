@@ -104,8 +104,8 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_AMBIENT_SPECULAR", "1"),
     // Pixel programs keep the console's early depth test
     ("VICTORY_EARLY_DEPTH", "1"),
-    // Left out: the decal heap's defragmentation and the heat-haze pass
-    ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
+    // Left out: the heat-haze pass
+    ("VICTORY_LEAVE_OUT", "731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
 ];
@@ -259,6 +259,11 @@ fn parse_menu(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        // An earlier menu's LEFT OUT also left out the defrag shader, which now runs (2026-11-27).
+        .map(|(k, v)| match (k.as_str(), v.as_str()) {
+            ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298") => (k, "731a39171b568298".to_owned()),
+            _ => (k, v),
+        })
         .filter(|(k, _)| {
             k.starts_with("VICTORY_") && k.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         })
@@ -983,6 +988,12 @@ mod tests {
         o.fg_type = "dlss".to_owned();
         let (s, _) = settings(&o, &[], Some(Path::new("x")));
         assert_eq!((s.get("VICTORY_FRAMEGEN").map(String::as_str), s.get("VICTORY_FSR_FRAMEGEN")), (Some("1"), None));
+    }
+
+    #[test]
+    fn an_earlier_left_out_keeps_only_the_heat_haze() {
+        let menu = parse_menu("VICTORY_LEAVE_OUT=02384a60fda6f2d0,731a39171b568298\r\n");
+        assert_eq!(menu, [("VICTORY_LEAVE_OUT".to_owned(), "731a39171b568298".to_owned())]);
     }
 
     #[test]

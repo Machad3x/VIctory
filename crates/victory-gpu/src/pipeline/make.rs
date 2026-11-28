@@ -62,9 +62,11 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// Shader hashes whose pipelines are left out in every build
 /// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`; `VICTORY_SKIP_PIPELINES` does
 /// the same in diagnostics builds only). The decal heap's
-/// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), translatable for
-/// 32-lane hosts through host waves that meet by spinning, took 11.85 ms of
-/// the card a frame in the first gameplay area (timing run, 2026-11-26).
+/// `CS_DefragHeap_ComputeRelocations` (02384a60fda6f2d0), which took 11.85 ms
+/// of the card a frame in the first gameplay area (timing run, 2026-11-26,
+/// host waves meeting by an atomic per lane), is no longer named by the
+/// launchers: its meetings are cheaper and it translates again for 32-lane
+/// hosts (`victory_shader::emit`, 2026-11-28).
 fn leave_out() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {

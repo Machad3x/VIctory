@@ -29,8 +29,9 @@ What is known to be wrong:
   shaders. They are off (`VICTORY_BVH_BUILDER=1` turns them on: about 3 fps and a broken picture today). An
   estimate stands in for indirect light and for reflections of opaque surfaces: rooms are lit, but reflections
   are blurry, and in cutscenes they can still show the sky's bright colour.
-- **Left out:** the heat-haze / in-scattering pass (it smears blocks of pixels, also on water) and the decal
-  heap's defragmentation (5.6 ms of GPU a frame). `VICTORY_LEAVE_OUT` names them.
+- **Left out:** the heat-haze / in-scattering pass (it smears blocks of pixels, also on water).
+  `VICTORY_LEAVE_OUT` names it. The decal heap's defragmentation runs again (it cost 5.6 ms of GPU a frame
+  before its host waves met more cheaply; not measured since).
 - **Hitches:** some single frames of 70-190 ms in cutscenes while the title streams.
 - **Frame rate:** the title runs at 30 fps. `-Fps 60` lets frames start every 1/60 s, but the layer itself costs
   about 33 ms a frame today, so it stays near 30. 60 fps is the goal.

@@ -4606,10 +4606,14 @@ impl<'a> Lower<'a> {
     /// [`with_pair_meetings`], the console wave's own meeting: the first lane of each host
     /// wave counts it in on the console wave's LDS counter (two a meeting), and the wave reads
     /// the counter (one load every lane shares, behind a fence so that it is read again)
-    /// until it reaches the next even number, at most [`MEETING_POLLS`] times. (The first
-    /// form counted each of the 64 lanes in with an atomic and polled with an atomic per lane:
-    /// 11.9 ms a frame for `CS_DefragHeap_ComputeRelocations` alone, run 184458.) The code
-    /// after it is in a new block ([`Self::cur`]).
+    /// until it reaches the next even number, at most [`MEETING_POLLS`] times; the second to
+    /// count in (an odd count found) does not poll. (The first form counted each of the 64
+    /// lanes in with an atomic and polled with an atomic per lane: 11.9 ms a frame for
+    /// `CS_DefragHeap_ComputeRelocations` alone, run 184458. Polling with an atomic is slower
+    /// still than the shared load: 326 against 146 ms for 4,000 rounds of a loop that meets,
+    /// in 20,000 groups of 128 on an RTX 3080 Ti; with no poll for the second, 115 ms; with
+    /// group barriers in groups of 64, 21.5 ms.) The code after it is in a new block
+    /// ([`Self::cur`]).
     fn meet(&mut self) {
         if self.pairs.is_none() {
             let c = self.cur;
@@ -4640,7 +4644,10 @@ impl<'a> Lower<'a> {
         let base = self.s.m.bin(c, Bin::And, old, even);
         let target = self.s.m.bin(c, Bin::Add, base, two);
         let (wait, done) = (self.s.m.new_block(), self.s.m.new_block());
-        self.s.m.terminate(c, Term::Br(wait));
+        // (the second to count in found its partner in: no poll)
+        let odd = self.s.m.bin(c, Bin::And, old, one);
+        let late = self.s.m.cmp(c, pred::NE, odd, zero);
+        self.s.m.terminate(c, Term::CondBr(late, done, wait));
         let n = self.s.m.phi(wait, i32t);
         self.s.op(wait, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         let now = self.s.m.load(wait, ptr);
