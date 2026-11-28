@@ -1,6 +1,39 @@
-# Machad3x branch notes (RTX 3080 Ti, Ryzen 7 5700X)
+# Machad3x/VIctory-nvidia-RTX: fork notes (RTX 3080 Ti, Ryzen 7 5700X)
 
-This branch is based on trustno1-coder/VIctory-NVIDIA main. Every run here has the title's ray tracing on (`VICTORY_BVH_BUILDER=1`) and leaves no pipeline out (no `VICTORY_LEAVE_OUT`). Runs use `autotest.ps1`: 300 s, diag build, the launcher's NVIDIA switches, DLSS Quality at 1440p, frame generation off.
+This fork is based on [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA) main,
+which builds on [Marvisak/VIctory](https://github.com/Marvisak/VIctory). Every run here has the title's ray tracing
+on (`VICTORY_BVH_BUILDER=1`) and leaves no pipeline out (no `VICTORY_LEAVE_OUT`). Runs use `autotest.ps1`: diag
+build, the launcher's NVIDIA switches, DLSS Quality at 1440p, frame generation off; 300 s in batch 1, 240 s with a
+shot every 120 s from batch 2 on.
+
+## Current state
+
+| | |
+|---|---|
+| latest batch | 8 (run t8a-2) |
+| ms/frame, average of the last 120 s | 66.8 (max 85) |
+| card (GPU) ms | 6.1 |
+| prep ms | 47.1 |
+| dropped draws | 0 |
+| refused shaders or pipelines | 0 |
+
+Open issues filed with the base:
+
+- [trustno1-coder/VIctory-NVIDIA#688](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/688): pages faulted in by BVH shaders stop after 2048 for the whole run, rays then read holes.
+- [#689](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/689): a compacted structure size is read back before the builder writes it.
+- [#690](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/690): root-view buffer accesses ignore OOB_SELECT 1, out-of-range stores land in memory.
+- [#691](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/691): VRAM at 99.9% of budget, about 1.9 GB free in partly used texture blocks.
+- [#692](https://github.com/trustno1-coder/VIctory-NVIDIA/issues/692): an intermittent full white frame around 120 s into the opening cutscene.
+
+## Runtime switches added by this fork
+
+| switch | default | what |
+|---|---|---|
+| `VICTORY_BVH_SIZE_ANSWER` | on | The compacted size of an acceleration structure is answered at the title's call with the builder's own maximum. `=0` turns it off. |
+| `VICTORY_LATE_WAIT=0` | not set | The pacing option: turns the late wait off, so submissions are not held back. Slower here (batch 8), it can feel steadier on some setups. |
+| `VICTORY_DXR` | off | Watches the title's builder calls for DXR: `1` on, `check` compares both ways. |
+
+`autotest.ps1` sets `VICTORY_BVH_BUILDER=1` itself; `-More @{VICTORY_BVH_BUILDER=''}` turns ray tracing off for a run.
 
 ## Batch 1 (2026-11-27)
 
@@ -8,17 +41,18 @@ This branch is based on trustno1-coder/VIctory-NVIDIA main. Every run here has t
 - d3bc4297: copy-back runs are found 64 bytes at a time (SSE2) instead of byte by byte.
 - 7c72f843, a613ff5e: the pipeline library save is flushed and summed. On load, a library that does not match its sum is set aside. A library newer than its sum (saved by a build without sums) loads unchecked.
 - autotest.ps1: the launcher's switches (`play-foxhound.ps1 -EnvOnly`), ray tracing on, nothing left out, and a count of refused or untranslated lines.
-- The console pipeline-state deserializers (device 0x218/0x1c8, after upstream #3586) were tried and taken back out. The compute pipelines they made did not translate (840 shaders), while without them the title creates those pipelines the normal way.
+- The console pipeline-state deserializers (device 0x218/0x1c8, after Marvisak/VIctory#3586) were tried and taken back out. The compute pipelines they made did not translate (840 shaders), while without them the title creates those pipelines the normal way.
 
 | run | ray tracing | ms/frame | GPU ms | prep ms | copy-back ms | dropped draws/frame | result |
 |---|---|---|---|---|---|---|---|
 | tn1a (base) | off | 40.5 | ~1 | 30-33 | 10-11 | 330 + 637 indirect (left out) | alive |
-| tn1b (base) | on | — | — | — | — | — | watchdog crash at 84 s |
+| tn1b (base) | on | - | - | - | - | - | watchdog crash at 84 s |
 | t1b (batch 1) | on | 90-97 | 32-42 | 46-47 | 13-15 | 1 | alive 300 s |
 
 ## Batch 2 (2026-11-27)
 
-Merged from tn1: #516, #501, #498, #497, #532, #521. Fixes on top:
+Merged from the base: #516, #501, #498, #497, #532, #521. Fixes on top:
+
 - watch: re-read the books when title memory is made real (race in #516);
 - lazy: `hot_within` joins a piece only onto a range it overlaps (#501);
 - ambient: `raise` scrubs the probe result channel by channel, so one bad channel no longer zeroes the whole probe (#521; the right side of the cell went dark).
@@ -35,7 +69,7 @@ With ray tracing on, the ambient estimate now stays out for the whole run (it wa
 
 ## Batch 3 (2026-11-27)
 
-Merged from tn1: #552, #548 (its counting-allocator tests now run in diagnostics builds only), #547, #544. #550 (the code table starts after the instructions) is left out: with it the card time per frame went from 11-19 ms to 76-224 ms on the Series X profile, with the same picture.
+Merged from the base: #552, #548 (its counting-allocator tests now run in diagnostics builds only), #547, #544. #550 (the code table starts after the instructions) is left out: with it the card time per frame went from 11-19 ms to 76-224 ms on the Series X profile, with the same picture.
 
 | run | profile | ms/frame | GPU ms | prep ms | copy-back ms | dropped draws/frame | result |
 |---|---|---|---|---|---|---|---|
@@ -46,6 +80,7 @@ Merged from tn1: #552, #548 (its counting-allocator tests now run in diagnostics
 ## Batch 4 (2026-11-27)
 
 The defragmenting compute shader (02384a60fda6f2d0) is no longer left out:
+
 - a loop shape is accepted only when it is narrower than the host wave or fits it;
 - the second host wave does not poll in meet;
 - the indirect tests follow `VICTORY_INDIRECT_REST`'s default;
@@ -56,6 +91,10 @@ The defragmenting compute shader (02384a60fda6f2d0) is no longer left out:
 | t4b (batch 4) | Series X | 71.7-72.7 | 17-18 | 41-45 | 10-11 | 0 | alive 240 s, picture as t3r |
 
 Nothing is dropped or left out any more. The shader now running costs about 3 ms per frame.
+
+## Batches 5 and 6 (2026-11-27)
+
+Integration branches that were not taken to main. Batch 5 (copy pool, global loads into LDS, the write watch's refused blocks) stays on its branch. What batch 6 carried (the BVH walk, the precompiled-pipeline lookups, the root-view range check) came to main in batches 7 and 8.
 
 ## Batch 7 (2026-11-27)
 
@@ -69,7 +108,7 @@ From now on, runs are compared on the average of the last 120 s (24 frame lines)
 
 | run | ms/frame (120 s avg, max) | GPU ms | prep ms | copy-back ms | dropped | result |
 |---|---|---|---|---|---|---|
-| t4b (batch 4) | 77.7 (110) | 24.3 | 41.5 | 10.0 | 0 | — |
+| t4b (batch 4) | 77.7 (110) | 24.3 | 41.5 | 10.0 | 0 | - |
 | t7a-2 (batch 7) | 75.2 (100) | 19.4 | 43.4 | 10.5 | 0 | alive 240 s, picture as t4b |
 
 ## Batch 8 (2026-11-27)
@@ -81,11 +120,11 @@ From now on, runs are compared on the average of the last 120 s (24 frame lines)
 
 | run | ms/frame (120 s avg, max) | GPU ms | prep ms | copy-back ms | dropped | result |
 |---|---|---|---|---|---|---|
-| t7a-2 (batch 7) | 75.2 (100) | 19.4 | 43.4 | 10.5 | 0 | â€” |
-| t8a-2 (batch 8) | 66.8 (85) | 6.1 | 47.1 | 11.4 | 0 | alive 240 s, picture as t7a-2; the 120 s shot is white (seen before in t4b, not attributed) |
+| t7a-2 (batch 7) | 75.2 (100) | 19.4 | 43.4 | 10.5 | 0 | - |
+| t8a-2 (batch 8) | 66.8 (85) | 6.1 | 47.1 | 11.4 | 0 | alive 240 s, picture as t7a-2; the 120 s shot is white (seen before in t4b, not attributed; #692) |
 
 No shader or pipeline is refused.
 
 ### Pacing option
 
-`VICTORY_LATE_WAIT=0` turns the late wait off: submissions are not held back. It is off by default. On this machine it costs a lot (run t7w: 124.3 ms/frame against 75.2), but it can feel steadier on some setups.
+`VICTORY_LATE_WAIT=0` turns the late wait off: submissions are not held back. It is not set by default. On this machine it costs a lot (run t7w: 124.3 ms/frame against 75.2), but it can feel steadier on some setups.
